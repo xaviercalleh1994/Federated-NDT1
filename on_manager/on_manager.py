@@ -9,15 +9,21 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict, deque
 
 TOPO_FILE = "/run/topology.json"
-LOG_FILE = "/home/ubuntu/ndtm_events.log" #"/tmp/onm_events.log"
+
+# Default log file for ONM (can be overridden with --log-file)
+LOG_FILE_DEFAULT = "/home/ubuntu/onm_events.log"
+
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 6001
+
+# Runtime context appended to every log line
+RUN_CTX: Dict[str, object] = {}
 
 
 # Log structured events for metrics extraction
 def log_event(tag: str, data: dict):
-    entry = {"ts_ns": time.time_ns(), "tag": tag, **data}
-    with open(LOG_FILE, "a") as f:
+    entry = {"ts_ns": time.time_ns(), "tag": tag, **RUN_CTX, **data}
+    with open(RUN_CTX.get("log_file", LOG_FILE_DEFAULT), "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -178,7 +184,6 @@ def apply_logical_edge_to_on(g, a: str, b: str, e: Edge) -> bool:
         print(f"[ON] No logical path between {a} and {b}")
         return False
 
-
     for x, y in phys_edges:
         resp = control_call({
             "type": "LINK_SET",
@@ -211,7 +216,6 @@ class SyncSender:
     def send(self, data: bytes):
         raise NotImplementedError
 
-
     def close(self):
         pass
 
@@ -222,10 +226,8 @@ class UdpSender(SyncSender):
         self.addr = (relay_ip, relay_port)
         self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-
     def send(self, data: bytes):
         self.s.sendto(data, self.addr)
-
 
     def close(self):
         self.s.close()
@@ -238,10 +240,8 @@ class TcpSender(SyncSender):
         self.s.connect((relay_ip, relay_port))
         self.s.sendall(b"ON\n")
 
-
     def send(self, data: bytes):
         self.s.sendall(len(data).to_bytes(4, "big") + data)
-
 
     def close(self):
         self.s.close()
@@ -252,7 +252,21 @@ def main():
     ap.add_argument("--proto", choices=["udp", "tcp"], required=True)
     ap.add_argument("--relay-ip", required=True)
     ap.add_argument("--relay-port", type=int, default=7001)
+    ap.add_argument("--relay-kind", choices=["router", "vps"], required=True,
+                    help="Type of relay used: local router VM or remote VPS server")
+    ap.add_argument("--log-file", default=LOG_FILE_DEFAULT,
+                    help="Path to ON manager log file (JSONL)")
     args = ap.parse_args()
+
+    global RUN_CTX
+    RUN_CTX = {
+        "side": "ON",
+        "proto": args.proto,
+        "relay_kind": args.relay_kind,
+        "relay_ip": args.relay_ip,
+        "relay_port": args.relay_port,
+        "log_file": args.log_file
+    }
 
     # Transport selection
     sender = UdpSender(args.relay_ip, args.relay_port) if args.proto == "udp" else TcpSender(args.relay_ip, args.relay_port)
@@ -304,8 +318,7 @@ def main():
             log_event("ON_EVENT_CREATED", {
                 "event_id": event_id,
                 "a": a, "b": b,
-                "params": asdict(e),
-                "proto": args.proto
+                "params": asdict(e)
             })
 
             # Apply locally in ON
@@ -313,6 +326,7 @@ def main():
 
             if not ok:
                 print("[ON] Failed to apply locally")
+                log_event("ON_EVENT_LOCAL_APPLY_FAIL", {"event_id": event_id, "a": a, "b": b})
                 continue
 
             # Build sync event (sent to relay, not directly to NDT)
@@ -331,14 +345,10 @@ def main():
                 "event_id": event_id,
                 "t_create_ns": t_create_ns,
                 "t_tx_ns": t_tx_ns,
-                "size_bytes": len(payload),
-                "relay_ip": args.relay_ip,
-                "relay_port": args.relay_port,
-                "proto": args.proto
+                "size_bytes": len(payload)
             })
 
             print("[ON] Event applied locally and sent to relay")
-
             continue
 
         if cmd == "exec":
@@ -365,8 +375,7 @@ def main():
             log_event("ON_EXEC_SENT", {
                 "node": node,
                 "cmd": shell_cmd,
-                "size_bytes": len(payload),
-                "proto": args.proto
+                "size_bytes": len(payload)
             })
             continue
 

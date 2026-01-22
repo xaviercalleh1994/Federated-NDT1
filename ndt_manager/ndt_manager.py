@@ -11,13 +11,18 @@ import threading
 TOPO_FILE = "/run/topology.json"
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 6001
-LOG_FILE = "/home/ubuntu/ndtm_events.log" #"/tmp/ndtm_events.log"
+
+# Default log file for NDTM (can be overridden with --log-file)
+LOG_FILE_DEFAULT = "/home/ubuntu/ndtm_events.log"
+
+# Runtime context appended to every log line
+RUN_CTX: Dict[str, object] = {}
 
 
 # Log structured events for metrics extraction
 def log_event(tag: str, data: dict):
-    entry = {"ts_ns": time.time_ns(), "tag": tag, **data}
-    with open(LOG_FILE, "a") as f:
+    entry = {"ts_ns": time.time_ns(), "tag": tag, **RUN_CTX, **data}
+    with open(RUN_CTX.get("log_file", LOG_FILE_DEFAULT), "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -77,7 +82,6 @@ def path_only_switches_middle(g: Dict[str, List[str]], src: str, dst: str) -> Li
 
     if dst not in prev:
         return []
-
 
     path_nodes = []
     cur = dst
@@ -162,7 +166,6 @@ class UdpReceiver:
         self.keepalive_s = keepalive_s
         self._start_keepalive()
 
-
     def _start_keepalive(self):
         def loop():
             while True:
@@ -187,7 +190,6 @@ class TcpReceiver:
         self.sock.connect((relay_ip, relay_port))
         self.sock.sendall(b"NDT\n")
 
-
     def recv(self) -> bytes:
         hdr = recv_exact(self.sock, 4)
         if hdr is None:
@@ -203,7 +205,21 @@ def main():
     ap.add_argument("--proto", choices=["udp", "tcp"], required=True)
     ap.add_argument("--relay-ip", required=True)
     ap.add_argument("--relay-port", type=int, default=7001)
+    ap.add_argument("--relay-kind", choices=["router", "vps"], required=True,
+                    help="Type of relay used: local router VM or remote VPS server")
+    ap.add_argument("--log-file", default=LOG_FILE_DEFAULT,
+                    help="Path to NDT manager log file (JSONL)")
     args = ap.parse_args()
+
+    global RUN_CTX
+    RUN_CTX = {
+        "side": "NDT",
+        "proto": args.proto,
+        "relay_kind": args.relay_kind,
+        "relay_ip": args.relay_ip,
+        "relay_port": args.relay_port,
+        "log_file": args.log_file
+    }
 
     g = load_topo_graph()
 
@@ -213,7 +229,6 @@ def main():
     else:
         rx = TcpReceiver(args.relay_ip, args.relay_port)
         print("[NDT] Ready (TCP)")
-
 
     while True:
         data = rx.recv()
@@ -228,7 +243,6 @@ def main():
             log_event("NDT_RX_PARSE_ERR", {"err": str(e), "size_bytes": len(data)})
             continue
 
-
         t = ev.get("type", "NA")
 
         if t == "LOGICAL_LINK_SET":
@@ -242,16 +256,19 @@ def main():
                 "event_id": event_id,
                 "t_create_ns": t_create_ns,
                 "t_rx_ns": t_rx_ns,
-                "size_bytes": len(data),
-                "proto": args.proto
+                "size_bytes": len(data)
             })
 
-            e = Edge(
-                delay_ms=float(p["delay_ms"]),
-                loss_pct=float(p["loss_pct"]),
-                bw_mbps=float(p["bw_mbps"]),
-                up=bool(p["up"])
-            )
+            try:
+                e = Edge(
+                    delay_ms=float(p["delay_ms"]),
+                    loss_pct=float(p["loss_pct"]),
+                    bw_mbps=float(p["bw_mbps"]),
+                    up=bool(p["up"])
+                )
+            except Exception as ex:
+                log_event("NDT_EVENT_BAD_PAYLOAD", {"event_id": event_id, "err": str(ex)})
+                continue
 
             segments = apply_logical_link(g, p["a"], p["b"], e)
             t_apply_ns = time.time_ns()
@@ -268,7 +285,6 @@ def main():
             })
 
             print(f"[NDT] EVENT APPLIED {event_id}", flush=True)
-
             continue
 
         if t == "EXEC_CMD":
