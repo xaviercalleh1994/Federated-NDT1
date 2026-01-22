@@ -1,157 +1,62 @@
 #!/usr/bin/env python3
+import psutil
+import time
+import csv
 import argparse
-import pathlib
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+import sys
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def p95(x):
-    return float(np.percentile(x, 95))
-
-def normalize_time(df):
-    t0 = df["ts_epoch_s"].iloc[0]
-    df = df.copy()
-    df["t_rel_s"] = df["ts_epoch_s"] - t0
-    return df
-
-# -----------------------------
-# 1:1 ANALYSIS
-# -----------------------------
-def analyze_1to1(csv_path, outdir):
-    df = pd.read_csv(csv_path)
-    df = normalize_time(df)
-
-    metrics = {
-        "cpu_mean": df.cpu_percent.mean(),
-        "cpu_p95": p95(df.cpu_percent),
-        "rss_mb_mean": df.rss_mb.mean(),
-        "rss_mb_p95": p95(df.rss_mb),
-        "tx_kbps_mean": df.tx_kbps.mean(),
-        "rx_kbps_mean": df.rx_kbps.mean(),
-    }
-
-    # Save metrics
-    pd.DataFrame([metrics]).to_csv(outdir / "metrics_1to1.csv", index=False)
-
-    # ---- CPU plot ----
-    plt.figure(figsize=(8,4))
-    plt.plot(df.t_rel_s, df.cpu_percent)
-    plt.xlabel("time (s)")
-    plt.ylabel("CPU (%)")
-    plt.title("NDT CPU usage (1:1)")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(outdir / "fig_cpu_1to1.png", dpi=300)
-    plt.close()
-
-    # ---- Memory plot ----
-    plt.figure(figsize=(8,4))
-    plt.plot(df.t_rel_s, df.rss_mb)
-    plt.xlabel("time (s)")
-    plt.ylabel("RSS (MB)")
-    plt.title("NDT Memory usage (1:1)")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(outdir / "fig_mem_1to1.png", dpi=300)
-    plt.close()
-
-    # ---- Bandwidth plot ----
-    plt.figure(figsize=(8,4))
-    plt.plot(df.t_rel_s, df.tx_kbps, label="TX")
-    plt.plot(df.t_rel_s, df.rx_kbps, label="RX")
-    plt.xlabel("time (s)")
-    plt.ylabel("kbps")
-    plt.title("Synchronization bandwidth (1:1)")
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(outdir / "fig_bw_1to1.png", dpi=300)
-    plt.close()
-
-    print("[OK] 1:1 analysis completed")
-
-
-# -----------------------------
-# FEDERATED ANALYSIS
-# -----------------------------
-def analyze_federated(csv_paths, outdir, link_capacity_mbps=None):
-    rows = []
-
-    for csv in csv_paths:
-        df = pd.read_csv(csv)
-        fanout = int("".join(filter(str.isdigit, csv.stem)))
-        rows.append({
-            "fanout": fanout,
-            "tx_kbps_mean": df.tx_kbps.mean(),
-            "tx_kbps_p95": p95(df.tx_kbps)
-        })
-
-    m = pd.DataFrame(rows).sort_values("fanout")
-    m.to_csv(outdir / "metrics_federated.csv", index=False)
-
-    # Federation Overhead Ratio
-    B1 = m[m.fanout == 1].tx_kbps_mean.iloc[0]
-    m["FOR"] = m.tx_kbps_mean / B1
-
-    if link_capacity_mbps:
-        C = link_capacity_mbps * 1000
-        m["link_util_pct"] = (m.tx_kbps_mean / C) * 100
-
-    m.to_csv(outdir / "metrics_federated_with_for.csv", index=False)
-
-    # ---- Bandwidth vs fanout ----
-    plt.figure(figsize=(6,4))
-    plt.plot(m.fanout, m.tx_kbps_mean, marker="o")
-    plt.xlabel("Number of replicas (fanout)")
-    plt.ylabel("TX kbps (mean)")
-    plt.title("Synchronization bandwidth vs replicas")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(outdir / "fig_federated_bw.png", dpi=300)
-    plt.close()
-
-    # ---- FOR plot ----
-    plt.figure(figsize=(6,4))
-    plt.plot(m.fanout, m.FOR, marker="o")
-    plt.xlabel("Number of replicas (fanout)")
-    plt.ylabel("Federation Overhead Ratio")
-    plt.title("Federation overhead scaling")
-    plt.grid(True, linestyle="--", alpha=0.4)
-    plt.tight_layout()
-    plt.savefig(outdir / "fig_federated_for.png", dpi=300)
-    plt.close()
-
-    print("[OK] Federated analysis completed")
-
-
-# -----------------------------
-# MAIN
-# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["1to1", "federated"], required=True)
-    ap.add_argument("--csv", nargs="+", required=True,
-                    help="CSV(s) from monitor_resources.py")
-    ap.add_argument("--outdir", default="out_monitor")
-    ap.add_argument("--link-capacity-mbps", type=float, default=None,
-                    help="Optional link capacity for utilization metric")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="PID to monitor (ONM or NDTM)")
+    ap.add_argument("--iface", required=True,
+                    help="Network interface to monitor (e.g., eth0, enp0s8)")
+    ap.add_argument("--out", required=True,
+                    help="Output CSV file")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="Sampling interval in seconds (e.g., 0.2, 1.0)")
     args = ap.parse_args()
 
-    outdir = pathlib.Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = psutil.Process(args.pid)
+    except psutil.NoSuchProcess:
+        print("PID not found")
+        sys.exit(1)
 
-    if args.mode == "1to1":
-        if len(args.csv) != 1:
-            raise SystemExit("1to1 mode expects exactly ONE CSV")
-        analyze_1to1(pathlib.Path(args.csv[0]), outdir)
+    # Prime CPU measurement
+    proc.cpu_percent(interval=None)
 
-    else:
-        csvs = [pathlib.Path(c) for c in args.csv]
-        analyze_federated(csvs, outdir, args.link_capacity_mbps)
+    net = psutil.net_io_counters(pernic=True)
+    if args.iface not in net:
+        print(f"Interface not found: {args.iface}")
+        sys.exit(1)
 
+    prev_net = net[args.iface]
+
+    with open(args.out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "ts_epoch_s",
+            "cpu_percent",
+            "rss_mb",
+            "tx_kbps",
+            "rx_kbps"
+        ])
+
+        while True:
+            time.sleep(args.interval)
+
+            ts = time.time()
+            cpu = proc.cpu_percent(interval=None)
+            rss_mb = proc.memory_info().rss / (1024 * 1024)
+
+            net = psutil.net_io_counters(pernic=True)[args.iface]
+            tx_kbps = ((net.bytes_sent - prev_net.bytes_sent) * 8.0 / 1000.0) / args.interval
+            rx_kbps = ((net.bytes_recv - prev_net.bytes_recv) * 8.0 / 1000.0) / args.interval
+            prev_net = net
+
+            w.writerow([ts, cpu, rss_mb, tx_kbps, rx_kbps])
+            f.flush()
 
 if __name__ == "__main__":
     main()

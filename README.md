@@ -58,9 +58,73 @@ python3 relay.py --proto <udp or tcp> --port 7001
 Second start the DTM
 ```bash
 python3 dtm.py --proto <udp or tcp> --relay-ip <172.16.1.1 or 79.143.93.210> --relay-port 7001
+python3 dtm_v12.py --proto udp --relay-ip 79.143.93.210 --relay-port 7001 --relay-kind vps --log-file /home/ubuntu/ndtm_events.log & NDT_PID=$!
 ```
 
 Start the ONM
 ```bash
 python3 onm.py --proto <udp or tcp> --relay-ip <172.16.1.1 or 79.143.93.210> --relay-port 7001
+sudo python3 onm_v12.py --proto udp --relay-ip 79.143.93.210 --relay-port 7001 --relay-kind vps --log-file /home/ubuntu/onm_events.log
 ```
+
+```bash
+python3 monitor_resources.py --pid 4569 --iface enp0s8 --out ndt_1to1_resources.csv --interval 0.2
+```
+
+
+caso federado:
+en ON:
+```bash
+python3 onm_fed.py \
+  --proto udp \
+  --relay-ip <IP_ROUTER> \
+  --base-port 7001 \
+  --fanout 5 \
+  --relay-kind router \
+  --log-file /home/ubuntu/onm_events.log &
+ON_PID=$!
+```
+
+```bash
+python3 monitor_resources.py \
+  --pid $ON_PID \
+  --iface enp0s8 \
+  --out on_federated_fanout5.csv \
+  --interval 0.5
+```
+
+```bash
+set r1 r2 up 50 1 10
+set r1 r2 down 0 0 1000
+```
+
+en el router
+```bash
+python3 listen_ports.py \
+  --proto udp \
+  --base-port 7001 \
+  --fanout 5 \
+  --csv dummy_rx_fanout5.csv
+```
+
+📊 CÓMO SACAS LAS MÉTRICAS Y PLOTS (DESPUÉS)
+
+Cuando tengas:
+
+on_federated_fanout1.csv
+on_federated_fanout2.csv
+on_federated_fanout5.csv
+on_federated_fanout10.csv
+on_federated_fanout20.csv
+
+
+Copias esos archivos a tu máquina de análisis (o una VM con venv limpio).
+
+7️⃣ Máquina de análisis — Plots finales
+python3 analyze_monitor_results.py \
+  --mode federated \
+  --csv on_federated_fanout1.csv on_federated_fanout2.csv \
+        on_federated_fanout5.csv on_federated_fanout10.csv \
+        on_federated_fanout20.csv \
+  --outdir out_federated \
+  --link-capacity-mbps 100
