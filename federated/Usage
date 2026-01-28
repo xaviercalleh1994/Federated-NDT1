@@ -1,0 +1,147 @@
+*******************************************************
+Escenario 1:1
+-------------------------------------------
+DTM EN VM NDT
+-------------------------------------------
+DTM UDP:
+python3 dtm_manager.py \
+  --proto udp \
+  --relay-ip <IP_ONM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --mode 1:1 \
+  --log-file dtm_udp.log
+
+DTM TCP:
+python3 dtm_manager.py \
+  --proto tcp \
+  --relay-ip <IP_ONM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --mode 1:1 \
+  --log-file dtm_tcp.log
+
+-------------------------------------------
+Monitor de recursos EN VM NDT
+-------------------------------------------
+UDP:
+python3 monitor_dtm_resources.py \
+  --pid $(pgrep -f dtm_manager.py) \
+  --out dtm_udp_f1.csv
+
+
+TCP:
+python3 monitor_dtm_resources.py \
+  --pid $(pgrep -f dtm_manager.py) \
+  --out dtm_tcp_f1.csv
+-------------------------------------------
+ONM EN VM NDT
+-------------------------------------------
+UDP:
+python3 onm.py \
+  --proto udp \
+  --relay-ip <IP_DTM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --log-file onm_udp.log
+
+TCP:
+python3 onm.py \
+  --proto tcp \
+  --relay-ip <IP_DTM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --log-file onm_tcp.log
+
+set r1 r2 down 0 0 1000
+set r1 r2 up 50 1 10
+
+*********************************************************
+
+*********************************************************
+
+Escenario Federado 1:N
+-------------------------------------------
+En una VM Dummy EN VM NDT
+-------------------------------------------}
+UDP
+python3 dummy_receivers.py \
+  --proto udp \
+  --base-port 8001 \
+  --fanout 10 \
+  --csv dummy_udp_f10.csv
+
+TCP:
+python3 dummy_receivers.py \
+  --proto tcp \
+  --base-port 8001 \
+  --fanout 10 \
+  --csv dummy_tcp_f10.csv
+
+-------------------------------------------
+DTM EN VM NDT
+-------------------------------------------
+UDP:
+python3 dtm_manager.py \
+  --proto udp \
+  --relay-ip <IP_ONM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --mode federated \
+  --dst-ip <IP_DUMMY> \
+  --base-port 8001 \
+  --fanout 10 \
+  --group-size 5 \
+  --wave-delay-s 0.2 \
+  --rate-eps 0 \
+  --log-file dtm_udp.log
+
+TCP:
+python3 dtm_manager.py \
+  --proto tcp \
+  --relay-ip <IP_ONM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --mode federated \
+  --dst-ip <IP_DUMMY> \
+  --base-port 8001 \
+  --fanout 10 \
+  --group-size 5 \
+  --wave-delay-s 0.2 \
+  --rate-eps 0 \
+  --log-file dtm_tcp.log
+
+-------------------------------------------
+Monitor de recursos EN VM NDT
+-------------------------------------------
+UDP:
+python3 monitor_dtm_resources.py \
+  --pid $(pgrep -f dtm_manager.py) \
+  --out dtm_udp_f10.csv
+
+
+python3 monitor_dtm_resources.py \
+  --pid $(pgrep -f dtm_manager.py) \
+  --out dtm_tcp_f10.csv
+
+-------------------------------------------
+ONM EN VM NDT
+-------------------------------------------
+UDP:
+python3 onm.py \
+  --proto udp \
+  --relay-ip <IP_DTM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --log-file onm_udp.log
+
+TCP:
+python3 onm.py \
+  --proto tcp \
+  --relay-ip <IP_DTM> \
+  --relay-port 7001 \
+  --relay-kind router \
+  --log-file onm_tcp.log
+
+set r1 r2 down 0 0 1000
+set r1 r2 up 50 1 10
