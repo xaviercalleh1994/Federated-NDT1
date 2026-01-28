@@ -128,3 +128,16 @@ python3 analyze_monitor_results.py \
         on_federated_fanout20.csv \
   --outdir out_federated \
   --link-capacity-mbps 100
+
+
+
+latencias
+en el ON:
+arrancar el onm
+python3 onm_fed.py --proto udp --relay-ip 79.143.93.210 --base-port 7001 --fanout 2 --relay-kind vps --log-file /home/ubuntu/onm_fanout_udp_f2.log --pid-file /home/ubuntu/onm.pid
+
+arrancar el monitor
+python3 monitor_resources.py --pid $(cat /home/ubuntu/onm.pid)  --iface enp0s3 --out /home/ubuntu/fanout/onm_resources_tcp_f50.csv --interval 1.0
+
+analizar consumo de recursos:
+python3 analyze_monitor_resources.py   --input-dir /home/ubuntu/fanout   --outdir out_federated   --link-capacity-mbps 100
