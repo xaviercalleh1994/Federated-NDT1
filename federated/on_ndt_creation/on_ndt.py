@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import json
 import socket
@@ -7,7 +6,7 @@ import argparse
 from typing import Dict, Any
 
 from mininet.net import Mininet
-from mininet.node import Controller, Node
+from mininet.node import OVSController, Node
 from mininet.nodelib import NAT
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
@@ -28,7 +27,7 @@ def export_topology(net: Mininet, filename: str = TOPO_FILE):
     """
     Exporta topología de Mininet:
       - nodes: hosts + switches
-      - links: pares [a,b] 
+      - links: pares [a,b]
     """
     nodes = [n.name for n in net.hosts + net.switches]
     links = []
@@ -46,7 +45,7 @@ def export_topology(net: Mininet, filename: str = TOPO_FILE):
 def apply_tc(intf: str, delay_ms: float, loss_pct: float, bw_mbps: float):
     """
     Aplica políticas de QoS (tc traffic control, qdisc colas) para enlaces cuando se generan eventos:
-      - rate (bw) con tbf (token bucket filter para control de ancho de banda) 
+      - rate (bw) con tbf (token bucket filter para control de ancho de banda)
       - delay/loss con netem (network emulator: simula imperfecciones en el enlace)
     """
 
@@ -171,7 +170,7 @@ def control_server(net: Mininet):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # els ervidor escuchará solo localmente
     srv.bind((CONTROL_HOST, CONTROL_PORT))
-    # socket en modo server 
+    # socket en modo server
     srv.listen(5)
     info(f"*** Control server {CONTROL_HOST}:{CONTROL_PORT}\n")
 
@@ -185,7 +184,7 @@ def control_server(net: Mininet):
                     break
                 buf += data
                 while b"\n" in buf:
-                # separar los JSON que terminan en \n
+                    # separar los JSON que terminan en \n
                     line, buf = buf.split(b"\n", 1)
                     if not line.strip():
                         continue
@@ -200,9 +199,9 @@ def control_server(net: Mininet):
 
 def redComplejaFinal(role: str):
     """
-    APlicable tanto para ON y NDT, debe recibir el rol. 
+    APlicable tanto para ON y NDT, debe recibir el rol.
     Configura rutas en routers y host, asegura nat para acceso a redes externas
-    
+
     Nuevo: control_server en thread y export_topology al inicio.
     """
     if role == "ndt":
@@ -228,8 +227,8 @@ def redComplejaFinal(role: str):
         os.system(f"ip addr flush dev {K8S_INTF}")
 
     # Crea el controlador para la red para que se controle mediante software
-    net = Mininet(controller=Controller, link=TCLink) #TCLink permite usar TC para los eventos
-    net.addController("c0")
+    net = Mininet(controller=OVSController, link=TCLink) # TCLink permite usar TC para los eventos
+    net.addController("c0", controller=OVSController)
 
     # Crear el switch principal
     info("*** Creating Backbone\n")
@@ -257,13 +256,13 @@ def redComplejaFinal(role: str):
 
         # Conecta el router con el switch local
         net.addLink(router, switch)
-        # Conecta el router con el switch del backbone 
+        # Conecta el router con el switch del backbone
         net.addLink(router, s_core)
 
         # Crea los hosts de cada LAN
         for h in range(1, 3):
             host_name = f"h{i}_{h}"
-            host_ip = f"192.168.{subnet_val}.{h+10}/24"
+            host_ip = f"192.168.{subnet_val}.{h + 10}/24"
             gateway = f"192.168.{subnet_val}.1"
             h_node = net.addHost(host_name, ip=host_ip, defaultRoute=f"via {gateway}")
             net.addLink(h_node, switch)
