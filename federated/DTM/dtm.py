@@ -271,13 +271,76 @@ class FeedbackReceiver:
     """
 
     def __init__(self, listen_port: int, controller):
+        self.controller = controller
         # It creates an UDP socket to receive events
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Increase the buffer size
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        # bind the receiver
         self.sock.bind(("0.0.0.0", listen_port))
-        self.controller = controller
-        # It creates the main thread to receive events
-        threading.Thread(target=self._loop, daemon=True).start()
+        # Define an RX queue
+        self.q = queue.Queue(maxsize=200000)
+        # It defines the main thread just to receive events
+        threading.Thread(target=self._rx_loop, daemon=True).start()
+        # It defines a thread to process what has been received
+        for _ in range(2):
+            threading.Thread(target=self._worker_loop, daemon=True).start()
         print(f"[DTM] FeedbackReceiver listening on UDP {listen_port}")
+
+    def _rx_loop(self):
+        """
+        Loop to receive incoming packets
+        """
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(65535)
+                t_rx_ns = time.time_ns()
+                try:
+                    self.q.put_nowait((data, t_rx_ns))
+                except queue.Full:
+                    # opcional: contar drops internos
+                    pass
+            except Exception:
+                continue
+
+    def _worker_loop(self):
+        """
+        Loop to process received packets
+        """
+        while True:
+            try:
+                data, t_rx_ns = self.q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            # log_event("DTM_RAW_RX", {
+            #     "t_rx_ns": t_rx_ns,
+            #     "size_bytes": len(data)
+            # })
+
+            try:
+                ev = json.loads(data.decode())
+            except Exception:
+                # log_event("DTM_PARSE_ERR", {
+                #     "t_rx_ns": t_rx_ns,
+                #     "size_bytes": len(data)
+                # })
+                continue
+
+            # log_event(
+            #     "DTM_FEEDBACK_RX",
+            #     {
+            #         "event_id": ev.get("event_id"),
+            #         "ndt_id": ev.get("ndt_id"),
+            #         "priority": ev.get("priority"),
+            #         "t_rx_ns": t_rx_ns,
+            #         "size_bytes": len(data),
+            #     },
+            # )
+
+            self.controller.submit(ev, t_rx_ns, src="feedback")
+            self.q.task_done()
+
 
     def _loop(self):
         while True:
@@ -605,9 +668,12 @@ class FederatedController:
             # The sender queue is pushed:
             data = json.dumps(ev).encode()
             try:
-                self.send_q.put((data, ev, item), block=False)
+                # self.send_q.put((data, ev, item), block=False)
+                t_sendq_in_ns = time.time_ns()
+                self.send_q.put((data, ev, item, t_sendq_in_ns), block=True)
             except queue.Full:
                 log_event("DTM_SENDQ_FULL", {"event_id": event_id})
+                continue
 
     def send_loop(self):
         """
@@ -618,8 +684,23 @@ class FederatedController:
         # targets = list(range(self.fanout))
         targets = self.targets
         while True:
-            data, ev, item = self.send_q.get()
+            # data, ev, item = self.send_q.get()
+            data, ev, item, t_sendq_in_ns = self.send_q.get()
+
+            t_send_start_ns = time.time_ns()
+            sendq_wait_ms = (t_send_start_ns - t_sendq_in_ns) / 1e6
+
             event_id = ev.get("event_id")
+
+            log_event(
+                "DTM_SENDQ_DEQUEUE",
+                {
+                    "event_id": event_id,
+                    "sendq_wait_ms": sendq_wait_ms,
+                    "sendq_size": self.send_q.qsize(),
+                    "t_send_start_ns": t_send_start_ns,
+                },
+            )
 
             # at this moment just logical link set events are critical
             if is_critical(ev):
@@ -662,12 +743,15 @@ class FederatedController:
                     if self.wave_delay > 0:
                         time.sleep(self.wave_delay)
             # Logging DONE events.
+            t_done_ns = time.time_ns()
+
             log_event(
                 "DTM_EVENT_DONE",
                 {
                     "event_id": event_id,
                     "type": ev.get("type"),
-                    "t_done_ns": time.time_ns(),
+                    "t_done_ns": t_done_ns,
+                    "sendq_wait_ms": sendq_wait_ms
                 },
             )
 

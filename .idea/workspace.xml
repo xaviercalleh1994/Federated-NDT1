@@ -5,18 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="0b183594-d838-4778-b6bd-46d1679400a4" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/federated/DTM/dtm.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/ONM/onm.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/analysis/comparison.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/analysis/core_capaciy.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/analysis/dtm_analysis_enhance.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/ndt_event_gen/ndt_gen.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/relay/relay.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/federated/DTM/dtm_opt.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/federated/analysis/dtm_analysis_commmag.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/federated/analysis/new.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/federated/DTM/dtm_fed.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/DTM/dtm_old.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/federated/ONM/onm_fed.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/federated/analysis/metrics_dtm.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/on_manager/on_manager_fed.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/federated/DTM/dtm.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/DTM/dtm.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
