@@ -1,4 +1,3 @@
-import json
 import time
 import socket
 import argparse
@@ -9,11 +8,20 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 import queue
 from collections import deque
+import os
+import multiprocessing as mp
+
+# Intentar usar orjson para máxima velocidad, fallback a json estándar
+try:
+    import orjson as json
+except ImportError:
+    import json
 
 # ============================================================
 # ASYNC LOGGING
 # ============================================================
-log_queue = queue.Queue()
+# Aumentamos el maxsize drásticamente para soportar tormentas de 5000 ev/s
+log_queue = queue.Queue(maxsize=2000000)
 log_stop = threading.Event()
 
 # ============================================================
@@ -71,8 +79,8 @@ def count_done_event(
         done_event_ids.add(event_id)
         done_n = len(done_event_ids)
 
-    # Optional debug line:
-    if run_ctx.get("print_progress", False):
+    # Optional debug line (reducimos la impresión a cada 500 para no ahogar la terminal):
+    if run_ctx.get("print_progress", False) and done_n % 500 == 0:
         print(f"[DTM] done {done_n}/{limit} (event_id={event_id})", flush=True)
 
     if done_n >= limit:
@@ -84,15 +92,17 @@ def limit_reached():
     if stop_event.is_set():
         # tiny flush window
         time.sleep(0.15)
-
+        print(f"\n[DTM] event-limit reached ({run_ctx.get('event_limit')}). Flushing logs to disk...", flush=True)
         log_stop.set()
-        time.sleep(0.2)
 
-        print(
-            f"[DTM] event-limit reached ({run_ctx.get('event_limit')}). Exiting.",
-            flush=True,
-        )
-        sys.exit(0)
+        # Garantizamos que la cola de logs se vacíe en disco antes de matar el proceso
+        while not log_queue.empty():
+            time.sleep(0.1)
+
+        time.sleep(0.5)
+        print("[DTM] Logs saved successfully. Exiting.", flush=True)
+        # Usamos os._exit para matar todos los hilos instantáneamente de forma limpia
+        os._exit(0)
 
 
 # ============================================================
@@ -101,21 +111,21 @@ def limit_reached():
 def log_writer():
     path = run_ctx.get("log_file", log_file_default)
 
-    with open(path, "a", buffering=1) as f:
+    with open(path, "ab") as f:
         while not log_stop.is_set() or not log_queue.empty():
             try:
                 entry = log_queue.get(timeout=0.1)
-                f.write(json.dumps(entry) + "\n")
+                # orjson genera bytes, json normal genera string. Lo normalizamos.
+                line = json.dumps(entry)
+                if not isinstance(line, bytes):
+                    line = line.encode()
+                f.write(line + b"\n")
             except queue.Empty:
                 continue
 
 
 def log_event(tag: str, data: dict):
-    # entry = {"ts_ns": time.time_ns(), "tag": tag, **run_ctx, **data}
-    # with open(run_ctx.get("log_file", log_file_default), "a") as f:
-    #     f.write(json.dumps(entry) + "\n")
     entry = {"ts_ns": time.time_ns(), "tag": tag, **run_ctx, **data}
-
     try:
         log_queue.put_nowait(entry)
     except queue.Full:
@@ -156,7 +166,13 @@ def is_switch(n: str) -> bool:
 # Function to load the adjacency matrix topology obtained once the NDT runs
 def load_topo_graph() -> Dict[str, List[str]]:
     with open(topo_file) as f:
-        t = json.load(f)
+        content = f.read()
+        # Soporte cruzado para json/orjson
+        if hasattr(json, 'loads') and not isinstance(content, bytes) and 'orjson' in str(json):
+            t = json.loads(content.encode())
+        else:
+            t = json.loads(content)
+
     g = defaultdict(list)
     for a, b in t["links"]:
         g[a].append(b)
@@ -194,15 +210,16 @@ def path_only_switches_middle(g, src, dst):
 def control_call(ev: dict) -> dict:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((control_host, control_port))
-    s.sendall((json.dumps(ev) + "\n").encode())
-    data = b""
-    while b"\n" not in data:
+    data = json.dumps(ev)
+    s.sendall((data if isinstance(data, bytes) else data.encode()) + b"\n")
+    resp_data = b""
+    while b"\n" not in resp_data:
         chunk = s.recv(4096)
         if not chunk:
             break
-        data += chunk
+        resp_data += chunk
     s.close()
-    return json.loads(data.split(b"\n")[0].decode()) if data else {"ok": False}
+    return json.loads(resp_data.split(b"\n")[0]) if resp_data else {"ok": False}
 
 
 def apply_logical_link(g, a, b, e: Edge) -> int:
@@ -230,6 +247,8 @@ def apply_logical_link(g, a, b, e: Edge) -> int:
 class UdpReceiver:
     def __init__(self, relay_ip, relay_port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Optimization:
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         self.sock.bind(("0.0.0.0", relay_port))
         self.relay = (relay_ip, relay_port)
         threading.Thread(target=self._keepalive, daemon=True).start()
@@ -275,15 +294,18 @@ class FeedbackReceiver:
         # It creates an UDP socket to receive events
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Increase the buffer size
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         # bind the receiver
         self.sock.bind(("0.0.0.0", listen_port))
-        # Define an RX queue
-        self.q = queue.Queue(maxsize=200000)
+
+        # NUEVA LÓGICA: Colección rápida (deque + Condition) en lugar de Queue
+        self.q = deque()
+        self.cond = threading.Condition()
+
         # It defines the main thread just to receive events
         threading.Thread(target=self._rx_loop, daemon=True).start()
         # It defines a thread to process what has been received
-        for _ in range(2):
+        for _ in range(4):  # Subimos a 4 para aguantar la carga masiva
             threading.Thread(target=self._worker_loop, daemon=True).start()
         print(f"[DTM] FeedbackReceiver listening on UDP {listen_port}")
 
@@ -295,11 +317,9 @@ class FeedbackReceiver:
             try:
                 data, _ = self.sock.recvfrom(65535)
                 t_rx_ns = time.time_ns()
-                try:
-                    self.q.put_nowait((data, t_rx_ns))
-                except queue.Full:
-                    # opcional: contar drops internos
-                    pass
+                with self.cond:
+                    self.q.append((data, t_rx_ns))
+                    self.cond.notify()
             except Exception:
                 continue
 
@@ -308,65 +328,21 @@ class FeedbackReceiver:
         Loop to process received packets
         """
         while True:
-            try:
-                data, t_rx_ns = self.q.get(timeout=0.1)
-            except queue.Empty:
-                continue
+            # Vaciado en bloque (Batching) para eliminar la contención del Lock
+            with self.cond:
+                while not self.q:
+                    self.cond.wait()
+                batch = list(self.q)
+                self.q.clear()
 
-            # log_event("DTM_RAW_RX", {
-            #     "t_rx_ns": t_rx_ns,
-            #     "size_bytes": len(data)
-            # })
+            for data, t_rx_ns in batch:
+                try:
+                    ev = json.loads(data)
+                except Exception:
+                    continue
 
-            try:
-                ev = json.loads(data.decode())
-            except Exception:
-                # log_event("DTM_PARSE_ERR", {
-                #     "t_rx_ns": t_rx_ns,
-                #     "size_bytes": len(data)
-                # })
-                continue
-
-            # log_event(
-            #     "DTM_FEEDBACK_RX",
-            #     {
-            #         "event_id": ev.get("event_id"),
-            #         "ndt_id": ev.get("ndt_id"),
-            #         "priority": ev.get("priority"),
-            #         "t_rx_ns": t_rx_ns,
-            #         "size_bytes": len(data),
-            #     },
-            # )
-
-            self.controller.submit(ev, t_rx_ns, src="feedback")
-            self.q.task_done()
-
-
-    def _loop(self):
-        while True:
-            data, addr = self.sock.recvfrom(8192)
-            t_rx_ns = time.time_ns()
-            # log_event("DTM_RAW_RX", {"t_rx_ns": t_rx_ns, "size_bytes": len(data)})
-            try:
-                ev = json.loads(data.decode())
-            except Exception:
-                # log_event(
-                # "DTM_PARSE_ERR", {"t_rx_ns": t_rx_ns, "size_bytes": len(data)}
-                # )
-                continue
-
-            log_event(
-                "DTM_FEEDBACK_RX",
-                {
-                    "event_id": ev.get("event_id"),
-                    "ndt_id": ev.get("ndt_id"),
-                    "priority": ev.get("priority"),
-                    "t_rx_ns": t_rx_ns,
-                    "size_bytes": len(data),
-                },
-            )
-            # Send the event to the DTM scheduler
-            self.controller.submit(ev, t_rx_ns, src="feedback")
+                # Pasamos raw_data para omitir re-serialización json en el envío (Zero-Copy)
+                self.controller.submit(ev, t_rx_ns, src="feedback", raw_data=data)
 
 
 # ============================================================
@@ -451,7 +427,9 @@ def fast_dispatch_to_fanout(
       (sent_ok_total, dispatch_ns_total)
     """
     targets = list(range(fanout))
-    data = json.dumps(ev).encode()
+    data = json.dumps(ev)
+    if not isinstance(data, bytes):
+        data = data.encode()
 
     sent_ok_total = 0
     dispatch_ns_total = 0
@@ -510,6 +488,7 @@ class FederatedController:
     def __init__(
             self,
             sender,
+            onm_sender,
             fanout,
             group_size,
             wave_delay,
@@ -518,6 +497,7 @@ class FederatedController:
             send_workers: int = 4,
     ):
         self.sender = sender
+        self.onm_sender = onm_sender  # Nuevo sender hacia el ONM para cerrar el bucle
         self.fanout = fanout
         self.group_size = max(1, group_size)
         self.wave_delay = max(0.0, wave_delay)
@@ -533,12 +513,12 @@ class FederatedController:
             While threading.Lock() protects the queue against concurrent access, a thread
             might insert events while another thread may deque events
         """
-        # self.q = PriorityQueue()
         self.q = deque()
         self.q_lock = threading.Lock()
 
-        # NEW: queue for sending events
-        self.send_q = queue.Queue(maxsize=10000)
+        # NEW: queue for sending events using deque and Condition instead of mp.Queue
+        self.send_q = deque()
+        self.send_cond = threading.Condition()
 
         self.latest = {}
         # sequential event counter
@@ -552,14 +532,27 @@ class FederatedController:
         # Creates the Scheduler thread with the main loop
         threading.Thread(target=self._loop, daemon=True).start()
 
-        # Sender threads
-        for _ in range(send_workers):
-            threading.Thread(target=self.send_loop, args=(), daemon=True).start()
+        # EMPAQUETAMOS los parámetros para que coincidan con el worker
+        dst_ip = run_ctx.get("dst_ip", "127.0.0.1")
+        base_port = run_ctx.get("base_port", 8001)
+        params = (dst_ip, base_port, self.fanout)
 
-    def submit(self, ev, t_rx_ns: int, src: str):
+        # Sender threads (Subimos a 10 hilos en Threading en vez de mp.Process)
+        for _ in range(10):
+            t = threading.Thread(
+                target=self.send_loop_worker,
+                args=(params, self.onm_sender, self.targets, self.group_size, self.wave_delay, self.fanout)
+            )
+            t.daemon = True
+            t.start()
+
+    def submit(self, ev, t_rx_ns: int, src: str, raw_data: bytes = None):
         """
         Function to receive events and prepare them for processing
         """
+        # REGISTRAMOS EL 100% DE LOS EVENTOS PARA TENER MÉTRICAS REALES EN EL PAPER
+        should_log = True
+
         pr = ev_priority(ev)
         event_id = ev.get("event_id")
 
@@ -571,18 +564,20 @@ class FederatedController:
         # Read the current queue size
         with self.q_lock:
             qsize_now = len(self.q)
+
         # Logging an ingest event
-        log_event(
-            "DTM_INGEST",
-            {
-                "event_id": event_id,
-                "type": ev.get("type"),
-                "priority": pr,
-                "src": src,
-                "t_rx_ns": t_rx_ns,
-                "qsize": qsize_now,
-            },
-        )
+        if should_log:
+            log_event(
+                "DTM_INGEST",
+                {
+                    "event_id": event_id,
+                    "type": ev.get("type"),
+                    "priority": pr,
+                    "src": src,
+                    "t_rx_ns": t_rx_ns,
+                    "qsize": qsize_now,
+                },
+            )
 
         # Optional drop policy when queue is full: drop only if priority is worse
         if (
@@ -590,20 +585,23 @@ class FederatedController:
                 and qsize_now >= self.max_queue
                 and pr >= self.drop_prio_if_full
         ):
-            log_event(
-                "DTM_DROP",
-                {
-                    "event_id": event_id,
-                    "type": ev.get("type"),
-                    "priority": pr,
-                    "src": src,
-                    "reason": "queue_full",
-                    "qsize": qsize_now,
-                },
-            )
+            if should_log:
+                log_event(
+                    "DTM_DROP",
+                    {
+                        "event_id": event_id,
+                        "type": ev.get("type"),
+                        "priority": pr,
+                        "src": src,
+                        "reason": "queue_full",
+                        "qsize": qsize_now,
+                    },
+                )
             return
+
         # Constructs the item to further process it
-        item = {"ev": ev, "t_rx_ns": t_rx_ns, "src": src, "priority": pr}
+        item = {"ev": ev, "t_rx_ns": t_rx_ns, "src": src, "priority": pr, "should_log": should_log,
+                "raw_data": raw_data}
 
         """
         Decides how to queue the events. If it's an ON LOGICAL_LINK_SET event 
@@ -622,144 +620,192 @@ class FederatedController:
         Loop launched with the thread to continuously deque events
         """
         while True:
+            # Batch draining to avoid lock contention
             with self.q_lock:
                 if not self.q:
-                    # empty queue
-                    item_q = None
+                    batch = []
                 else:
-                    # deque first element
-                    item_q = self.q.popleft()
+                    batch = list(self.q)
+                    self.q.clear()
 
-            if item_q is None:
+            if not batch:
                 time.sleep(0.001)
                 continue
-            # unpackage the event composed by pr, #seq and payload
-            pr, seq, payload = item_q
 
-            if payload[0] == "DEDUP":
-                k = payload[1]
-                item = self.latest.pop(k, None)
-                if not item:
-                    continue
-            else:
-                item = payload[1]
-            # extract event information including deque time
-            ev = item["ev"]
-            event_id = ev.get("event_id")
-            t_deq_ns = time.time_ns()
-            queue_ms = (t_deq_ns - int(item["t_rx_ns"])) / 1e6
-            # measure queue size after deque for logging
-            with self.q_lock:
-                qsize_at_deq = len(self.q)
-            # logging deque event
-            log_event(
-                "DTM_DEQUEUE",
-                {
-                    "event_id": event_id,
-                    "type": ev.get("type"),
-                    "priority": int(item["priority"]),
-                    "src": item["src"],
-                    "queue_ms": queue_ms,
-                    "t_deq_ns": t_deq_ns,
-                    "qsize_at_deq": qsize_at_deq,
-                },
-            )
+            send_batch = []
+            for item_q in batch:
+                pr, seq, payload = item_q
 
-            # The sender queue is pushed:
-            data = json.dumps(ev).encode()
-            try:
-                # self.send_q.put((data, ev, item), block=False)
+                if payload[0] == "DEDUP":
+                    k = payload[1]
+                    item = self.latest.pop(k, None)
+                    if not item:
+                        continue
+                else:
+                    item = payload[1]
+
+                # extract event information including deque time
+                should_log = item.get("should_log", False)
+                ev = item["ev"]
+                event_id = ev.get("event_id")
+                t_deq_ns = time.time_ns()
+                queue_ms = (t_deq_ns - int(item["t_rx_ns"])) / 1e6
+
+                # logging deque event
+                if should_log:
+                    log_event(
+                        "DTM_DEQUEUE",
+                        {
+                            "event_id": event_id,
+                            "type": ev.get("type"),
+                            "priority": int(item["priority"]),
+                            "src": item["src"],
+                            "queue_ms": queue_ms,
+                            "t_deq_ns": t_deq_ns,
+                            "qsize_at_deq": 0,  # Optimizamos: ya no medimos len() aquí
+                        },
+                    )
+
+                # The sender queue is pushed
                 t_sendq_in_ns = time.time_ns()
-                self.send_q.put((data, ev, item, t_sendq_in_ns), block=True)
-            except queue.Full:
-                log_event("DTM_SENDQ_FULL", {"event_id": event_id})
-                continue
+                send_batch.append((ev, item, t_sendq_in_ns, should_log))
 
-    def send_loop(self):
+            if send_batch:
+                with self.send_cond:
+                    self.send_q.extend(send_batch)
+                    self.send_cond.notify_all()
+
+    # @staticmethod
+    def send_loop_worker(self, sender_params, onm_sender, targets, group_size, wave_delay, fanout):
+        # Desempaqueta la tupla que creamos arriba
+        dst_ip, base_port, fanout_val = sender_params
+        worker_sender = UdpSender(dst_ip, base_port, fanout_val)
+
         """
         This is the main loop for sending the response to
         the NDTs without blocking the main scheduler thread
         """
-
-        # targets = list(range(self.fanout))
-        targets = self.targets
         while True:
-            # data, ev, item = self.send_q.get()
-            data, ev, item, t_sendq_in_ns = self.send_q.get()
+            with self.send_cond:
+                while not self.send_q:
+                    self.send_cond.wait()
+                batch = list(self.send_q)
+                self.send_q.clear()
 
-            t_send_start_ns = time.time_ns()
-            sendq_wait_ms = (t_send_start_ns - t_sendq_in_ns) / 1e6
+            for res in batch:
+                ev, item, t_sendq_in_ns, should_log = res
 
-            event_id = ev.get("event_id")
+                # Aseguramos que data sea bytes para el socket sin re-serializar
+                data = item.get("raw_data") or json.dumps(ev)
+                if not isinstance(data, bytes):
+                    data = data.encode()
 
-            log_event(
-                "DTM_SENDQ_DEQUEUE",
-                {
-                    "event_id": event_id,
-                    "sendq_wait_ms": sendq_wait_ms,
-                    "sendq_size": self.send_q.qsize(),
-                    "t_send_start_ns": t_send_start_ns,
-                },
-            )
+                t_send_start_ns = time.time_ns()
+                sendq_wait_ms = (t_send_start_ns - t_sendq_in_ns) / 1e6
+                event_id = ev.get("event_id")
 
-            # at this moment just logical link set events are critical
-            if is_critical(ev):
-                t0 = time.time_ns()
-                sent_ok = self.sender.send(data, targets)
-                dispatch_ns = time.time_ns() - t0
-                log_event(
-                    "DTM_BROADCAST",
-                    {
-                        "event_id": event_id,
-                        "fanout": self.fanout,
-                        "sent_ok": sent_ok,
-                        "dispatch_ns": dispatch_ns,
-                    },
-                )
-            else:
-                wave_id = 0
-                for i in range(0, self.fanout, self.group_size):
-                    # events are sent serially to the NDTs
-                    grp = targets[i: i + self.group_size]
-                    t0 = time.time_ns()
-                    try:
-                        sent_ok = self.sender.send(data, grp)
-                    except Exception as e:
-                        log_event("DTM_SEND_ERR", {"event_id": event_id, "err": str(e)})
-                        continue
-                    dispatch_ns = time.time_ns() - t0
+                if should_log:
                     log_event(
-                        "DTM_ROLLING_SEND",
+                        "DTM_SENDQ_DEQUEUE",
                         {
                             "event_id": event_id,
-                            "fanout": self.fanout,
-                            "wave_id": wave_id,
-                            "group_size": len(grp),
-                            "sent_ok": sent_ok,
-                            "dispatch_ns": dispatch_ns,
+                            "sendq_wait_ms": sendq_wait_ms,
+                            "t_send_start_ns": t_send_start_ns,
                         },
                     )
-                    wave_id += 1
-                    if self.wave_delay > 0:
-                        time.sleep(self.wave_delay)
-            # Logging DONE events.
-            t_done_ns = time.time_ns()
 
-            log_event(
-                "DTM_EVENT_DONE",
-                {
-                    "event_id": event_id,
-                    "type": ev.get("type"),
-                    "t_done_ns": t_done_ns,
-                    "sendq_wait_ms": sendq_wait_ms
-                },
-            )
+                # =======================================================
+                # EXPERIMENTO 2 (UPSTREAM): NDT FEEDBACK -> DTM -> ONM
+                # =======================================================
+                if item["src"] == "feedback":
+                    prioridad = int(ev.get("priority", 100))
 
-            # NEW: count completion for queued (feedback) events
-            count_done_event(str(event_id))
-            limit_reached()
+                    # 1. Filtrado: Solo alertamos al ONM si es crítico (ej. <= 20)
+                    if prioridad <= 20 and onm_sender:
+                        t_send_onm = time.time_ns()
+                        try:
+                            onm_sender.send(data, [0])
+                            if should_log:
+                                log_event("DTM_ALERT_TO_ONM", {
+                                    "event_id": event_id,
+                                    "priority": prioridad,
+                                    "latency_to_onm_ns": time.time_ns() - t_send_onm
+                                })
+                        except Exception:
+                            pass
 
-            self.send_q.task_done()
+                    # 2. Terminamos el procesamiento sin hacer Broadcast a NDTs
+                    t_done_ns = time.time_ns()
+                    if should_log:
+                        log_event("DTM_EVENT_DONE", {
+                            "event_id": event_id, "type": ev.get("type"),
+                            "t_done_ns": t_done_ns, "sendq_wait_ms": sendq_wait_ms
+                        })
+                    count_done_event(str(event_id))
+                    continue  # <-- Detiene el flujo aquí
+
+                # =======================================================
+                # EXPERIMENTO 1 (DOWNSTREAM): ONM -> NDTs
+                # =======================================================
+                if is_critical(ev):
+                    t0 = time.time_ns()
+                    # USAMOS el worker_sender local
+                    sent_ok = worker_sender.send(data, targets)
+                    dispatch_ns = time.time_ns() - t0
+                    if should_log:
+                        log_event(
+                            "DTM_BROADCAST",
+                            {
+                                "event_id": event_id,
+                                "fanout": fanout,
+                                "sent_ok": sent_ok,
+                                "dispatch_ns": dispatch_ns,
+                            },
+                        )
+                else:
+                    wave_id = 0
+                    for i in range(0, fanout, group_size):
+                        # events are sent serially to the NDTs
+                        grp = targets[i: i + group_size]
+                        t0 = time.time_ns()
+                        try:
+                            # USAMOS el worker_sender local
+                            sent_ok = worker_sender.send(data, grp)
+                        except Exception as e:
+                            log_event("DTM_SEND_ERR", {"event_id": event_id, "err": str(e)})
+                            continue
+                        dispatch_ns = time.time_ns() - t0
+                        if should_log:
+                            log_event(
+                                "DTM_ROLLING_SEND",
+                                {
+                                    "event_id": event_id,
+                                    "fanout": fanout,
+                                    "wave_id": wave_id,
+                                    "group_size": len(grp),
+                                    "sent_ok": sent_ok,
+                                    "dispatch_ns": dispatch_ns,
+                                },
+                            )
+                        wave_id += 1
+                        if wave_delay > 0:
+                            time.sleep(wave_delay)
+
+                # Logging DONE events.
+                t_done_ns = time.time_ns()
+                if should_log:
+                    log_event(
+                        "DTM_EVENT_DONE",
+                        {
+                            "event_id": event_id,
+                            "type": ev.get("type"),
+                            "t_done_ns": t_done_ns,
+                            "sendq_wait_ms": sendq_wait_ms
+                        },
+                    )
+
+                # NEW: count completion for queued (feedback) events
+                count_done_event(str(event_id))
 
 
 # ============================================================
@@ -790,6 +836,10 @@ def main():
     ap.add_argument("--proto", required=True, choices=["udp", "tcp"])
     ap.add_argument("--relay-ip", required=True)
     ap.add_argument("--relay-port", type=int, default=7001)
+
+    # NUEVO: Puerto para reenviar telemetría crítica de vuelta al ONM
+    ap.add_argument("--onm-port", type=int, default=7002)
+
     ap.add_argument("--mode", choices=["1:1", "federated"], default="1:1")
     # federated downstream fanout
     ap.add_argument("--fanout", type=int, default=0)
@@ -891,6 +941,7 @@ def main():
     # Initializes the controllers
     controller = None
     sender = None
+    onm_sender = None
 
     if args.mode == "federated":
         if args.fanout <= 0:
@@ -903,10 +954,18 @@ def main():
             else TcpSender(args.dst_ip, args.base_port, args.fanout)
         )
 
+        # Sender hacia el ONM para el bucle cerrado
+        onm_sender = (
+            UdpSender(args.relay_ip, args.onm_port, 1)
+            if args.proto == "udp"
+            else TcpSender(args.relay_ip, args.onm_port, 1)
+        )
+
         # Federated controller is the DTM scheduler in the federated approach
         # to handle events received from the NDTs
         controller = FederatedController(
             sender=sender,
+            onm_sender=onm_sender,
             fanout=args.fanout,
             group_size=args.group_size,
             wave_delay=args.wave_delay,
@@ -930,15 +989,13 @@ def main():
         t_rx_ns = time.time_ns()
 
         try:
-            ev = json.loads(data.decode())
+            ev = json.loads(data.decode() if isinstance(data, bytes) else data)
         except Exception as e:
             log_event("NDT_RX_PARSE_ERR", {"err": str(e), "size_bytes": len(data)})
             continue
 
         event_id = ev.get("event_id")
         ev_type = ev.get("type", "NA")
-
-        # print(f"[NDT] EVENT RECEIVED {event_id}", flush=True)
 
         log_event(
             "NDT_EVENT_RX",
