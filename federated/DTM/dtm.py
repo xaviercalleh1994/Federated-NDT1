@@ -9,6 +9,7 @@ from collections import defaultdict
 import queue
 from collections import deque
 import os
+import gc
 import multiprocessing as mp
 
 # Intentar usar orjson para máxima velocidad, fallback a json estándar
@@ -87,41 +88,105 @@ def count_done_event(
         stop_event.set()
 
 
+# def limit_reached():
+#     """Exit cleanly once stop_event is set."""
+#     if stop_event.is_set():
+#         # tiny flush window
+#         time.sleep(0.15)
+#         print(f"\n[DTM] event-limit reached ({run_ctx.get('event_limit')}). Flushing logs to disk...", flush=True)
+#         log_stop.set()
+#
+#         # Garantizamos que la cola de logs se vacíe en disco antes de matar el proceso
+#         while not log_queue.empty():
+#             time.sleep(0.1)
+#
+#         time.sleep(0.5)
+#         print("[DTM] Logs saved successfully. Exiting.", flush=True)
+#         # Usamos os._exit para matar todos los hilos instantáneamente de forma limpia
+#         os._exit(0)
 def limit_reached():
     """Exit cleanly once stop_event is set."""
     if stop_event.is_set():
-        # tiny flush window
         time.sleep(0.15)
-        print(f"\n[DTM] event-limit reached ({run_ctx.get('event_limit')}). Flushing logs to disk...", flush=True)
+        print(f"\n[DTM] experiment duration reached. Flushing logs...", flush=True)
         log_stop.set()
 
-        # Garantizamos que la cola de logs se vacíe en disco antes de matar el proceso
-        while not log_queue.empty():
+        # Drenamos la cola, pero con un límite máximo de 5 segundos de seguridad.
+        # Si la red está en silencio (como debe ser), esto tomará 0.1 segundos.
+        timeout = 50  # 50 * 0.1s = 5 segundos
+        while not log_queue.empty() and timeout > 0:
             time.sleep(0.1)
+            timeout -= 1
 
-        time.sleep(0.5)
-        print("[DTM] Logs saved successfully. Exiting.", flush=True)
-        # Usamos os._exit para matar todos los hilos instantáneamente de forma limpia
+        if timeout <= 0:
+            print("[DTM] Advertencia: Se forzó el cierre para evitar un loop infinito.", flush=True)
+        else:
+            print("[DTM] Logs saved successfully. Exiting.", flush=True)
+
+        gc.enable()
         os._exit(0)
 
 
 # ============================================================
-# LOGGING
+# LOGGING (OPTIMIZADO CON BATCHING Y ESCRITURA BINARIA LIMPIA)
 # ============================================================
+# def log_writer():
+#     path = run_ctx.get("log_file", log_file_default)
+#
+#     # Usamos "wb" para borrar el archivo anterior y evitar zombis
+#     with open(path, "wb") as f:
+#         while not log_stop.is_set() or not log_queue.empty():
+#             batch = []
+#             try:
+#                 # Extraemos hasta 5000 eventos de golpe para no ahogar el disco
+#                 for _ in range(5000):
+#                     batch.append(log_queue.get_nowait())
+#             except queue.Empty:
+#                 pass
+#
+#             if batch:
+#                 lines = []
+#                 for entry in batch:
+#                     line = json.dumps(entry)
+#                     if not isinstance(line, bytes):
+#                         line = line.encode()
+#                     lines.append(line)
+#
+#                 # Escribimos todo el bloque junto
+#                 f.write(b"\n".join(lines) + b"\n")
+#             else:
+#                 # Si no hay eventos, dormimos una fracción para no quemar CPU
+#                 time.sleep(0.05)
 def log_writer():
     path = run_ctx.get("log_file", log_file_default)
+    try:
+        with open(path, "wb") as f:
+            while not log_stop.is_set() or not log_queue.empty():
+                batch = []
+                try:
+                    for _ in range(5000):
+                        batch.append(log_queue.get_nowait())
+                except queue.Empty:
+                    pass
 
-    with open(path, "ab") as f:
-        while not log_stop.is_set() or not log_queue.empty():
-            try:
-                entry = log_queue.get(timeout=0.1)
-                # orjson genera bytes, json normal genera string. Lo normalizamos.
-                line = json.dumps(entry)
-                if not isinstance(line, bytes):
-                    line = line.encode()
-                f.write(line + b"\n")
-            except queue.Empty:
-                continue
+                if batch:
+                    lines = []
+                    for entry in batch:
+                        try:
+                            line = json.dumps(entry)
+                            if not isinstance(line, bytes):
+                                line = line.encode()
+                            lines.append(line)
+                        except Exception:
+                            # Si un evento viene corrupto, lo ignoramos. ¡EL HILO NUNCA MUERE!
+                            pass
+
+                    if lines:
+                        f.write(b"\n".join(lines) + b"\n")
+                else:
+                    time.sleep(0.05)
+    except Exception as e:
+        print(f"\n[FATAL] El hilo de logs murió por un error de disco: {e}", flush=True)
 
 
 def log_event(tag: str, data: dict):
@@ -247,6 +312,8 @@ def apply_logical_link(g, a, b, e: Edge) -> int:
 class UdpReceiver:
     def __init__(self, relay_ip, relay_port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Timeout para que el DTM no se quede en coma y pueda apagarse
+        self.sock.settimeout(0.5)
         # Optimization:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         self.sock.bind(("0.0.0.0", relay_port))
@@ -262,22 +329,29 @@ class UdpReceiver:
             time.sleep(5)
 
     def recv(self) -> bytes:
-        return self.sock.recvfrom(65535)[0]
+        try:
+            return self.sock.recvfrom(65535)[0]
+        except socket.timeout:
+            return b""
 
 
 class TcpReceiver:
     def __init__(self, relay_ip, relay_port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(0.5)
         self.sock.connect((relay_ip, relay_port))
         self.sock.sendall(b"NDT\n")
 
     def recv(self) -> bytes:
-        hdr = recv_exact(self.sock, 4)
-        if not hdr:
+        try:
+            hdr = recv_exact(self.sock, 4)
+            if not hdr:
+                return b""
+            ln = int.from_bytes(hdr, "big")
+            payload = recv_exact(self.sock, ln)
+            return payload if payload else b""
+        except socket.timeout:
             return b""
-        ln = int.from_bytes(hdr, "big")
-        payload = recv_exact(self.sock, ln)
-        return payload if payload else b""
 
 
 # ============================================================
@@ -537,8 +611,8 @@ class FederatedController:
         base_port = run_ctx.get("base_port", 8001)
         params = (dst_ip, base_port, self.fanout)
 
-        # Sender threads (Subimos a 10 hilos en Threading en vez de mp.Process)
-        for _ in range(10):
+        # OPTIMIZACIÓN: Bajamos los hilos de 10 a 2 para evitar colisión de GIL en Python
+        for _ in range(2):
             t = threading.Thread(
                 target=self.send_loop_worker,
                 args=(params, self.onm_sender, self.targets, self.group_size, self.wave_delay, self.fanout)
@@ -565,19 +639,9 @@ class FederatedController:
         with self.q_lock:
             qsize_now = len(self.q)
 
-        # Logging an ingest event
-        if should_log:
-            log_event(
-                "DTM_INGEST",
-                {
-                    "event_id": event_id,
-                    "type": ev.get("type"),
-                    "priority": pr,
-                    "src": src,
-                    "t_rx_ns": t_rx_ns,
-                    "qsize": qsize_now,
-                },
-            )
+        # LOG SILENCIADO: DTM_INGEST (Se usa la mochila en su lugar)
+        # if should_log:
+        #     log_event("DTM_INGEST", {...})
 
         # Optional drop policy when queue is full: drop only if priority is worse
         if (
@@ -599,7 +663,7 @@ class FederatedController:
                 )
             return
 
-        # Constructs the item to further process it
+        # Constructs the item to further process it (LA MOCHILA DEL EVENTO)
         item = {"ev": ev, "t_rx_ns": t_rx_ns, "src": src, "priority": pr, "should_log": should_log,
                 "raw_data": raw_data}
 
@@ -651,20 +715,8 @@ class FederatedController:
                 t_deq_ns = time.time_ns()
                 queue_ms = (t_deq_ns - int(item["t_rx_ns"])) / 1e6
 
-                # logging deque event
-                if should_log:
-                    log_event(
-                        "DTM_DEQUEUE",
-                        {
-                            "event_id": event_id,
-                            "type": ev.get("type"),
-                            "priority": int(item["priority"]),
-                            "src": item["src"],
-                            "queue_ms": queue_ms,
-                            "t_deq_ns": t_deq_ns,
-                            "qsize_at_deq": 0,  # Optimizamos: ya no medimos len() aquí
-                        },
-                    )
+                # LOG SILENCIADO: DTM_DEQUEUE. Guardamos en la mochila
+                item["queue_ms"] = queue_ms
 
                 # The sender queue is pushed
                 t_sendq_in_ns = time.time_ns()
@@ -704,15 +756,8 @@ class FederatedController:
                 sendq_wait_ms = (t_send_start_ns - t_sendq_in_ns) / 1e6
                 event_id = ev.get("event_id")
 
-                if should_log:
-                    log_event(
-                        "DTM_SENDQ_DEQUEUE",
-                        {
-                            "event_id": event_id,
-                            "sendq_wait_ms": sendq_wait_ms,
-                            "t_send_start_ns": t_send_start_ns,
-                        },
-                    )
+                # LOG SILENCIADO: DTM_SENDQ_DEQUEUE. Guardamos en la mochila
+                item["sendq_wait_ms"] = sendq_wait_ms
 
                 # =======================================================
                 # EXPERIMENTO 2 (UPSTREAM): NDT FEEDBACK -> DTM -> ONM
@@ -738,8 +783,14 @@ class FederatedController:
                     t_done_ns = time.time_ns()
                     if should_log:
                         log_event("DTM_EVENT_DONE", {
-                            "event_id": event_id, "type": ev.get("type"),
-                            "t_done_ns": t_done_ns, "sendq_wait_ms": sendq_wait_ms
+                            "event_id": event_id,
+                            "type": ev.get("type"),
+                            "src": item.get("src"),
+                            "priority": item.get("priority", 100),
+                            "t_rx_ns": item.get("t_rx_ns"),
+                            "queue_ms": item.get("queue_ms", 0),
+                            "sendq_wait_ms": item.get("sendq_wait_ms", 0),
+                            "t_done_ns": t_done_ns
                         })
                     count_done_event(str(event_id))
                     continue  # <-- Detiene el flujo aquí
@@ -799,8 +850,12 @@ class FederatedController:
                         {
                             "event_id": event_id,
                             "type": ev.get("type"),
-                            "t_done_ns": t_done_ns,
-                            "sendq_wait_ms": sendq_wait_ms
+                            "src": item.get("src"),
+                            "priority": item.get("priority", 100),
+                            "t_rx_ns": item.get("t_rx_ns"),
+                            "queue_ms": item.get("queue_ms", 0),
+                            "sendq_wait_ms": item.get("sendq_wait_ms", 0),
+                            "t_done_ns": t_done_ns
                         },
                     )
 
@@ -924,6 +979,8 @@ def main():
         # Once the DTM is launched, starts a thread with the experiment
         # duration to stop the DTM.
         threading.Thread(target=stop_after_duration, daemon=True).start()
+
+    gc.disable()
 
     # Loads the DTM adjacency matrix (Just in 1:1 Mode)
     if args.mode == "1:1":

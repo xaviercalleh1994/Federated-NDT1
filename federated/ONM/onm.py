@@ -42,7 +42,6 @@ class Matrix:
         self.rev: Dict[int, str] = {}
         self.m: List[List[Optional[Edge]]] = []
 
-
     def _ensure(self, n: str):
         if n in self.idx:
             return
@@ -56,14 +55,12 @@ class Matrix:
 
         self.m.append([None] * (i + 1))
 
-
     def set(self, a: str, b: str, e: Edge):
         self._ensure(a)
         self._ensure(b)
         i, j = self.idx[a], self.idx[b]
         self.m[i][j] = e
         self.m[j][i] = e
-
 
     def show(self):
         print("\nLogic Nodes:")
@@ -255,6 +252,8 @@ def main():
                     help="Type of relay used: local router VM or remote VPS server")
     ap.add_argument("--log-file", default=LOG_FILE_DEFAULT,
                     help="Path to ON manager log file (JSONL)")
+    ap.add_argument("--mock-on", action="store_true",
+                    help="When activated, it skips the application of local actions")
     args = ap.parse_args()
 
     global RUN_CTX
@@ -283,7 +282,10 @@ def main():
     print("  quit\n")
 
     while True:
-        line = input("> ").strip()
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            break
 
         if not line:
             continue
@@ -321,12 +323,13 @@ def main():
             })
 
             # Apply locally in ON
-            ok = apply_logical_edge_to_on(g, a, b, e)
-
-            if not ok:
-                print("[ON] Failed to apply locally")
-                log_event("ON_EVENT_LOCAL_APPLY_FAIL", {"event_id": event_id, "a": a, "b": b})
-                continue
+            if not args.mock_on:
+                if not apply_logical_edge_to_on(g, a, b, e):
+                    log_event("ON_EVENT_LOCAL_APPLY_FAIL", {"event_id": event_id, "a": a, "b": b})
+                    continue
+            else:
+                # Simulamos que lo aplicó localmente al instante para no frenar el test
+                pass
 
             # Build sync event (sent to relay, not directly to NDT)
             ev = {
@@ -347,7 +350,9 @@ def main():
                 "size_bytes": len(payload)
             })
 
-            print("[ON] Event applied locally and sent to relay")
+            # Evita inundar la terminal en modo mock de estrés
+            if not args.mock_on:
+                print("[ON] Event applied locally and sent to relay")
             continue
 
         if cmd == "exec":
@@ -371,7 +376,6 @@ def main():
             if shell_cmd.startswith('"') and shell_cmd.endswith('"'):
                 shell_cmd = shell_cmd[1:-1]
 
-            # ev = {"type": "EXEC_CMD", "payload": {"node": node, "cmd": shell_cmd}}
             ev = {
                 "type": "EXEC_CMD",
                 "event_id": event_id,
@@ -383,8 +387,9 @@ def main():
             }
 
             # Execute in ON
-            resp = control_call(ev)
-            print("[ON EXEC]", resp)
+            if not args.mock_on:
+                resp = control_call(ev)
+                print("[ON EXEC]", resp)
 
             # Also send to NDT via relay (so it mirrors the exec)
             payload = json.dumps(ev).encode()
