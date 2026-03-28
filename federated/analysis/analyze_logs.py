@@ -151,6 +151,16 @@ def compute_upstream(df: pd.DataFrame, exp_name: str):
     else:
         proc_lat_mean, proc_lat_p95 = np.nan, np.nan
 
+    # NUEVO: Análisis de Drops por Prioridad (Crucial para el Paper)
+    # Suponiendo que las prioridades son 10, 20 (Críticas) y 50, 100 (Fondo)
+    drops_prio_baja = 0
+    drops_prio_alta = 0
+    if not drops.empty and "priority" in drops.columns:
+        prio_series = pd.to_numeric(drops["priority"], errors="coerce").fillna(100)
+        # Consideramos <= 20 como Crítico (Alta), > 20 como Fondo (Baja)
+        drops_prio_alta = len(prio_series[prio_series <= 20])
+        drops_prio_baja = len(prio_series[prio_series > 20])
+
     return {
         "Experiment": exp_name,
         "Offered Load (ev/s)": round(offered_load, 2),
@@ -160,7 +170,9 @@ def compute_upstream(df: pd.DataFrame, exp_name: str):
         "Queue Mean (ms)": round(q_mean, 3),
         "Queue P95 (ms)": round(q_p95, 3),
         "Proc Lat Mean (ms)": round(proc_lat_mean, 3),
-        "Proc Lat P95 (ms)": round(proc_lat_p95, 3)
+        "Proc Lat P95 (ms)": round(proc_lat_p95, 3),
+        "Drops (Critical <=20)": drops_prio_alta,  # NUEVA COLUMNA
+        "Drops (Background >20)": drops_prio_baja  # NUEVA COLUMNA
     }
 
 

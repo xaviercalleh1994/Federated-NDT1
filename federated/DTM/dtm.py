@@ -88,22 +88,6 @@ def count_done_event(
         stop_event.set()
 
 
-# def limit_reached():
-#     """Exit cleanly once stop_event is set."""
-#     if stop_event.is_set():
-#         # tiny flush window
-#         time.sleep(0.15)
-#         print(f"\n[DTM] event-limit reached ({run_ctx.get('event_limit')}). Flushing logs to disk...", flush=True)
-#         log_stop.set()
-#
-#         # Garantizamos que la cola de logs se vacíe en disco antes de matar el proceso
-#         while not log_queue.empty():
-#             time.sleep(0.1)
-#
-#         time.sleep(0.5)
-#         print("[DTM] Logs saved successfully. Exiting.", flush=True)
-#         # Usamos os._exit para matar todos los hilos instantáneamente de forma limpia
-#         os._exit(0)
 def limit_reached():
     """Exit cleanly once stop_event is set."""
     if stop_event.is_set():
@@ -130,33 +114,6 @@ def limit_reached():
 # ============================================================
 # LOGGING (OPTIMIZADO CON BATCHING Y ESCRITURA BINARIA LIMPIA)
 # ============================================================
-# def log_writer():
-#     path = run_ctx.get("log_file", log_file_default)
-#
-#     # Usamos "wb" para borrar el archivo anterior y evitar zombis
-#     with open(path, "wb") as f:
-#         while not log_stop.is_set() or not log_queue.empty():
-#             batch = []
-#             try:
-#                 # Extraemos hasta 5000 eventos de golpe para no ahogar el disco
-#                 for _ in range(5000):
-#                     batch.append(log_queue.get_nowait())
-#             except queue.Empty:
-#                 pass
-#
-#             if batch:
-#                 lines = []
-#                 for entry in batch:
-#                     line = json.dumps(entry)
-#                     if not isinstance(line, bytes):
-#                         line = line.encode()
-#                     lines.append(line)
-#
-#                 # Escribimos todo el bloque junto
-#                 f.write(b"\n".join(lines) + b"\n")
-#             else:
-#                 # Si no hay eventos, dormimos una fracción para no quemar CPU
-#                 time.sleep(0.05)
 def log_writer():
     path = run_ctx.get("log_file", log_file_default)
     try:
@@ -568,6 +525,7 @@ class FederatedController:
             wave_delay,
             max_queue: int,
             drop_prio_if_full: int,
+            disable_priorities: bool = False,
             send_workers: int = 4,
     ):
         self.sender = sender
@@ -578,6 +536,7 @@ class FederatedController:
 
         self.max_queue = max_queue
         self.drop_prio_if_full = drop_prio_if_full
+        self.disable_priorities = disable_priorities
 
         """
             Queue structure:
@@ -639,29 +598,44 @@ class FederatedController:
         with self.q_lock:
             qsize_now = len(self.q)
 
-        # LOG SILENCIADO: DTM_INGEST (Se usa la mochila en su lugar)
-        # if should_log:
-        #     log_event("DTM_INGEST", {...})
+        # ==========================================================
+        # POLÍTICA DE DESCARTE (ADMISSION CONTROL)
+        # ==========================================================
+        if self.max_queue > 0 and qsize_now >= self.max_queue:
 
-        # Optional drop policy when queue is full: drop only if priority is worse
-        if (
-                self.max_queue > 0
-                and qsize_now >= self.max_queue
-                and pr >= self.drop_prio_if_full
-        ):
-            if should_log:
-                log_event(
-                    "DTM_DROP",
-                    {
-                        "event_id": event_id,
-                        "type": ev.get("type"),
-                        "priority": pr,
-                        "src": src,
-                        "reason": "queue_full",
-                        "qsize": qsize_now,
-                    },
-                )
-            return
+            if self.disable_priorities:
+                # MODO FIFO ESTRICTO (Tail Drop)
+                # La cola está llena -> Bota TODO, sin importar la prioridad
+                if should_log:
+                    log_event(
+                        "DTM_DROP",
+                        {
+                            "event_id": event_id,
+                            "type": ev.get("type"),
+                            "priority": pr,
+                            "src": src,
+                            "reason": "queue_full_fifo_drop",
+                            "qsize": qsize_now,
+                        },
+                    )
+                return
+            else:
+                # MODO GESTIÓN ACTIVA POR PRIORIDAD (QoS)
+                # La cola está llena -> Solo bota los paquetes de prioridad baja
+                if pr >= self.drop_prio_if_full:
+                    if should_log:
+                        log_event(
+                            "DTM_DROP",
+                            {
+                                "event_id": event_id,
+                                "type": ev.get("type"),
+                                "priority": pr,
+                                "src": src,
+                                "reason": "queue_full_prio_drop",
+                                "qsize": qsize_now,
+                            },
+                        )
+                    return
 
         # Constructs the item to further process it (LA MOCHILA DEL EVENTO)
         item = {"ev": ev, "t_rx_ns": t_rx_ns, "src": src, "priority": pr, "should_log": should_log,
@@ -917,6 +891,16 @@ def main():
         default=60,
         help="If queue full, drop events with priority >= this value (lower is higher priority).",
     )
+
+    # ========================================================
+    # NUEVO PARÁMETRO: DESACTIVAR PRIORIDADES (MODO FIFO)
+    # ========================================================
+    ap.add_argument(
+        "--disable-priorities",
+        action="store_true",
+        help="Si se activa, el DTM ignora las prioridades y aplica estricto Tail Drop (FIFO) cuando la cola se llena.",
+    )
+
     # keep functionality: if you ever want to enqueue ONM events again
     ap.add_argument(
         "--enqueue-onm",
@@ -1028,11 +1012,12 @@ def main():
             wave_delay=args.wave_delay,
             max_queue=args.max_queue,
             drop_prio_if_full=args.drop_prio_if_full,
+            disable_priorities=args.disable_priorities,
         )
 
         # It is the interface for receiving the NDT events
         FeedbackReceiver(args.feedback_port, controller)
-        print(f"[NDT] Federated mode (fanout={args.fanout})", flush=True)
+        print(f"[NDT] Federated mode (fanout={args.fanout}, Disable Priorities={args.disable_priorities})", flush=True)
 
     print(f"[NDT] Ready ({args.proto.upper()}, mode={args.mode})", flush=True)
 
