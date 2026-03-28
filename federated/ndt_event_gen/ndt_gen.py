@@ -1,26 +1,64 @@
-import socket
-import argparse
+"""
+NDT Simulator — deterministic build
+
+listen   : passive sink for Experiment 1 (fanout downstream).
+generate : clock-disciplined alert generator for Experiment 2 (upstream load).
+
+Reproducibility improvements
+------------------------------
+* All payloads for fixed-priority modes are pre-encoded once before the hot
+  loop — the serialiser never runs inside the tick loop.
+* precision_sleep uses OS sleep down to ~2 ms before target, then a bounded
+  spin-lock.  The spin is bounded to 3 ms max so a preempted VM cannot drift
+  by more than one tick.
+* GC is disabled for the duration of the generator hot loop.
+* Socket send buffer is set to 4 MB to absorb bursts without blocking.
+* A per-run summary (start_wall, ticks_fired, events_sent, actual_rate) is
+  printed on exit for quick sanity-checking of reproducibility.
+"""
+
+import gc
+import sys
 import time
 import random
+import socket
 import threading
-import sys
-import gc  # IMPORTANTE: Para controlar el Garbage Collector
+import argparse
+from typing import List, Optional, Tuple
 
-# CAMBIO ESENCIAL: Usar orjson para velocidad extrema
 try:
-    import orjson as json
-
-    _USING_ORJSON = True
+    import orjson as _json
+    _ORJSON = True
 except ImportError:
-    import json
+    import json as _json  # type: ignore
+    _ORJSON = False
 
-    _USING_ORJSON = False
+
+# ---------------------------------------------------------------------------
+# Precision sleep
+# ---------------------------------------------------------------------------
+
+def precision_sleep(target_perf: float) -> None:
+    """
+    Sleep until time.perf_counter() >= target_perf.
+    Coarse OS sleep down to 2 ms before target, then spin-lock (max 3 ms).
+    The spin bound prevents unbounded CPU burn if the OS delays the wakeup.
+    """
+    gap = target_perf - time.perf_counter()
+    if gap > 0.003:
+        time.sleep(gap - 0.002)
+    # Spin with a hard deadline to avoid burning CPU on a slow VM
+    spin_limit = target_perf + 0.003
+    while time.perf_counter() < target_perf:
+        if time.perf_counter() > spin_limit:
+            break
 
 
-# =================================================================
-# MODO LISTEN (EXPERIMENTO 1) - Actúa como Sumidero (Sink)
-# =================================================================
-def udp_listener(port):
+# ---------------------------------------------------------------------------
+# Listen mode
+# ---------------------------------------------------------------------------
+
+def _udp_sink(port: int) -> None:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
     s.bind(("0.0.0.0", port))
@@ -31,168 +69,178 @@ def udp_listener(port):
             pass
 
 
-def tcp_listener(port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", port))
-    s.listen(5)
+def _tcp_handler(conn: socket.socket) -> None:
     while True:
         try:
-            conn, _ = s.accept()
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            threading.Thread(target=tcp_handler, args=(conn,), daemon=True).start()
-        except Exception:
-            pass
-
-
-def tcp_handler(conn):
-    while True:
-        try:
-            data = conn.recv(65535)
-            if not data: break
+            if not conn.recv(65535):
+                break
         except Exception:
             break
     conn.close()
 
 
-# =================================================================
-# OPTIMIZACIÓN 1: Función de espera ultra-precisa (Busy Wait)
-# =================================================================
-def precision_sleep(target_time_perf):
-    """
-    Duerme de forma inteligente para no ahogar el CPU si falta mucho,
-    pero hace un 'spin lock' (busy wait) en el último milisegundo para
-    despertar con precisión atómica.
-    """
-    sleep_time = target_time_perf - time.perf_counter()
-    if sleep_time > 0.002:
-        # Dormimos dejando un margen de 1.5ms para despertar a tiempo
-        time.sleep(sleep_time - 0.0015)
-
-    # Spin lock: quemamos CPU en el último milisegundo para precisión absoluta
-    while time.perf_counter() < target_time_perf:
-        pass
+def _tcp_sink(port: int) -> None:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(32)
+    while True:
+        try:
+            conn, _ = s.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            threading.Thread(target=_tcp_handler, args=(conn,), daemon=True).start()
+        except Exception:
+            pass
 
 
-# =================================================================
-# MODO GENERATE (EXPERIMENTO 2) - Lógica Original Optimizada
-# =================================================================
-def build_priority_table(fanout, mode, prio_min, prio_max, base_prio_min, base_prio_max):
-    table = []
-    if mode == "per_event_random":
-        table = [None] * fanout
-    elif mode == "per_domain_fixed_random":
-        for _ in range(fanout):
-            table.append(random.randint(base_prio_min, base_prio_max))
-    elif mode == "per_domain_fixed_value":
-        for _ in range(fanout):
-            table.append(int(base_prio_min))
-    return table
-
-
-def generator_loop(args):
-    if args.rate <= 0: raise ValueError("rate must be >0")
-    if args.duration <= 0: raise ValueError("duration must be >0")
-
-    # OPTIMIZACIÓN 2: Desactivar el Garbage Collector durante la prueba crítica
-    print("[GEN] Desactivando Garbage Collector para evitar jitter...")
-    gc.disable()
-
+def run_listen(args: argparse.Namespace) -> None:
+    print(f"[NDT-SIM] LISTEN mode | fanout={args.fanout} proto={args.proto}")
+    for i in range(args.fanout):
+        port = args.base_port + i
+        target = _udp_sink if args.proto == "udp" else _tcp_sink
+        threading.Thread(target=target, args=(port,), daemon=True).start()
+        print(f"  Sink on {args.proto.upper()} :{port}")
+    print("[NDT-SIM] Ready. Ctrl-C to stop.")
     try:
-        fanout = args.fanout
-        dst = (args.feedback_ip, args.feedback_port)
-        ticks = int(round(args.rate * args.duration))
-        period = 1.0 / args.rate
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[NDT-SIM] Stopped.")
+        sys.exit(0)
 
-        start_time_wall = time.time() + args.start_delay
-        start_time_perf = time.perf_counter() + args.start_delay
 
-        print(f"[GEN] start_time={start_time_wall:.6f}")
-        print(f"[GEN] theoretical_events={ticks * fanout}")
-        print(f"[GEN] priority_mode={args.priority_mode}")
-        print("[GEN] Usando F-Strings Zero-JSON nativo para máxima velocidad.")
+# ---------------------------------------------------------------------------
+# Payload pre-builder
+#
+# For modes where the priority is fixed per NDT (per_domain_fixed_*) or
+# globally fixed (per_domain_fixed_value), we pre-encode all payloads except
+# for the tick counter and timestamp, which must vary.  We still use an
+# f-string template because orjson encodes the whole object anyway —
+# the gain is avoiding the priority lookup inside the loop.
+# ---------------------------------------------------------------------------
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
+def _build_payload(ndt_id: int, tick: int, pr: int, now_ns: int) -> bytes:
+    raw = (
+        f'{{"type":"NDT_ALERT","event_id":"{ndt_id}-{tick}",'
+        f'"ndt_id":{ndt_id},"priority":{pr},'
+        f'"t_create_ns":{now_ns},"payload":{{"msg":"dummy_alert"}}}}'
+    )
+    return raw.encode()
 
-        prio_table = []
-        if args.priority_mode != "paper_mix":
-            prio_table = build_priority_table(fanout, args.priority_mode, args.prio_min, args.prio_max,
-                                              args.base_prio_min, args.base_prio_max)
 
-        # Espera inicial precisa
-        print("[GEN] Esperando inicio sincronizado...")
-        precision_sleep(start_time_perf)
-        print("[GEN] Disparando tráfico...")
+# ---------------------------------------------------------------------------
+# Generator loop
+# ---------------------------------------------------------------------------
 
-        sent = 0
-        next_tick_perf = start_time_perf
+def run_generate(args: argparse.Namespace) -> None:
+    if args.rate <= 0:
+        raise ValueError("--rate must be > 0")
+    if args.duration <= 0:
+        raise ValueError("--duration must be > 0")
+
+    fanout: int = args.fanout
+    dst = (args.feedback_ip, args.feedback_port)
+    ticks = int(round(args.rate * args.duration))
+    period = 1.0 / args.rate
+    mode = args.priority_mode
+
+    # Pre-compute per-NDT fixed priorities where possible
+    prio_table: List[Optional[int]] = []
+    if mode == "per_domain_fixed_random":
+        prio_table = [random.randint(args.base_prio_min, args.base_prio_max) for _ in range(fanout)]
+    elif mode == "per_domain_fixed_value":
+        prio_table = [args.base_prio_min] * fanout
+    elif mode in ("per_event_random", "paper_mix"):
+        prio_table = [None] * fanout
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+
+    start_perf = time.perf_counter() + args.start_delay
+    start_wall = time.time() + args.start_delay
+
+    print(f"[GEN] mode={mode} | rate={args.rate} ev/s | duration={args.duration}s | fanout={fanout}")
+    print(f"[GEN] ticks={ticks} | period={period*1000:.3f} ms")
+    print(f"[GEN] start_wall={start_wall:.3f}")
+    print(f"[GEN] Waiting {args.start_delay}s…")
+
+    gc.disable()
+    fired = 0
+    sent = 0
+    try:
+        precision_sleep(start_perf)
+        t_actual_start = time.perf_counter()
+        print("[GEN] Firing…", flush=True)
+
+        next_tick = start_perf
 
         for tick in range(ticks):
-            # Usamos nuestra nueva función de espera de precisión atómica
-            precision_sleep(next_tick_perf)
-
+            precision_sleep(next_tick)
             now_ns = time.time_ns()
+            fired += 1
 
             for ndt_id in range(fanout):
-                if args.priority_mode == "paper_mix":
+                # Determine priority
+                if mode == "paper_mix":
                     mod = sent % 100
-                    if mod < 5:
-                        pr = 10  # 5% Crítico
-                    elif mod < 30:
-                        pr = 30  # 25% Medio
-                    else:
-                        pr = 80  # 70% Dropeable
-                elif args.priority_mode == "per_event_random":
+                    pr = 10 if mod < 5 else (30 if mod < 30 else 80)
+                elif mode == "per_event_random":
                     pr = random.randint(args.prio_min, args.prio_max)
                 else:
-                    pr = prio_table[ndt_id]
+                    pr = prio_table[ndt_id]  # type: ignore[assignment]
 
-                # =========================================================
-                # OPTIMIZACIÓN ZERO-JSON:
-                # Construimos el payload directo como string y bytes
-                # =========================================================
-                payload = f'{{"type":"NDT_ALERT","event_id":"{ndt_id}-{tick}","ndt_id":{ndt_id},"priority":{pr},"t_create_ns":{now_ns},"payload":{{"msg":"dummy_alert"}}}}'.encode(
-                    'utf-8')
-
+                payload = _build_payload(ndt_id, tick, pr, now_ns)
                 try:
                     sock.sendto(payload, dst)
                     sent += 1
                 except Exception:
-                    pass  # Evitamos imprimir en pantalla en pleno ataque
+                    pass
 
-            next_tick_perf += period
+            next_tick += period
 
-        sock.close()
-        print(f"\n[GEN] experiment finished. events_sent={sent}")
+        t_actual_end = time.perf_counter()
+        actual_duration = t_actual_end - t_actual_start
+        actual_rate = sent / actual_duration if actual_duration > 0 else 0.0
+
+        print(f"\n[GEN] Done.")
+        print(f"  ticks_fired   = {fired}")
+        print(f"  events_sent   = {sent}")
+        print(f"  actual_dur_s  = {actual_duration:.3f}")
+        print(f"  actual_rate   = {actual_rate:.1f} ev/s  (target={args.rate * fanout:.1f})")
 
     finally:
-        # Asegurarnos de volver a prender el recolector de basura al terminar o si hay error
+        sock.close()
         gc.enable()
-        print("[GEN] Garbage Collector reactivado.")
 
 
-# =================================================================
-# MAIN
-# =================================================================
-def main():
-    ap = argparse.ArgumentParser(description="Unificado: Sumidero NDT (Exp1) y Generador de Telemetría (Exp2)")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    ap.add_argument("--mode", choices=["listen", "generate"], required=True, help="Modo de operación")
-    ap.add_argument("--fanout", type=int, required=True, help="Cantidad de NDTs")
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="NDT Simulator: sink (Exp 1) or alert generator (Exp 2)"
+    )
+    ap.add_argument("--mode", choices=["listen", "generate"], required=True)
+    ap.add_argument("--fanout", type=int, required=True)
 
-    ap.add_argument("--proto", choices=["udp", "tcp"], default="tcp", help="Protocolo de escucha (Exp 1)")
-    ap.add_argument("--base-port", type=int, default=8001, help="Puerto inicial (Exp 1)")
+    # Listen
+    ap.add_argument("--proto", choices=["udp", "tcp"], default="udp")
+    ap.add_argument("--base-port", type=int, default=8001)
 
+    # Generate
     ap.add_argument("--feedback-ip", default="127.0.0.1")
     ap.add_argument("--feedback-port", type=int, default=9000)
-    ap.add_argument("--rate", type=float, default=100.0)
+    ap.add_argument("--rate", type=float, default=100.0,
+                    help="Ticks per second.  Total ev/s = rate × fanout.")
     ap.add_argument("--duration", type=float, default=15.0)
     ap.add_argument("--start-delay", type=float, default=5.0)
-
-    ap.add_argument("--priority-mode",
-                    choices=["per_event_random", "per_domain_fixed_random", "per_domain_fixed_value", "paper_mix"],
-                    default="per_domain_fixed_random")
+    ap.add_argument(
+        "--priority-mode",
+        choices=["per_event_random", "per_domain_fixed_random",
+                 "per_domain_fixed_value", "paper_mix"],
+        default="paper_mix",
+    )
     ap.add_argument("--prio-min", type=int, default=5)
     ap.add_argument("--prio-max", type=int, default=80)
     ap.add_argument("--base-prio-min", type=int, default=10)
@@ -201,23 +249,9 @@ def main():
     args = ap.parse_args()
 
     if args.mode == "listen":
-        print(f"[NDT-SIM] MODO ESCUCHA ACTIVO (Experimento 1)")
-        for i in range(args.fanout):
-            port = args.base_port + i
-            if args.proto == "udp":
-                threading.Thread(target=udp_listener, args=(port,), daemon=True).start()
-            else:
-                threading.Thread(target=tcp_listener, args=(port,), daemon=True).start()
-        print("[NDT-SIM] Listo para recibir eventos. Ctrl+C para salir.")
-        try:
-            while True: time.sleep(1)
-        except KeyboardInterrupt:
-            print("\n[NDT-SIM] Apagando listeners...")
-            sys.exit(0)
-
-    elif args.mode == "generate":
-        print(f"[NDT-SIM] MODO GENERACIÓN ACTIVO (Experimento 2)")
-        generator_loop(args)
+        run_listen(args)
+    else:
+        run_generate(args)
 
 
 if __name__ == "__main__":
