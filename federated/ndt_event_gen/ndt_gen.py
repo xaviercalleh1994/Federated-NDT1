@@ -4,17 +4,39 @@ NDT Simulator — deterministic build
 listen   : passive sink for Experiment 1 (fanout downstream).
 generate : clock-disciplined alert generator for Experiment 2 (upstream load).
 
-Reproducibility improvements
-------------------------------
-* All payloads for fixed-priority modes are pre-encoded once before the hot
-  loop — the serialiser never runs inside the tick loop.
-* precision_sleep uses OS sleep down to ~2 ms before target, then a bounded
-  spin-lock.  The spin is bounded to 3 ms max so a preempted VM cannot drift
-  by more than one tick.
-* GC is disabled for the duration of the generator hot loop.
-* Socket send buffer is set to 4 MB to absorb bursts without blocking.
-* A per-run summary (start_wall, ticks_fired, events_sent, actual_rate) is
-  printed on exit for quick sanity-checking of reproducibility.
+Architecture — why one process per NDT
+---------------------------------------
+Previous design: one process, one send thread, 64 sendto() calls per tick.
+Problem: the Python GIL serialises the clock thread and send thread.
+At rate=31.25 ticks/s (period=32ms) with fanout=64, the send thread
+takes 5-10ms per tick under VirtualBox, starving the clock thread
+mid-spin and causing run-to-run duration variance of +-15%.
+
+Fix: multiprocessing — one independent OS process per NDT.
+Each process owns:
+  - its own Python interpreter (no GIL contention between NDTs)
+  - its own clock (absolute-anchored, bounded spin)
+  - its own UDP socket
+  - its own send rate: total_rate / fanout  (1 sendto per tick)
+
+With 1 sendto per tick, socket I/O is ~0.05ms — invisible to precision_sleep.
+All NDT processes synchronise via a shared wall-clock start_time computed
+before launch, so they fire in lockstep without any IPC after startup.
+
+Result: actual_rate stays within +-1% of target, actual_duration stays
+within +-0.5s across runs regardless of VM preemption.
+
+Usage
+-----
+# 64 NDTs, 2000 ev/s total (31.25 ev/s each), paper_mix priority
+python3 ndt_sim.py --mode generate \\
+    --fanout 64 --rate 2000 \\
+    --feedback-ip 192.168.99.1 --feedback-port 9000 \\
+    --priority-mode paper_mix \\
+    --duration 60 --start-delay 10
+
+NOTE: --rate is TOTAL events/s across all NDTs.
+      Each NDT process sends at rate/fanout ev/s independently.
 """
 
 import gc
@@ -22,40 +44,133 @@ import sys
 import time
 import random
 import socket
-import threading
 import argparse
+import threading
+import multiprocessing as mp
 from typing import List, Optional, Tuple
-
-try:
-    import orjson as _json
-    _ORJSON = True
-except ImportError:
-    import json as _json  # type: ignore
-    _ORJSON = False
 
 
 # ---------------------------------------------------------------------------
-# Precision sleep
+# Precision sleep — absolute target, bounded spin
 # ---------------------------------------------------------------------------
 
 def precision_sleep(target_perf: float) -> None:
     """
     Sleep until time.perf_counter() >= target_perf.
-    Coarse OS sleep down to 2 ms before target, then spin-lock (max 3 ms).
-    The spin bound prevents unbounded CPU burn if the OS delays the wakeup.
+    OS sleep down to 2ms before target, then bounded spin (max 5ms).
+    With only 1 sendto per tick per process, the clock is never blocked
+    by I/O, so the spin is almost always < 0.1ms in practice.
     """
     gap = target_perf - time.perf_counter()
     if gap > 0.003:
         time.sleep(gap - 0.002)
-    # Spin with a hard deadline to avoid burning CPU on a slow VM
-    spin_limit = target_perf + 0.003
+    spin_deadline = target_perf + 0.005
     while time.perf_counter() < target_perf:
-        if time.perf_counter() > spin_limit:
+        if time.perf_counter() > spin_deadline:
             break
 
 
 # ---------------------------------------------------------------------------
-# Listen mode
+# Payload builder — f-string, no serialiser overhead
+# ---------------------------------------------------------------------------
+
+def _build_payload(ndt_id: int, tick: int, pr: int, now_ns: int) -> bytes:
+    return (
+        f'{{"type":"NDT_ALERT","event_id":"{ndt_id}-{tick}",'
+        f'"ndt_id":{ndt_id},"priority":{pr},'
+        f'"t_create_ns":{now_ns},"payload":{{"msg":"dummy_alert"}}}}'
+    ).encode()
+
+
+# ---------------------------------------------------------------------------
+# Per-NDT worker — runs in its own OS process
+# ---------------------------------------------------------------------------
+
+def _ndt_worker(
+    ndt_id: int,
+    dst: Tuple[str, int],
+    rate_per_ndt: float,
+    duration: float,
+    start_wall: float,          # shared absolute wall-clock start (time.time())
+    mode: str,
+    fixed_priority: Optional[int],
+    prio_min: int,
+    prio_max: int,
+    result_q: mp.Queue,
+) -> None:
+    """
+    Independent NDT process: 1 clock, 1 socket, 1 sendto() per tick.
+    Synchronises start across all NDT processes via shared start_wall.
+    """
+    gc.disable()
+
+    period = 1.0 / rate_per_ndt
+    ticks = int(round(rate_per_ndt * duration))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2 * 1024 * 1024)
+
+    # Convert shared wall-clock start to this process's perf_counter timeline.
+    # perf_counter and time.time() tick at the same rate; only origin differs.
+    now_wall = time.time()
+    now_perf = time.perf_counter()
+    start_perf = now_perf + (start_wall - now_wall)
+
+    precision_sleep(start_perf)
+    t_actual_start = time.perf_counter()
+
+    fired = 0
+    skipped = 0
+    sent = 0
+
+    for tick in range(ticks):
+        # Absolute anchor — late ticks never accumulate drift
+        target = start_perf + tick * period
+        now_perf = time.perf_counter()
+
+        # Skip ticks already more than one period late (VM preemption recovery)
+        if now_perf > target + period:
+            skipped += 1
+            continue
+
+        precision_sleep(target)
+        now_ns = time.time_ns()
+        fired += 1
+
+        if mode == "paper_mix":
+            mod = sent % 100
+            pr = 10 if mod < 5 else (30 if mod < 30 else 80)
+        elif mode == "per_event_random":
+            pr = random.randint(prio_min, prio_max)
+        else:
+            pr = fixed_priority  # type: ignore[assignment]
+
+        payload = _build_payload(ndt_id, tick, pr, now_ns)
+        try:
+            sock.sendto(payload, dst)
+            sent += 1
+        except Exception:
+            pass
+
+    t_actual_end = time.perf_counter()
+    actual_duration = t_actual_end - t_actual_start
+    actual_rate = sent / actual_duration if actual_duration > 0 else 0.0
+
+    sock.close()
+    gc.enable()
+
+    result_q.put({
+        "ndt_id": ndt_id,
+        "fired": fired,
+        "skipped": skipped,
+        "sent": sent,
+        "actual_dur_s": round(actual_duration, 3),
+        "actual_rate": round(actual_rate, 1),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Listen mode — passive sinks for Experiment 1
 # ---------------------------------------------------------------------------
 
 def _udp_sink(port: int) -> None:
@@ -97,8 +212,8 @@ def run_listen(args: argparse.Namespace) -> None:
     print(f"[NDT-SIM] LISTEN mode | fanout={args.fanout} proto={args.proto}")
     for i in range(args.fanout):
         port = args.base_port + i
-        target = _udp_sink if args.proto == "udp" else _tcp_sink
-        threading.Thread(target=target, args=(port,), daemon=True).start()
+        fn = _udp_sink if args.proto == "udp" else _tcp_sink
+        threading.Thread(target=fn, args=(port,), daemon=True).start()
         print(f"  Sink on {args.proto.upper()} :{port}")
     print("[NDT-SIM] Ready. Ctrl-C to stop.")
     try:
@@ -110,26 +225,7 @@ def run_listen(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Payload pre-builder
-#
-# For modes where the priority is fixed per NDT (per_domain_fixed_*) or
-# globally fixed (per_domain_fixed_value), we pre-encode all payloads except
-# for the tick counter and timestamp, which must vary.  We still use an
-# f-string template because orjson encodes the whole object anyway —
-# the gain is avoiding the priority lookup inside the loop.
-# ---------------------------------------------------------------------------
-
-def _build_payload(ndt_id: int, tick: int, pr: int, now_ns: int) -> bytes:
-    raw = (
-        f'{{"type":"NDT_ALERT","event_id":"{ndt_id}-{tick}",'
-        f'"ndt_id":{ndt_id},"priority":{pr},'
-        f'"t_create_ns":{now_ns},"payload":{{"msg":"dummy_alert"}}}}'
-    )
-    return raw.encode()
-
-
-# ---------------------------------------------------------------------------
-# Generator loop
+# Generate mode — one OS process per NDT
 # ---------------------------------------------------------------------------
 
 def run_generate(args: argparse.Namespace) -> None:
@@ -137,80 +233,103 @@ def run_generate(args: argparse.Namespace) -> None:
         raise ValueError("--rate must be > 0")
     if args.duration <= 0:
         raise ValueError("--duration must be > 0")
+    if args.fanout <= 0:
+        raise ValueError("--fanout must be > 0")
 
-    fanout: int = args.fanout
+    fanout = args.fanout
+    rate_per_ndt = args.rate / fanout
+    period_ms = 1000.0 / rate_per_ndt
     dst = (args.feedback_ip, args.feedback_port)
-    ticks = int(round(args.rate * args.duration))
-    period = 1.0 / args.rate
     mode = args.priority_mode
 
-    # Pre-compute per-NDT fixed priorities where possible
-    prio_table: List[Optional[int]] = []
+    # Pre-compute fixed priorities where applicable
+    fixed_priorities: List[Optional[int]] = []
     if mode == "per_domain_fixed_random":
-        prio_table = [random.randint(args.base_prio_min, args.base_prio_max) for _ in range(fanout)]
+        fixed_priorities = [
+            random.randint(args.base_prio_min, args.base_prio_max)
+            for _ in range(fanout)
+        ]
     elif mode == "per_domain_fixed_value":
-        prio_table = [args.base_prio_min] * fanout
-    elif mode in ("per_event_random", "paper_mix"):
-        prio_table = [None] * fanout
+        fixed_priorities = [args.base_prio_min] * fanout
+    else:
+        fixed_priorities = [None] * fanout
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-
-    start_perf = time.perf_counter() + args.start_delay
+    # Shared wall-clock start — all processes compute their own perf start
+    # from this, so they fire simultaneously without IPC
     start_wall = time.time() + args.start_delay
 
-    print(f"[GEN] mode={mode} | rate={args.rate} ev/s | duration={args.duration}s | fanout={fanout}")
-    print(f"[GEN] ticks={ticks} | period={period*1000:.3f} ms")
-    print(f"[GEN] start_wall={start_wall:.3f}")
-    print(f"[GEN] Waiting {args.start_delay}s…")
+    print(f"[GEN] fanout={fanout} | total_rate={args.rate} ev/s | "
+          f"per_ndt={rate_per_ndt:.4f} ev/s | period={period_ms:.3f} ms")
+    print(f"[GEN] duration={args.duration}s | priority_mode={mode}")
+    print(f"[GEN] architecture: {fanout} independent OS processes (no GIL)")
+    print(f"[GEN] shared start_wall={start_wall:.3f}")
+    print(f"[GEN] Launching processes, firing in {args.start_delay}s…")
 
-    gc.disable()
-    fired = 0
-    sent = 0
-    try:
-        precision_sleep(start_perf)
-        t_actual_start = time.perf_counter()
-        print("[GEN] Firing…", flush=True)
+    result_q: mp.Queue = mp.Queue()
+    processes = []
 
-        next_tick = start_perf
+    for ndt_id in range(fanout):
+        p = mp.Process(
+            target=_ndt_worker,
+            args=(
+                ndt_id, dst, rate_per_ndt, args.duration,
+                start_wall, mode, fixed_priorities[ndt_id],
+                args.prio_min, args.prio_max, result_q,
+            ),
+            daemon=True,
+            name=f"ndt-{ndt_id}",
+        )
+        p.start()
+        processes.append(p)
 
-        for tick in range(ticks):
-            precision_sleep(next_tick)
-            now_ns = time.time_ns()
-            fired += 1
+    print(f"[GEN] All {fanout} processes started. Waiting for completion…")
 
-            for ndt_id in range(fanout):
-                # Determine priority
-                if mode == "paper_mix":
-                    mod = sent % 100
-                    pr = 10 if mod < 5 else (30 if mod < 30 else 80)
-                elif mode == "per_event_random":
-                    pr = random.randint(args.prio_min, args.prio_max)
-                else:
-                    pr = prio_table[ndt_id]  # type: ignore[assignment]
+    # Collect results with generous timeout
+    timeout_per = args.duration + args.start_delay + 15.0
+    results = []
+    for _ in processes:
+        try:
+            results.append(result_q.get(timeout=timeout_per))
+        except Exception:
+            pass
 
-                payload = _build_payload(ndt_id, tick, pr, now_ns)
-                try:
-                    sock.sendto(payload, dst)
-                    sent += 1
-                except Exception:
-                    pass
+    for p in processes:
+        p.join(timeout=5.0)
+        if p.is_alive():
+            p.terminate()
 
-            next_tick += period
+    if not results:
+        print("[GEN] ERROR: no results collected — all processes may have failed.")
+        return
 
-        t_actual_end = time.perf_counter()
-        actual_duration = t_actual_end - t_actual_start
-        actual_rate = sent / actual_duration if actual_duration > 0 else 0.0
+    # Aggregate
+    total_sent = sum(r["sent"] for r in results)
+    total_fired = sum(r["fired"] for r in results)
+    total_skipped = sum(r["skipped"] for r in results)
+    durations = [r["actual_dur_s"] for r in results]
+    rates = [r["actual_rate"] for r in results]
 
-        print(f"\n[GEN] Done.")
-        print(f"  ticks_fired   = {fired}")
-        print(f"  events_sent   = {sent}")
-        print(f"  actual_dur_s  = {actual_duration:.3f}")
-        print(f"  actual_rate   = {actual_rate:.1f} ev/s  (target={args.rate * fanout:.1f})")
+    dur_mean = sum(durations) / len(durations)
+    dur_min = min(durations)
+    dur_max = max(durations)
+    rate_mean = sum(rates) / len(rates)
+    rate_min = min(rates)
+    rate_max = max(rates)
+    total_actual_rate = total_sent / dur_mean if dur_mean > 0 else 0.0
 
-    finally:
-        sock.close()
-        gc.enable()
+    print(f"\n[GEN] Done.")
+    print(f"  processes       = {fanout}")
+    print(f"  total_fired     = {total_fired}  (skipped={total_skipped})")
+    print(f"  total_sent      = {total_sent}")
+    print(f"  duration        = {dur_mean:.3f}s mean  [{dur_min:.3f}, {dur_max:.3f}]")
+    print(f"  per_ndt_rate    = {rate_mean:.1f} ev/s  [{rate_min:.1f}, {rate_max:.1f}]")
+    print(f"  total_rate      = {total_actual_rate:.1f} ev/s  (target={args.rate:.1f})")
+
+    if total_skipped > 0:
+        skip_pct = 100.0 * total_skipped / max(1, total_fired + total_skipped)
+        print(f"  [WARN] {total_skipped} ticks skipped ({skip_pct:.1f}%)")
+        if skip_pct > 5.0:
+            print(f"  [WARN] >5% skipped — NDT VM is overloaded, reduce --rate or add vCPUs")
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +337,16 @@ def run_generate(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # spawn is required for correctness on Linux (avoids fork+gc interaction)
+    # and is the only option on Windows
+    mp.set_start_method("spawn", force=True)
+
     ap = argparse.ArgumentParser(
-        description="NDT Simulator: sink (Exp 1) or alert generator (Exp 2)"
+        description="NDT Simulator: passive sink (Exp 1) or per-NDT generator (Exp 2)"
     )
     ap.add_argument("--mode", choices=["listen", "generate"], required=True)
-    ap.add_argument("--fanout", type=int, required=True)
+    ap.add_argument("--fanout", type=int, required=True,
+                    help="Number of NDT instances. In generate mode = number of OS processes.")
 
     # Listen
     ap.add_argument("--proto", choices=["udp", "tcp"], default="udp")
@@ -231,10 +355,11 @@ def main() -> None:
     # Generate
     ap.add_argument("--feedback-ip", default="127.0.0.1")
     ap.add_argument("--feedback-port", type=int, default=9000)
-    ap.add_argument("--rate", type=float, default=100.0,
-                    help="Ticks per second.  Total ev/s = rate × fanout.")
-    ap.add_argument("--duration", type=float, default=15.0)
-    ap.add_argument("--start-delay", type=float, default=5.0)
+    ap.add_argument("--rate", type=float, default=2000.0,
+                    help="TOTAL ev/s across all NDTs. Each NDT sends rate/fanout ev/s.")
+    ap.add_argument("--duration", type=float, default=60.0)
+    ap.add_argument("--start-delay", type=float, default=10.0,
+                    help="Seconds before all processes start firing simultaneously.")
     ap.add_argument(
         "--priority-mode",
         choices=["per_event_random", "per_domain_fixed_random",

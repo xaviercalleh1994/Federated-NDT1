@@ -49,7 +49,7 @@ sudo python3 on_ndt.py --role on
 sudo python3 on_ndt.py --role ndt
 ```
 
-### ORder for execute the test
+### Order for execute the test
 First start the relay local or cloud:
 ```bash
 python3 relay.py --proto <udp or tcp> --port 7001

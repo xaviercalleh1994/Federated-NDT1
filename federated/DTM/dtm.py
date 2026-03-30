@@ -3,21 +3,10 @@ DTM — Digital Twin Manager (deterministic / reproducible build)
 
 Threading model
 ---------------
-Main thread      : relay RX → fast-dispatch (federated) or local apply (1:1)
-log-writer       : async JSONL writer (daemon)
-fb-rx            : single UDP recv thread for NDT feedback
-fb-dispatch      : single dispatch thread — drains AdmissionQueue, logs, forwards
-
-Key choices for reproducibility
----------------------------------
-* Feedback processed in ONE dispatch thread (no worker pool fighting the GIL).
-* AdmissionQueue uses a single lock + Condition; _qsize is an atomic counter
-  incremented/decremented inside the same lock as append/popleft — so there
-  is NO window between "check size" and "actually append".
-* Scheduler wakes via Condition.notify() — no time.sleep() polling jitter.
-* run_ctx contains only JSON-serialisable primitives (no argparse Namespace).
-* orjson is mandatory — deterministic serialisation speed across runs.
-  Install: pip install orjson --break-system-packages
+Main thread   : relay RX → fast-dispatch (federated) or local apply (1:1)
+log-writer    : async JSONL writer (daemon)
+fb-rx         : single UDP recv thread for NDT feedback
+fb-dispatch   : single dispatch thread — drains AdmissionQueue, logs, forwards
 """
 
 import gc
@@ -27,7 +16,6 @@ import time
 import socket
 import argparse
 import threading
-import queue
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -43,7 +31,7 @@ try:
 
 except ImportError:
     sys.exit(
-        "[FATAL] orjson is required for deterministic performance.\n"
+        "[FATAL] orjson is required.\n"
         "Install: pip install orjson --break-system-packages"
     )
 
@@ -56,7 +44,7 @@ CONTROL_PORT = 6001
 LOG_FILE_DEFAULT = "/home/ubuntu/ndtm_events.log"
 
 # ---------------------------------------------------------------------------
-# Global runtime context — primitives only
+# Global runtime context — JSON-serialisable primitives only
 # ---------------------------------------------------------------------------
 run_ctx: Dict[str, object] = {}
 
@@ -84,10 +72,10 @@ def count_done_event(event_id: str) -> None:
 
 
 def _flush_and_exit(reason: str) -> None:
-    print(f"\n[DTM] {reason}. Flushing logs…", flush=True)
+    print(f"\n[DTM] {reason}. Flushing logs...", flush=True)
     _log_stop.set()
     deadline = time.monotonic() + 6.0
-    while not _log_queue.empty() and time.monotonic() < deadline:
+    while _log_deque and time.monotonic() < deadline:
         time.sleep(0.05)
     print("[DTM] Logs flushed. Exiting.", flush=True)
     gc.enable()
@@ -101,40 +89,47 @@ def limit_reached() -> None:
 
 # ---------------------------------------------------------------------------
 # Async log writer
+#
+# Uses deque instead of queue.Queue:
+#   - deque.append() is GIL-atomic, no lock acquisition.
+#   - queue.Queue.put_nowait() acquires an internal lock on every call,
+#     causing RX thread / dispatch thread contention at high rates.
+#
+# log_event() pre-serialises to bytes before enqueueing.
+#   - run_ctx serialised once as prefix, reused for every event.
+#   - Log writer thread does zero serialisation work, only file I/O.
 # ---------------------------------------------------------------------------
-_log_queue: queue.Queue = queue.Queue(maxsize=2_000_000)
+_log_deque: deque = deque()
 _log_stop = threading.Event()
+_log_ctx_prefix: bytes = b""
+
+
+def _build_log_prefix() -> None:
+    """Call once after run_ctx is populated."""
+    global _log_ctx_prefix
+    base = _dumps(run_ctx)
+    _log_ctx_prefix = base[:-1]  # strip closing "}" to allow appending fields
 
 
 def _log_writer() -> None:
     path = str(run_ctx.get("log_file", LOG_FILE_DEFAULT))
     with open(path, "wb") as f:
-        while not _log_stop.is_set() or not _log_queue.empty():
-            batch: list = []
-            try:
-                for _ in range(10_000):
-                    batch.append(_log_queue.get_nowait())
-            except queue.Empty:
-                pass
-            if batch:
-                lines: List[bytes] = []
-                for entry in batch:
-                    try:
-                        lines.append(_dumps(entry))
-                    except Exception:
-                        pass
-                if lines:
-                    f.write(b"\n".join(lines) + b"\n")
-                    f.flush()
+        while not _log_stop.is_set() or _log_deque:
+            if _log_deque:
+                batch = list(_log_deque)
+                _log_deque.clear()
+                f.write(b"\n".join(batch) + b"\n")
+                f.flush()
             else:
                 time.sleep(0.01)
 
 
 def log_event(tag: str, data: dict) -> None:
-    entry = {"ts_ns": time.time_ns(), "tag": tag, **run_ctx, **data}
     try:
-        _log_queue.put_nowait(entry)
-    except queue.Full:
+        event_bytes = _dumps({"ts_ns": time.time_ns(), "tag": tag, **data})
+        merged = _log_ctx_prefix + b"," + event_bytes[1:]
+        _log_deque.append(merged)
+    except Exception:
         pass
 
 
@@ -298,8 +293,6 @@ class UdpFanoutSender:
 
 
 class TcpFanoutSender:
-    """Not shared across threads — each caller owns its instance."""
-
     def __init__(self, dst_ip: str, base_port: int, fanout: int) -> None:
         self._ip = dst_ip
         self._ports = [base_port + i for i in range(fanout)]
@@ -333,11 +326,55 @@ class TcpFanoutSender:
 
 
 # ---------------------------------------------------------------------------
-# AdmissionQueue — bounded FIFO with atomic size tracking
+# TokenBucket — optional hard rate cap (--max-rate)
+# ---------------------------------------------------------------------------
+class TokenBucket:
+    def __init__(self, rate: float, burst: int = 1) -> None:
+        self._rate = rate
+        self._burst = max(1, burst)
+        self._tokens = float(self._burst)
+        self._last = time.perf_counter()
+        self._lock = threading.Lock()
+
+    def consume(self) -> None:
+        while True:
+            with self._lock:
+                now = time.perf_counter()
+                self._tokens = min(
+                    float(self._burst),
+                    self._tokens + (now - self._last) * self._rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait * 0.9)
+
+
+# ---------------------------------------------------------------------------
+# AdmissionQueue
 #
-# _qsize is the single source of truth.  It is incremented inside the same
-# lock acquisition as deque.append(), so the size is always consistent.
-# Condition.notify() wakes the dispatch thread immediately — no polling sleep.
+# Three modes:
+#   no_queue=True  : drop immediately if dispatch thread is busy (--no-queue)
+#   max_queue=0    : unlimited queue, never drops
+#   max_queue=N    : bounded queue, drops when full
+#
+# Key fixes vs previous version:
+#
+# 1. Removed set_busy() / _busy_lock from the hot path for bounded/unlimited
+#    modes. The previous version called set_busy(True) and set_busy(False)
+#    on EVERY event, each acquiring a separate lock — pure overhead for the
+#    99% case. Now set_busy() is only called in no_queue mode.
+#
+# 2. Drain timeout: 50ms → 0.5ms. The old 50ms timeout caused the dispatch
+#    thread to sleep 50ms between batches. At low rates this meant events
+#    arriving during the sleep were held for up to 50ms before processing,
+#    which inflated queue_ms measurements and caused artificial drops when
+#    the queue filled during the sleep window.
+#
+# 3. log_event() called OUTSIDE the queue lock. Previously DTM_DROP was
+#    logged while holding _lock, causing log deque contention with the lock.
 # ---------------------------------------------------------------------------
 class AdmissionQueue:
     def __init__(
@@ -345,39 +382,54 @@ class AdmissionQueue:
         max_queue: int,
         drop_prio_if_full: int,
         disable_priorities: bool,
+        no_queue: bool = False,
     ) -> None:
         self._max = max_queue
         self._drop_prio = drop_prio_if_full
         self._fifo = disable_priorities
+        self._no_queue = no_queue
         self._q: deque = deque()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._qsize = 0
+        self._dispatch_busy = False  # plain bool, GIL-safe, only used in no_queue mode
+
+    def set_busy(self, busy: bool) -> None:
+        self._dispatch_busy = busy  # GIL-safe plain bool write
 
     def push(self, item: dict, priority: int, event_id: str, ev_type: str, src: str) -> bool:
+        drop_reason: Optional[str] = None
+
         with self._lock:
-            if self._max > 0 and self._qsize >= self._max:
-                should_drop = self._fifo or priority >= self._drop_prio
-                if should_drop:
-                    log_event("DTM_DROP", {
-                        "event_id": event_id,
-                        "type": ev_type,
-                        "priority": priority,
-                        "src": src,
-                        "reason": "tail_drop" if self._fifo else "prio_drop",
-                        "qsize": self._qsize,
-                    })
-                    return False
-            self._q.append(item)
-            self._qsize += 1
-            self._cond.notify()
+            if self._no_queue:
+                if self._dispatch_busy or self._qsize > 0:
+                    drop_reason = "no_queue_busy"
+            elif self._max > 0 and self._qsize >= self._max:
+                if self._fifo or priority >= self._drop_prio:
+                    drop_reason = "tail_drop" if self._fifo else "prio_drop"
+
+            if drop_reason is None:
+                self._q.append(item)
+                self._qsize += 1
+                self._cond.notify()
+
+        # Log OUTSIDE the lock — no contention with queue operations
+        if drop_reason is not None:
+            log_event("DTM_DROP", {
+                "event_id": event_id,
+                "type": ev_type,
+                "priority": priority,
+                "src": src,
+                "reason": drop_reason,
+                "qsize": self._qsize,
+            })
+            return False
         return True
 
     def drain(self, max_items: int = 500) -> List[dict]:
-        """Block until at least one item is ready, return up to max_items."""
         with self._lock:
             while not self._q:
-                self._cond.wait(timeout=0.05)
+                self._cond.wait(timeout=0.0005)  # 0.5ms max wait
             batch: List[dict] = []
             while self._q and len(batch) < max_items:
                 batch.append(self._q.popleft())
@@ -386,7 +438,14 @@ class AdmissionQueue:
 
 
 # ---------------------------------------------------------------------------
-# Feedback controller — single RX thread + single dispatch thread
+# FeedbackController
+#
+# Key fix: removed try/finally from dispatch loop.
+#   The previous version wrapped every event in try/finally to call
+#   set_busy(False). Python's try/finally creates an exception frame on
+#   every iteration even when no exception occurs — real measurable overhead
+#   at high event rates. The dispatch loop is now flat sequential code.
+#   set_busy() is only called when _no_queue is True (rare mode).
 # ---------------------------------------------------------------------------
 class FeedbackController:
     def __init__(
@@ -394,9 +453,11 @@ class FeedbackController:
         listen_port: int,
         onm_sender: Optional[UdpFanoutSender],
         aq: AdmissionQueue,
+        token_bucket: Optional[TokenBucket] = None,
     ) -> None:
         self._aq = aq
         self._onm = onm_sender
+        self._tb = token_bucket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         self._sock.bind(("0.0.0.0", listen_port))
@@ -432,6 +493,13 @@ class FeedbackController:
     def _dispatch_loop(self) -> None:
         while True:
             for item in self._aq.drain():
+                # set_busy only needed in no_queue mode
+                if self._aq._no_queue:
+                    self._aq.set_busy(True)
+
+                if self._tb is not None:
+                    self._tb.consume()
+
                 ev = item["ev"]
                 event_id = item["event_id"]
                 pr = item["priority"]
@@ -460,12 +528,16 @@ class FeedbackController:
                     "queue_ms": (t_done_ns - t_rx_ns) / 1e6,
                     "t_done_ns": t_done_ns,
                 })
+
+                if self._aq._no_queue:
+                    self._aq.set_busy(False)
+
                 count_done_event(event_id)
                 limit_reached()
 
 
 # ---------------------------------------------------------------------------
-# Fast downstream dispatch (ONM → NDTs, no queue)
+# Fast downstream dispatch (ONM -> NDTs)
 # ---------------------------------------------------------------------------
 def fast_dispatch(
     sender,
@@ -501,7 +573,7 @@ def fast_dispatch(
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Digital Twin Manager (deterministic build)")
+    ap = argparse.ArgumentParser(description="Digital Twin Manager")
     ap.add_argument("--proto", required=True, choices=["udp", "tcp"])
     ap.add_argument("--relay-ip", required=True)
     ap.add_argument("--relay-port", type=int, default=7001)
@@ -516,6 +588,10 @@ def main() -> None:
     ap.add_argument("--max-queue", type=int, default=0)
     ap.add_argument("--drop-prio-if-full", type=int, default=60)
     ap.add_argument("--disable-priorities", action="store_true")
+    ap.add_argument("--no-queue", action="store_true",
+                    help="Zero-buffer: drop immediately if dispatch is busy")
+    ap.add_argument("--max-rate", type=float, default=0.0,
+                    help="Hard cap on processing rate ev/s (0=unlimited)")
     ap.add_argument("--enqueue-onm", action="store_true")
     ap.add_argument("--log-file", default=LOG_FILE_DEFAULT)
     ap.add_argument("--event-limit", type=int, default=0)
@@ -541,6 +617,7 @@ def main() -> None:
     }
 
     threading.Thread(target=_log_writer, name="log-writer", daemon=True).start()
+    _build_log_prefix()
 
     if args.experiment_duration > 0:
         def _timer() -> None:
@@ -577,11 +654,25 @@ def main() -> None:
             max_queue=args.max_queue,
             drop_prio_if_full=args.drop_prio_if_full,
             disable_priorities=args.disable_priorities,
+            no_queue=args.no_queue,
         )
+
+        if args.no_queue:
+            print("[DTM] Mode: NO-QUEUE — drop immediately if busy", flush=True)
+        elif args.max_queue > 0:
+            print(f"[DTM] Mode: BOUNDED QUEUE — max_queue={args.max_queue}", flush=True)
+        else:
+            print("[DTM] Mode: UNLIMITED QUEUE — no drops", flush=True)
+
+        tb = TokenBucket(args.max_rate, burst=1) if args.max_rate > 0 else None
+        if tb is not None:
+            print(f"[DTM] Rate cap: C = {args.max_rate:.0f} ev/s", flush=True)
+
         FeedbackController(
             listen_port=args.feedback_port,
             onm_sender=onm_sender,
             aq=aq,
+            token_bucket=tb,
         )
         print(
             f"[NDT] Federated | fanout={args.fanout} "
