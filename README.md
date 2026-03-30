@@ -25,119 +25,76 @@ This is a PoC for testing Event-driven synchronization between ON-NDT
             Red interna (ON) enp0s8: 172.16.1.1/30
             Red interna (DT) enp0s9: 172.16.2.1/30  
 
-        4.2 Cloud private server: 
-            ip: 79.143.93.210
+The architecture including mininet ON and NDT is seen below:
+![poc_architevture](Images/PoC.jpg)
 
 ## Running the PoC:
+The PoC can run under two different execution modes: normal (1:1) and federated (1:N). 
 
-### Create the ON and NDT
-In the VM ON and VM NDT:
+- 1:1 Mode: In this operation mode, the ONM is used as the input interface to modify the ON mininet with actions such a: "set r1 r2 down 0 0 1000", "set r1 r2 up 50 1 10", "exec r1 "ip route add 10.20.30.40 via 10.0.0.254"", "exec r1 "ip route del 10.20.30.40 via 10.0.0.254"". The ONM applies these modifications in the ON and then transmits the command to the DTM vis the relay node. The DTM receives the ON modification and applies locally the modification (the NDT mininet need to run).
 
-1. Create (if not created yet) the script nodes.py
-```bash
-nano on_ndt.py
-```
+- 1:N Mode: in this mode, the ONM operates as in the 1:1; however, the DTM, doesn't require the NDT mininet running. Therefore, the DTM just forwards the ON commands to N NDTs while it receives and coordinates the NDT's generated events to transmit them coordinated to the ONM.
 
-### VM ON:
+
 Initiate the ON
+### VM ON:
 ```bash
 sudo python3 on_ndt.py --role on
 ```
 
+Initiate the NDT
 ### VM NDT
 ```bash
 sudo python3 on_ndt.py --role ndt
 ```
 
-### Order for execute the test
-First start the relay local or cloud:
+Initiate the relay:
 ```bash
-python3 relay.py --proto <udp or tcp> --port 7001
+python3 relay.py --proto tcp --port 7001
 ```
 
-Second start the DTM
-```bash
-python3 dtm.py --proto <udp or tcp> --relay-ip <172.16.1.1 or 79.143.93.210> --relay-port 7001
-python3 dtm_v12.py --proto udp --relay-ip 79.143.93.210 --relay-port 7001 --relay-kind vps --log-file /home/ubuntu/ndtm_events.log & NDT_PID=$!
-```
-
-Start the ONM
-```bash
-python3 onm.py --proto <udp or tcp> --relay-ip <172.16.1.1 or 79.143.93.210> --relay-port 7001
-sudo python3 onm_v12.py --proto udp --relay-ip 79.143.93.210 --relay-port 7001 --relay-kind vps --log-file /home/ubuntu/onm_events.log
-```
+## Start the Experiments
+### ONM
+To autoamte the ONM commands execution there are two supporting files: on_events_gen.py and onm_commands.txt.
+Arguments: 
+- file: contains the ON commands.
+- rate: rate in ev/second.
+- duration: experiment duration in seconds.
+- monck-on: flag to avoid the execution of the events in the ON
+- log-file: path where a supporting log is saved (optional)
 
 ```bash
-python3 monitor_resources.py --pid 4569 --iface enp0s8 --out ndt_1to1_resources.csv --interval 0.2
+python3 on_events_gen.py --file onm_commands.txt --rate <rate: events per second> --duration <experiment time> | python3 onm.py --proto tcp --relay-ip 172.16.1.1 --relay-port 7001 --relay-kind vps  --mock-on  --log-file /home/ubuntu/final_test/2core/1to64_tcp/onm.log
 ```
 
-
-caso federado:
-en ON:
+### DTM:
+- 1:1 Mode:
+![1:1_Mode](Images/Poc_11.png)
 ```bash
-python3 onm_fed.py \
-  --proto udp \
-  --relay-ip <IP_ROUTER> \
-  --base-port 7001 \
-  --fanout 5 \
-  --relay-kind router \
-  --log-file /home/ubuntu/onm_events.log &
-ON_PID=$!
+python3 dtm.py --proto tcp --relay-ip 172.16.2.1 --relay-port 7001 --mode 1:1 --log-file /home/ubuntu/dtm_events.log -experiment-duration 75
 ```
 
+- 1:N Mode:
+![1:N_mode](Images/PoC_fed.png)
 ```bash
-python3 monitor_resources.py \
-  --pid $ON_PID \
-  --iface enp0s8 \
-  --out on_federated_fanout5.csv \
-  --interval 0.5
+python3 dtm.py --proto tcp  --relay-ip 172.16.2.1  --relay-port 7001  --mode federated  --fanout 15  --dst-ip 192.168.99.2  --base-port 8001  --feedback-port 9000  --group-size 1  --wave-delay 0  --max-queue 10  --drop-prio-if-full 20  --experiment-duration 75  --disable-priorities  --log-file /home/ubuntu/final_test/experiment2/losses/1to15/dtm.log
 ```
 
+Arguments:
+  - mode: 1:1/federated
+  - fanout (federated mode): Number of fan out NDTs
+  - dst-ip (federated mode): IP address of the VM that deploys and generates NDT events.
+  - base-port (federated mode): port used by the DTM to transmit the ON events to the NDTs.
+  - feedback-port (federated mode): port used by the DTM to listen to the NDT events.
+  - group size (federated mode-optional): used to forward events to the NDTs in groups.
+  - wave-delay (federated mode-optional): delay between transmission groups.
+  - max-queue (federated mode-optional): size of the queue handled by the DTM, if no size is proved the queue is unlimited.
+  - drop-prio-if-full (federated mode-optional): priority to discard events when the queue is full.
+  - experiment-duration: duration of the experiment in seconds.
+  - disable-priorities (federated mode-optional): if it is turned on the events are discarded equally when the queue is full; if is turned off the critical events are forwarded while non-critical events might be discarded.
+
+### NDTs and generator:
+Generate mode
 ```bash
-set r1 r2 up 50 1 10
-set r1 r2 down 0 0 1000
+python3 ndt_gen_ev.py --mode generate --fanout 15 --feedback-ip 192.168.99.1 --feedback-port 9000 --priority-mode paper_mix --rate 3000 --duration 60 --start-delay 5
 ```
-
-en el router
-```bash
-python3 listen_ports.py \
-  --proto udp \
-  --base-port 7001 \
-  --fanout 5 \
-  --csv dummy_rx_fanout5.csv
-```
-
-📊 CÓMO SACAS LAS MÉTRICAS Y PLOTS (DESPUÉS)
-
-Cuando tengas:
-
-on_federated_fanout1.csv
-on_federated_fanout2.csv
-on_federated_fanout5.csv
-on_federated_fanout10.csv
-on_federated_fanout20.csv
-
-
-Copias esos archivos a tu máquina de análisis (o una VM con venv limpio).
-
-7️⃣ Máquina de análisis — Plots finales
-python3 analyze_monitor_results.py \
-  --mode federated \
-  --csv on_federated_fanout1.csv on_federated_fanout2.csv \
-        on_federated_fanout5.csv on_federated_fanout10.csv \
-        on_federated_fanout20.csv \
-  --outdir out_federated \
-  --link-capacity-mbps 100
-
-
-
-latencias
-en el ON:
-arrancar el onm
-python3 onm_fed.py --proto udp --relay-ip 79.143.93.210 --base-port 7001 --fanout 2 --relay-kind vps --log-file /home/ubuntu/onm_fanout_udp_f2.log --pid-file /home/ubuntu/onm.pid
-
-arrancar el monitor
-python3 monitor_resources.py --pid $(cat /home/ubuntu/onm.pid)  --iface enp0s3 --out /home/ubuntu/fanout/onm_resources_tcp_f50.csv --interval 1.0
-
-analizar consumo de recursos:
-python3 analyze_monitor_resources.py   --input-dir /home/ubuntu/fanout   --outdir out_federated   --link-capacity-mbps 100
