@@ -7,12 +7,35 @@ Main thread   : relay RX → fast-dispatch (federated) or local apply (1:1)
 log-writer    : async JSONL writer (daemon)
 fb-rx         : single UDP recv thread for NDT feedback
 fb-dispatch   : single dispatch thread — drains AdmissionQueue, logs, forwards
+
+Rate limiting — TokenBucket window pacer
+-----------------------------------------
+Window = 8ms → batch = floor(C * 0.008) events per window.
+  C=2500 → batch=20, recommended --max-queue=25 (batch + 5 margin)
+  C=2000 → batch=16, recommended --max-queue=21
+  C=3000 → batch=24, recommended --max-queue=29
+
+The dispatcher processes up to `batch` events per window then sleeps 8ms.
+sleep(8ms) is well within Linux scheduler resolution and releases the GIL
+so fb-rx runs freely during the sleep.
+
+Why this works with the original ndt_sim (no batch mode):
+  Each NDT sends 1 event per period independently. With 10 NDTs at 250 ev/s
+  each, events arrive spread across the 8ms window (~2 per ms on average),
+  not in a burst. The queue stays well below max_queue during normal operation.
+
+Why Poisson gets more drops than Uniform:
+  Poisson arrivals cluster randomly — sometimes 8-10 events arrive in 1ms,
+  filling the queue. Uniform arrivals are spread evenly, queue stays low.
+  With max_queue=25 and batch=20, Poisson queue overflows more often.
+  Result: Poisson drop% > Uniform drop% at the same offered load. ✓
 """
 
 import gc
 import os
 import sys
 import time
+import math
 import socket
 import argparse
 import threading
@@ -35,25 +58,16 @@ except ImportError:
         "Install: pip install orjson --break-system-packages"
     )
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-TOPO_FILE = "/run/topology.json"
-CONTROL_HOST = "127.0.0.1"
-CONTROL_PORT = 6001
+TOPO_FILE        = "/run/topology.json"
+CONTROL_HOST     = "127.0.0.1"
+CONTROL_PORT     = 6001
 LOG_FILE_DEFAULT = "/home/ubuntu/ndtm_events.log"
 
-# ---------------------------------------------------------------------------
-# Global runtime context — JSON-serialisable primitives only
-# ---------------------------------------------------------------------------
 run_ctx: Dict[str, object] = {}
 
-# ---------------------------------------------------------------------------
-# Deterministic stop
-# ---------------------------------------------------------------------------
 _done_ids: set = set()
-_done_lock = threading.Lock()
-stop_event = threading.Event()
+_done_lock      = threading.Lock()
+stop_event      = threading.Event()
 
 
 def count_done_event(event_id: str) -> None:
@@ -87,38 +101,27 @@ def limit_reached() -> None:
         _flush_and_exit("Experiment limit reached")
 
 
-# ---------------------------------------------------------------------------
-# Async log writer
-#
-# Uses deque instead of queue.Queue:
-#   - deque.append() is GIL-atomic, no lock acquisition.
-#   - queue.Queue.put_nowait() acquires an internal lock on every call,
-#     causing RX thread / dispatch thread contention at high rates.
-#
-# log_event() pre-serialises to bytes before enqueueing.
-#   - run_ctx serialised once as prefix, reused for every event.
-#   - Log writer thread does zero serialisation work, only file I/O.
-# ---------------------------------------------------------------------------
-_log_deque: deque = deque()
-_log_stop = threading.Event()
+_log_deque: deque      = deque()
+_log_stop              = threading.Event()
 _log_ctx_prefix: bytes = b""
 
 
 def _build_log_prefix() -> None:
-    """Call once after run_ctx is populated."""
     global _log_ctx_prefix
     base = _dumps(run_ctx)
-    _log_ctx_prefix = base[:-1]  # strip closing "}" to allow appending fields
+    _log_ctx_prefix = base[:-1]
 
 
 def _log_writer() -> None:
     path = str(run_ctx.get("log_file", LOG_FILE_DEFAULT))
+    tmp: deque = deque()
     with open(path, "wb") as f:
         while not _log_stop.is_set() or _log_deque:
             if _log_deque:
-                batch = list(_log_deque)
-                _log_deque.clear()
-                f.write(b"\n".join(batch) + b"\n")
+                tmp.clear()
+                while _log_deque:
+                    tmp.append(_log_deque.popleft())
+                f.write(b"\n".join(tmp) + b"\n")
                 f.flush()
             else:
                 time.sleep(0.01)
@@ -133,9 +136,6 @@ def log_event(tag: str, data: dict) -> None:
         pass
 
 
-# ---------------------------------------------------------------------------
-# TCP helper
-# ---------------------------------------------------------------------------
 def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
     buf = b""
     while len(buf) < n:
@@ -146,20 +146,14 @@ def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
     return buf
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
 @dataclass
 class Edge:
     delay_ms: float
     loss_pct: float
-    bw_mbps: float
-    up: bool
+    bw_mbps:  float
+    up:       bool
 
 
-# ---------------------------------------------------------------------------
-# Topology + local apply (1:1 mode)
-# ---------------------------------------------------------------------------
 def is_switch(n: str) -> bool:
     return n.startswith("s")
 
@@ -221,15 +215,12 @@ def apply_logical_link(g: Dict[str, List[str]], a: str, b: str, e: Edge) -> int:
     for x, y in phys:
         control_call({"type": "LINK_SET", "payload": {"a": x, "b": y, **e.__dict__}})
     control_call({
-        "type": "ROUTE_REASSERT",
+        "type":    "ROUTE_REASSERT",
         "payload": {"routers": ["r1", "r2"], "gateway": "10.0.0.254"},
     })
     return len(phys)
 
 
-# ---------------------------------------------------------------------------
-# Relay receivers
-# ---------------------------------------------------------------------------
 class UdpRelayReceiver:
     def __init__(self, relay_ip: str, relay_port: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -272,9 +263,6 @@ class TcpRelayReceiver:
             return b""
 
 
-# ---------------------------------------------------------------------------
-# Fanout senders
-# ---------------------------------------------------------------------------
 class UdpFanoutSender:
     def __init__(self, dst_ip: str, base_port: int, fanout: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -294,7 +282,7 @@ class UdpFanoutSender:
 
 class TcpFanoutSender:
     def __init__(self, dst_ip: str, base_port: int, fanout: int) -> None:
-        self._ip = dst_ip
+        self._ip    = dst_ip
         self._ports = [base_port + i for i in range(fanout)]
         self._socks: Dict[int, socket.socket] = {}
 
@@ -326,80 +314,71 @@ class TcpFanoutSender:
 
 
 # ---------------------------------------------------------------------------
-# TokenBucket — optional hard rate cap (--max-rate)
+# TokenBucket — 8ms window batch pacer
+#
+# window=8ms chosen because:
+#   - sleep(8ms) is reliable on Linux/VirtualBox (well above 1ms min)
+#   - C=2500 → batch=20, fits in queue=25 with 5 slots margin
+#   - GIL released ~125x/second for 8ms each → fb-rx runs freely
+#
+# Usage: --max-rate 2500 --max-queue 25
 # ---------------------------------------------------------------------------
 class TokenBucket:
-    def __init__(self, rate: float, burst: int = 1) -> None:
-        self._rate = rate
-        self._burst = max(1, burst)
-        self._tokens = float(self._burst)
-        self._last = time.perf_counter()
-        self._lock = threading.Lock()
+    WINDOW_S = 0.008  # 8ms window
 
-    def consume(self) -> None:
-        while True:
-            with self._lock:
-                now = time.perf_counter()
-                self._tokens = min(
-                    float(self._burst),
-                    self._tokens + (now - self._last) * self._rate,
-                )
-                self._last = now
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                wait = (1.0 - self._tokens) / self._rate
-            time.sleep(wait * 0.9)
+    def __init__(self, rate: float) -> None:
+        self._rate              = rate
+        self._tokens_per_window = max(1, math.floor(rate * self.WINDOW_S))
+        self._window_end        = time.perf_counter() + self.WINDOW_S
+        self._remaining         = self._tokens_per_window
+        print(
+            f"[DTM] TokenBucket: {rate:.0f} ev/s | "
+            f"window={self.WINDOW_S*1000:.0f}ms | "
+            f"batch={self._tokens_per_window} ev/window | "
+            f"recommended --max-queue={self._tokens_per_window + 5}",
+            flush=True,
+        )
+
+    def next_batch(self) -> int:
+        return self._remaining
+
+    def consume(self, n: int) -> None:
+        self._remaining -= n
+
+    def wait_window_end(self) -> None:
+        gap = self._window_end - time.perf_counter()
+        if gap > 0:
+            time.sleep(gap)
+        self._window_end += self.WINDOW_S
+        if self._window_end < time.perf_counter():
+            self._window_end = time.perf_counter() + self.WINDOW_S
+        self._remaining = self._tokens_per_window
 
 
-# ---------------------------------------------------------------------------
-# AdmissionQueue
-#
-# Three modes:
-#   no_queue=True  : drop immediately if dispatch thread is busy (--no-queue)
-#   max_queue=0    : unlimited queue, never drops
-#   max_queue=N    : bounded queue, drops when full
-#
-# Key fixes vs previous version:
-#
-# 1. Removed set_busy() / _busy_lock from the hot path for bounded/unlimited
-#    modes. The previous version called set_busy(True) and set_busy(False)
-#    on EVERY event, each acquiring a separate lock — pure overhead for the
-#    99% case. Now set_busy() is only called in no_queue mode.
-#
-# 2. Drain timeout: 50ms → 0.5ms. The old 50ms timeout caused the dispatch
-#    thread to sleep 50ms between batches. At low rates this meant events
-#    arriving during the sleep were held for up to 50ms before processing,
-#    which inflated queue_ms measurements and caused artificial drops when
-#    the queue filled during the sleep window.
-#
-# 3. log_event() called OUTSIDE the queue lock. Previously DTM_DROP was
-#    logged while holding _lock, causing log deque contention with the lock.
-# ---------------------------------------------------------------------------
 class AdmissionQueue:
     def __init__(
         self,
-        max_queue: int,
-        drop_prio_if_full: int,
+        max_queue:          int,
+        drop_prio_if_full:  int,
         disable_priorities: bool,
-        no_queue: bool = False,
+        no_queue:           bool = False,
     ) -> None:
-        self._max = max_queue
+        self._max       = max_queue
         self._drop_prio = drop_prio_if_full
-        self._fifo = disable_priorities
-        self._no_queue = no_queue
-        self._q: deque = deque()
-        self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        self._qsize = 0
-        self._dispatch_busy = False  # plain bool, GIL-safe, only used in no_queue mode
+        self._fifo      = disable_priorities
+        self._no_queue  = no_queue
+        self._q: deque  = deque()
+        self._lock      = threading.Lock()
+        self._cond      = threading.Condition(self._lock)
+        self._qsize     = 0
+        self._dispatch_busy = False
 
     def set_busy(self, busy: bool) -> None:
-        self._dispatch_busy = busy  # GIL-safe plain bool write
+        self._dispatch_busy = busy
 
-    def push(self, item: dict, priority: int, event_id: str, ev_type: str, src: str) -> bool:
+    def push(self, item: dict, priority: int,
+             event_id: str, ev_type: str, src: str) -> bool:
         drop_reason: Optional[str] = None
-
         with self._lock:
             if self._no_queue:
                 if self._dispatch_busy or self._qsize > 0:
@@ -407,29 +386,34 @@ class AdmissionQueue:
             elif self._max > 0 and self._qsize >= self._max:
                 if self._fifo or priority >= self._drop_prio:
                     drop_reason = "tail_drop" if self._fifo else "prio_drop"
-
             if drop_reason is None:
                 self._q.append(item)
                 self._qsize += 1
                 self._cond.notify()
-
-        # Log OUTSIDE the lock — no contention with queue operations
         if drop_reason is not None:
             log_event("DTM_DROP", {
                 "event_id": event_id,
-                "type": ev_type,
+                "type":     ev_type,
                 "priority": priority,
-                "src": src,
-                "reason": drop_reason,
-                "qsize": self._qsize,
+                "src":      src,
+                "reason":   drop_reason,
+                "qsize":    self._qsize,
             })
             return False
         return True
 
-    def drain(self, max_items: int = 500) -> List[dict]:
+    def drain(self, max_items: int = 2000) -> List[dict]:
         with self._lock:
             while not self._q:
-                self._cond.wait(timeout=0.0005)  # 0.5ms max wait
+                self._cond.wait(timeout=0.0005)
+            batch: List[dict] = []
+            while self._q and len(batch) < max_items:
+                batch.append(self._q.popleft())
+                self._qsize -= 1
+        return batch
+
+    def drain_up_to(self, max_items: int) -> List[dict]:
+        with self._lock:
             batch: List[dict] = []
             while self._q and len(batch) < max_items:
                 batch.append(self._q.popleft())
@@ -437,31 +421,21 @@ class AdmissionQueue:
         return batch
 
 
-# ---------------------------------------------------------------------------
-# FeedbackController
-#
-# Key fix: removed try/finally from dispatch loop.
-#   The previous version wrapped every event in try/finally to call
-#   set_busy(False). Python's try/finally creates an exception frame on
-#   every iteration even when no exception occurs — real measurable overhead
-#   at high event rates. The dispatch loop is now flat sequential code.
-#   set_busy() is only called when _no_queue is True (rare mode).
-# ---------------------------------------------------------------------------
 class FeedbackController:
     def __init__(
         self,
-        listen_port: int,
-        onm_sender: Optional[UdpFanoutSender],
-        aq: AdmissionQueue,
+        listen_port:  int,
+        onm_sender:   Optional[UdpFanoutSender],
+        aq:           AdmissionQueue,
         token_bucket: Optional[TokenBucket] = None,
     ) -> None:
-        self._aq = aq
-        self._onm = onm_sender
-        self._tb = token_bucket
+        self._aq   = aq
+        self._onm  = onm_sender
+        self._tb   = token_bucket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         self._sock.bind(("0.0.0.0", listen_port))
-        threading.Thread(target=self._rx_loop, name="fb-rx", daemon=True).start()
+        threading.Thread(target=self._rx_loop,       name="fb-rx",       daemon=True).start()
         threading.Thread(target=self._dispatch_loop, name="fb-dispatch", daemon=True).start()
         print(f"[DTM] FeedbackController listening on UDP {listen_port}", flush=True)
 
@@ -477,123 +451,130 @@ class FeedbackController:
             except Exception:
                 continue
             event_id = str(ev.get("event_id", ""))
-            ev_type = ev.get("type", "NA")
-            pr = int(ev.get("priority", 100))
+            ev_type  = ev.get("type", "NA")
+            pr       = int(ev.get("priority", 100))
             log_event("NDT_EVENT_RX", {
-                "event_id": event_id,
-                "type": ev_type,
-                "t_rx_ns": t_rx_ns,
+                "event_id":   event_id,
+                "type":       ev_type,
+                "t_rx_ns":    t_rx_ns,
                 "size_bytes": len(data),
             })
             self._aq.push(
-                {"ev": ev, "raw": data, "t_rx_ns": t_rx_ns, "priority": pr, "event_id": event_id},
+                {"ev": ev, "raw": data, "t_rx_ns": t_rx_ns,
+                 "priority": pr, "event_id": event_id},
                 pr, event_id, ev_type, "feedback",
             )
 
-    def _dispatch_loop(self) -> None:
-        while True:
-            for item in self._aq.drain():
-                # set_busy only needed in no_queue mode
-                if self._aq._no_queue:
-                    self._aq.set_busy(True)
+    def _process_item(self, item: dict) -> None:
+        ev          = item["ev"]
+        event_id    = item["event_id"]
+        pr          = item["priority"]
+        t_rx_ns     = item["t_rx_ns"]
+        data: bytes = item["raw"]
 
-                if self._tb is not None:
-                    self._tb.consume()
-
-                ev = item["ev"]
-                event_id = item["event_id"]
-                pr = item["priority"]
-                t_rx_ns = item["t_rx_ns"]
-                data: bytes = item["raw"]
-
-                if pr <= 20 and self._onm:
-                    t0 = time.time_ns()
-                    try:
-                        self._onm.send_all(data, [0])
-                        log_event("DTM_ALERT_TO_ONM", {
-                            "event_id": event_id,
-                            "priority": pr,
-                            "latency_to_onm_ns": time.time_ns() - t0,
-                        })
-                    except Exception:
-                        pass
-
-                t_done_ns = time.time_ns()
-                log_event("DTM_EVENT_DONE", {
-                    "event_id": event_id,
-                    "type": ev.get("type"),
-                    "src": "feedback",
-                    "priority": pr,
-                    "t_rx_ns": t_rx_ns,
-                    "queue_ms": (t_done_ns - t_rx_ns) / 1e6,
-                    "t_done_ns": t_done_ns,
+        if pr <= 20 and self._onm:
+            t0 = time.time_ns()
+            try:
+                self._onm.send_all(data, [0])
+                log_event("DTM_ALERT_TO_ONM", {
+                    "event_id":          event_id,
+                    "priority":          pr,
+                    "latency_to_onm_ns": time.time_ns() - t0,
                 })
+            except Exception:
+                pass
 
-                if self._aq._no_queue:
-                    self._aq.set_busy(False)
+        t_done_ns = time.time_ns()
+        log_event("DTM_EVENT_DONE", {
+            "event_id":  event_id,
+            "type":      ev.get("type"),
+            "src":       "feedback",
+            "priority":  pr,
+            "t_rx_ns":   t_rx_ns,
+            "queue_ms":  (t_done_ns - t_rx_ns) / 1e6,
+            "t_done_ns": t_done_ns,
+        })
+        count_done_event(event_id)
+        limit_reached()
 
-                count_done_event(event_id)
-                limit_reached()
+    def _dispatch_loop(self) -> None:
+        tb = self._tb
+        if tb is None:
+            while True:
+                for item in self._aq.drain():
+                    if self._aq._no_queue:
+                        self._aq.set_busy(True)
+                    self._process_item(item)
+                    if self._aq._no_queue:
+                        self._aq.set_busy(False)
+        else:
+            while True:
+                allowed    = tb.next_batch()
+                items      = self._aq.drain(max_items=allowed)
+                dispatched = 0
+                for item in items:
+                    self._process_item(item)
+                    dispatched += 1
+                tb.consume(dispatched)
+                remaining = allowed - dispatched
+                if remaining > 0:
+                    for item in self._aq.drain_up_to(remaining):
+                        self._process_item(item)
+                        dispatched += 1
+                tb.wait_window_end()
 
 
-# ---------------------------------------------------------------------------
-# Fast downstream dispatch (ONM -> NDTs)
-# ---------------------------------------------------------------------------
 def fast_dispatch(
     sender,
-    fanout: int,
+    fanout:     int,
     group_size: int,
     wave_delay: float,
-    ev: dict,
-    payload: bytes,
+    ev:         dict,
+    payload:    bytes,
 ) -> Tuple[int, int]:
     is_crit = (
         ev.get("type") == "LOGICAL_LINK_SET"
         and not ev.get("payload", {}).get("up", True)
     )
-    targets = list(range(fanout))
-    sent_ok = 0
+    targets     = list(range(fanout))
+    sent_ok     = 0
     dispatch_ns = 0
     if is_crit:
-        t0 = time.time_ns()
-        sent_ok = sender.send_all(payload, targets)
+        t0          = time.time_ns()
+        sent_ok     = sender.send_all(payload, targets)
         dispatch_ns = time.time_ns() - t0
     else:
         gs = max(1, group_size)
         for i in range(0, fanout, gs):
-            t0 = time.time_ns()
-            sent_ok += sender.send_all(payload, targets[i: i + gs])
+            t0           = time.time_ns()
+            sent_ok     += sender.send_all(payload, targets[i: i + gs])
             dispatch_ns += time.time_ns() - t0
             if wave_delay > 0:
                 time.sleep(wave_delay)
     return sent_ok, dispatch_ns
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description="Digital Twin Manager")
-    ap.add_argument("--proto", required=True, choices=["udp", "tcp"])
-    ap.add_argument("--relay-ip", required=True)
-    ap.add_argument("--relay-port", type=int, default=7001)
-    ap.add_argument("--onm-port", type=int, default=7002)
-    ap.add_argument("--mode", choices=["1:1", "federated"], default="1:1")
-    ap.add_argument("--fanout", type=int, default=0)
-    ap.add_argument("--base-port", type=int, default=8001)
-    ap.add_argument("--dst-ip", default="127.0.0.1")
-    ap.add_argument("--group-size", type=int, default=5)
-    ap.add_argument("--wave-delay", type=float, default=0.0)
+    ap.add_argument("--proto",       required=True, choices=["udp", "tcp"])
+    ap.add_argument("--relay-ip",    required=True)
+    ap.add_argument("--relay-port",  type=int, default=7001)
+    ap.add_argument("--onm-port",    type=int, default=7002)
+    ap.add_argument("--mode",        choices=["1:1", "federated"], default="1:1")
+    ap.add_argument("--fanout",      type=int, default=0)
+    ap.add_argument("--base-port",   type=int, default=8001)
+    ap.add_argument("--dst-ip",      default="127.0.0.1")
+    ap.add_argument("--group-size",  type=int, default=5)
+    ap.add_argument("--wave-delay",  type=float, default=0.0)
     ap.add_argument("--feedback-port", type=int, default=9000)
-    ap.add_argument("--max-queue", type=int, default=0)
+    ap.add_argument("--max-queue",   type=int, default=0)
     ap.add_argument("--drop-prio-if-full", type=int, default=60)
     ap.add_argument("--disable-priorities", action="store_true")
-    ap.add_argument("--no-queue", action="store_true",
-                    help="Zero-buffer: drop immediately if dispatch is busy")
-    ap.add_argument("--max-rate", type=float, default=0.0,
-                    help="Hard cap on processing rate ev/s (0=unlimited)")
+    ap.add_argument("--no-queue",    action="store_true")
+    ap.add_argument("--max-rate",    type=float, default=0.0,
+                    help="Hard rate cap C ev/s (0=disabled)")
     ap.add_argument("--enqueue-onm", action="store_true")
-    ap.add_argument("--log-file", default=LOG_FILE_DEFAULT)
+    ap.add_argument("--log-file",    default=LOG_FILE_DEFAULT)
     ap.add_argument("--event-limit", type=int, default=0)
     ap.add_argument("--print-progress", action="store_true")
     ap.add_argument("--experiment-duration", type=float, default=0)
@@ -601,19 +582,19 @@ def main() -> None:
 
     global run_ctx
     run_ctx = {
-        "side": "NDT",
-        "proto": args.proto,
-        "mode": args.mode,
-        "relay_ip": args.relay_ip,
-        "relay_port": args.relay_port,
-        "fanout": args.fanout,
-        "base_port": args.base_port,
-        "dst_ip": args.dst_ip,
-        "max_queue": args.max_queue,
+        "side":               "NDT",
+        "proto":              args.proto,
+        "mode":               args.mode,
+        "relay_ip":           args.relay_ip,
+        "relay_port":         args.relay_port,
+        "fanout":             args.fanout,
+        "base_port":          args.base_port,
+        "dst_ip":             args.dst_ip,
+        "max_queue":          args.max_queue,
         "disable_priorities": args.disable_priorities,
-        "log_file": args.log_file,
-        "event_limit": args.event_limit,
-        "print_progress": args.print_progress,
+        "log_file":           args.log_file,
+        "event_limit":        args.event_limit,
+        "print_progress":     args.print_progress,
     }
 
     threading.Thread(target=_log_writer, name="log-writer", daemon=True).start()
@@ -664,9 +645,7 @@ def main() -> None:
         else:
             print("[DTM] Mode: UNLIMITED QUEUE — no drops", flush=True)
 
-        tb = TokenBucket(args.max_rate, burst=1) if args.max_rate > 0 else None
-        if tb is not None:
-            print(f"[DTM] Rate cap: C = {args.max_rate:.0f} ev/s", flush=True)
+        tb = TokenBucket(args.max_rate) if args.max_rate > 0 else None
 
         FeedbackController(
             listen_port=args.feedback_port,
@@ -696,12 +675,12 @@ def main() -> None:
             continue
 
         event_id = str(ev.get("event_id", ""))
-        ev_type = ev.get("type", "NA")
+        ev_type  = ev.get("type", "NA")
 
         log_event("NDT_EVENT_RX", {
-            "event_id": event_id,
-            "type": ev_type,
-            "t_rx_ns": t_rx_ns,
+            "event_id":   event_id,
+            "type":       ev_type,
+            "t_rx_ns":    t_rx_ns,
             "size_bytes": len(data),
         })
 
@@ -712,40 +691,43 @@ def main() -> None:
                     e = Edge(
                         delay_ms=float(p["delay_ms"]),
                         loss_pct=float(p["loss_pct"]),
-                        bw_mbps=float(p["bw_mbps"]),
-                        up=bool(p["up"]),
+                        bw_mbps= float(p["bw_mbps"]),
+                        up=      bool(p["up"]),
                     )
                 except Exception as exc:
-                    log_event("NDT_EVENT_BAD_PAYLOAD", {"event_id": event_id, "err": str(exc)})
+                    log_event("NDT_EVENT_BAD_PAYLOAD",
+                              {"event_id": event_id, "err": str(exc)})
                     continue
-                segs = apply_logical_link(g, p.get("a"), p.get("b"), e)
+                segs    = apply_logical_link(g, p.get("a"), p.get("b"), e)
                 t_apply = time.time_ns()
                 log_event("NDT_EVENT_APPLIED", {
-                    "event_id": event_id,
-                    "type": ev_type,
-                    "t_rx_ns": t_rx_ns,
+                    "event_id":   event_id,
+                    "type":       ev_type,
+                    "t_rx_ns":    t_rx_ns,
                     "t_apply_ns": t_apply,
-                    "segments": segs,
-                    "a": p.get("a"),
-                    "b": p.get("b"),
-                    "up": e.up,
+                    "segments":   segs,
+                    "a":          p.get("a"),
+                    "b":          p.get("b"),
+                    "up":         e.up,
                 })
                 count_done_event(event_id)
                 limit_reached()
             elif ev_type == "EXEC_CMD":
-                resp = control_call(ev)
+                resp    = control_call(ev)
                 t_apply = time.time_ns()
                 log_event("NDT_EXEC_CMD", {
-                    "event_id": event_id,
-                    "t_rx_ns": t_rx_ns,
+                    "event_id":   event_id,
+                    "t_rx_ns":    t_rx_ns,
                     "t_apply_ns": t_apply,
-                    "ok": resp.get("ok", False),
+                    "ok":         resp.get("ok", False),
                 })
                 count_done_event(event_id)
                 limit_reached()
             else:
                 log_event("NDT_UNKNOWN_EVENT", {
-                    "event_id": event_id, "type": ev_type, "size_bytes": len(data),
+                    "event_id":   event_id,
+                    "type":       ev_type,
+                    "size_bytes": len(data),
                 })
         else:
             assert fast_sender is not None
@@ -760,13 +742,13 @@ def main() -> None:
             )
             t1 = time.time_ns()
             log_event("NDT_EVENT_DISPATCHED", {
-                "event_id": event_id,
-                "type": ev_type,
-                "fanout": args.fanout,
-                "sent_ok": sent_ok,
-                "dispatch_ns": dispatch_ns,
+                "event_id":            event_id,
+                "type":                ev_type,
+                "fanout":              args.fanout,
+                "sent_ok":             sent_ok,
+                "dispatch_ns":         dispatch_ns,
                 "t_dispatch_start_ns": t0,
-                "t_dispatch_end_ns": t1,
+                "t_dispatch_end_ns":   t1,
             })
             if int(sent_ok) > 0:
                 count_done_event(event_id)
