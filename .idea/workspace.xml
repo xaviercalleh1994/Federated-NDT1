@@ -8,7 +8,6 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/federated/DTM/dtm.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/DTM/dtm.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/federated/analysis/experiment_2_results.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/analysis/experiment_2_results.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/federated/ndt_event_gen/ndt_gen.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/ndt_event_gen/ndt_gen.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

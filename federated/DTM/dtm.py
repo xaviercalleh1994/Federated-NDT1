@@ -1,36 +1,35 @@
 """
-DTM — Digital Twin Manager (deterministic / reproducible build)
+DTM — Digital Twin Manager
+
+Overview
+--------
+The DTM coordinates multiple Network Digital Twin (NDT) instances in a
+federated 1:N deployment. It operates in two modes:
+
+  1:1 mode      — Manages a single local NDT (built with Mininet). Receives
+                  topology events from the Original Network Manager (ONM) via
+                  a relay node and applies them to the local Mininet-based NDT.
+
+  federated mode — Does NOT manage a local NDT. Instead, it receives upstream
+                  feedback events from N emulated NDT instances, processes
+                  them through an admission queue, and forwards them to the ONM.
+                  This mode is used for Experiment 2 (upstream load analysis).
 
 Threading model
 ---------------
-Main thread   : relay RX → fast-dispatch (federated) or local apply (1:1)
-log-writer    : async JSONL writer (daemon)
-fb-rx         : single UDP recv thread for NDT feedback
-fb-dispatch   : single dispatch thread — drains AdmissionQueue, logs, forwards
-
-Rate limiting — TokenBucket window pacer
------------------------------------------
-Window = 8ms → batch = floor(C * 0.008) events per window.
-  C=2500 → batch=20, recommended --max-queue=25 (batch + 5 margin)
-  C=2000 → batch=16, recommended --max-queue=21
-  C=3000 → batch=24, recommended --max-queue=29
-
-The dispatcher processes up to `batch` events per window then sleeps 8ms.
-sleep(8ms) is well within Linux scheduler resolution and releases the GIL
-so fb-rx runs freely during the sleep.
-
-Why this works with the original ndt_sim (no batch mode):
-  Each NDT sends 1 event per period independently. With 10 NDTs at 250 ev/s
-  each, events arrive spread across the 8ms window (~2 per ms on average),
-  not in a burst. The queue stays well below max_queue during normal operation.
-
-Why Poisson gets more drops than Uniform:
-  Poisson arrivals cluster randomly — sometimes 8-10 events arrive in 1ms,
-  filling the queue. Uniform arrivals are spread evenly, queue stays low.
-  With max_queue=25 and batch=20, Poisson queue overflows more often.
-  Result: Poisson drop% > Uniform drop% at the same offered load. ✓
+  Main thread   : Receives events from the relay (ONM→DTM direction).
+                  In 1:1 mode: applies topology changes to the local NDT.
+                  In federated mode: dispatches events to NDT instances.
+  log-writer    : Daemon thread. Drains the log deque and writes to disk
+                  asynchronously so that the main thread and fb-rx are never
+                  blocked by I/O.
+  fb-rx         : Single UDP receive thread for NDT upstream feedback.
+                  Parses incoming JSON events and pushes them to the
+                  AdmissionQueue.
+  fb-dispatch   : Single dispatch thread. Drains the AdmissionQueue, logs
+                  processing latency, and forwards critical events to the ONM.
+                  If a TokenBucket is configured, paces dispatch to C ev/s.
 """
-
 import gc
 import os
 import sys
@@ -42,35 +41,42 @@ import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+import orjson
 
-try:
-    import orjson
 
-    def _dumps(obj: object) -> bytes:
-        return orjson.dumps(obj)
+def _dumps(obj: object) -> bytes:
+    """Serialize Py objects to JSON with orjson which is
+     faster than json"""
+    return orjson.dumps(obj)
 
-    def _loads(data: bytes) -> dict:
-        return orjson.loads(data)
+def _loads(data: bytes) -> dict:
+    """Deserialize JSON bytes to a Python dict using orjson."""
+    return orjson.loads(data)
 
-except ImportError:
-    sys.exit(
-        "[FATAL] orjson is required.\n"
-        "Install: pip install orjson --break-system-packages"
-    )
 
+########## Variables used for running DTM in mode 1:1 ############
+# Contains the list of mininet nodes, used by the DTM to find logical paths
 TOPO_FILE        = "/run/topology.json"
+# HOST and PORT: to locally apply modifications in the mininet NDT
 CONTROL_HOST     = "127.0.0.1"
 CONTROL_PORT     = 6001
+##################################################################
 LOG_FILE_DEFAULT = "/home/ubuntu/ndtm_events.log"
-
+# ctx to save the context of the variables used to run the DTM
 run_ctx: Dict[str, object] = {}
 
+# variable to cound complete events
 _done_ids: set = set()
+# variable to protect events from concurrent access
 _done_lock      = threading.Lock()
 stop_event      = threading.Event()
 
 
 def count_done_event(event_id: str) -> None:
+    """
+    Optional function --> requires event_limit active. It is used to count
+    the number of events that have been completed.
+    """
     limit = int(run_ctx.get("event_limit", 0) or 0)
     if limit <= 0 or not event_id:
         return
@@ -86,6 +92,11 @@ def count_done_event(event_id: str) -> None:
 
 
 def _flush_and_exit(reason: str) -> None:
+    """
+    Function to flush pending logs and exit cleanly the program.
+    First _log_stop to stop the log writer thread, then waits 6 seconds to
+    deque to pending events
+    """
     print(f"\n[DTM] {reason}. Flushing logs...", flush=True)
     _log_stop.set()
     deadline = time.monotonic() + 6.0
@@ -101,18 +112,29 @@ def limit_reached() -> None:
         _flush_and_exit("Experiment limit reached")
 
 
+# Used for async loging
 _log_deque: deque      = deque()
+# Used to block the writing of new logs
 _log_stop              = threading.Event()
 _log_ctx_prefix: bytes = b""
 
 
 def _build_log_prefix() -> None:
+    """
+    Function called just once at the beginning of the program to delete the '}'
+    and append events to the same log line
+    """
     global _log_ctx_prefix
     base = _dumps(run_ctx)
     _log_ctx_prefix = base[:-1]
 
 
 def _log_writer() -> None:
+    """
+    Function to write logs with a separated thread.avoiding I/O blocking.
+    The thread is started at the beginning of the program and keeps running untill
+    experiment limit is reached.
+    """
     path = str(run_ctx.get("log_file", LOG_FILE_DEFAULT))
     tmp: deque = deque()
     with open(path, "wb") as f:
@@ -128,6 +150,9 @@ def _log_writer() -> None:
 
 
 def log_event(tag: str, data: dict) -> None:
+    """
+    Appends the log event to the async log buffer (_log_deque)
+    """
     try:
         event_bytes = _dumps({"ts_ns": time.time_ns(), "tag": tag, **data})
         merged = _log_ctx_prefix + b"," + event_bytes[1:]
@@ -148,6 +173,11 @@ def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
 
 @dataclass
 class Edge:
+    """
+    Class used to define the parameters of a logical link for 1:1 mode.
+    When the DTM receives a LOGICAL_LINK_SET event from the ONM it extracts
+    the link information to apply in the NDT mininet link segments.
+    """
     delay_ms: float
     loss_pct: float
     bw_mbps:  float
@@ -155,10 +185,18 @@ class Edge:
 
 
 def is_switch(n: str) -> bool:
+    """
+    Used in 1:1 mode to determine if a node is a switch or not.
+    It is further used to validate that a logical path contains at least 1 switch
+    """
     return n.startswith("s")
 
 
 def load_topo_graph() -> Dict[str, List[str]]:
+    """
+    Used in 1:1 Reads the topology contained in the topo file as adjacency matrix.
+    Therefore, the 1:1 mode requires the NDT mininet running in order to save the topology
+    """
     with open(TOPO_FILE) as f:
         t = orjson.loads(f.read())
     g: Dict[str, List[str]] = defaultdict(list)
@@ -171,6 +209,10 @@ def load_topo_graph() -> Dict[str, List[str]]:
 def path_only_switches_middle(
     g: Dict[str, List[str]], src: str, dst: str
 ) -> List[Tuple[str, str]]:
+    """
+    Used when APPLY_LOGICAL_LINK_SET is received from the ONM.
+    This function seeks for the middle switches in the logical path.
+    """
     q: deque = deque([src])
     prev: Dict[str, Optional[str]] = {src: None}
     while q:
@@ -195,6 +237,10 @@ def path_only_switches_middle(
 
 
 def control_call(ev: dict) -> dict:
+    """
+    Used as a control function to send the event to the controller in the
+    mininet script
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.connect((CONTROL_HOST, CONTROL_PORT))
@@ -209,6 +255,14 @@ def control_call(ev: dict) -> dict:
 
 
 def apply_logical_link(g: Dict[str, List[str]], a: str, b: str, e: Edge) -> int:
+    """
+    Apply a logical link between two nodes in a given graph.
+
+    This function determines the physical path between nodes `a` and `b` in the
+    graph `g`, consisting only of switch nodes in the middle. If a physical path
+    exists, the function establishes the link for each segment of the path using
+    specified edge properties and reasserts routing configurations.
+    """
     phys = path_only_switches_middle(g, a, b)
     if not phys:
         return 0
@@ -222,6 +276,9 @@ def apply_logical_link(g: Dict[str, List[str]], a: str, b: str, e: Edge) -> int:
 
 
 class UdpRelayReceiver:
+    """
+    Communicates the ONM and DTM via UDP connection
+    """
     def __init__(self, relay_ip: str, relay_port: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
@@ -246,6 +303,9 @@ class UdpRelayReceiver:
 
 
 class TcpRelayReceiver:
+    """
+        Communicates the ONM and DTM via TCP connection
+        """
     def __init__(self, relay_ip: str, relay_port: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -264,6 +324,9 @@ class TcpRelayReceiver:
 
 
 class UdpFanoutSender:
+    """
+    Sends the ONM payload to the N NDTs via UDP
+    """
     def __init__(self, dst_ip: str, base_port: int, fanout: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
@@ -281,6 +344,9 @@ class UdpFanoutSender:
 
 
 class TcpFanoutSender:
+    """
+    Sends the ONM payload to the N NDTs via TCP
+    """
     def __init__(self, dst_ip: str, base_port: int, fanout: int) -> None:
         self._ip    = dst_ip
         self._ports = [base_port + i for i in range(fanout)]
@@ -313,17 +379,27 @@ class TcpFanoutSender:
         return ok
 
 
-# ---------------------------------------------------------------------------
-# TokenBucket — 8ms window batch pacer
-#
-# window=8ms chosen because:
-#   - sleep(8ms) is reliable on Linux/VirtualBox (well above 1ms min)
-#   - C=2500 → batch=20, fits in queue=25 with 5 slots margin
-#   - GIL released ~125x/second for 8ms each → fb-rx runs freely
-#
-# Usage: --max-rate 2500 --max-queue 25
-# ---------------------------------------------------------------------------
 class TokenBucket:
+    """
+    Implements a token bucket rate-limiting mechanism.
+
+    This class provides a token bucket algorithm that allows users to consume
+    tokens up to a certain rate, with tokens being replenished at fixed intervals.
+    It is designed to regulate events or actions to ensure they do not exceed
+    a defined rate.
+
+    Attributes:
+        WINDOW_S (float): A fixed window size in seconds used as the fundamental
+            time frame for token allocation.
+
+    Methods:
+        next_batch: Returns the current number of tokens available for consumption.
+        consume: Decreases the available tokens by a specified amount.
+        wait_window_end: Waits for the current time window to end and replenishes
+            tokens for the next time window.
+
+    Usage: --max-rate 2500 --max-queue 25
+    """
     WINDOW_S = 0.008  # 8ms window
 
     def __init__(self, rate: float) -> None:
@@ -356,6 +432,26 @@ class TokenBucket:
 
 
 class AdmissionQueue:
+    """
+    Class to manage the queue of events to be processed.
+
+    This class facilitates queue management, including handling prioritized
+    items, dealing with queue overflows, and providing mechanisms to control
+    dispatch and draining of items. It supports both FIFO and priority-based
+    queue behavior, along with configurations to disable queuing. It is
+    designed for thread-safe operations.
+
+    Attributes:
+        max_queue (int): Maximum size of the queue. Zero means no limit.
+        drop_prio_if_full (int): Minimum priority level at which items
+            will be dropped if the queue is full and priority queuing
+            is enabled.
+        disable_priorities (bool): Disables priority sorting, enforcing
+            FIFO behavior.
+        no_queue (bool): If set to True, disables queuing entirely. Items
+            will only be processed if no other items are present in the
+            queue and the dispatch is not busy.
+    """
     def __init__(
         self,
         max_queue:          int,
@@ -422,6 +518,17 @@ class AdmissionQueue:
 
 
 class FeedbackController:
+    """
+    Class for handling the events received by the NDTs. Reception is done via UDP
+
+    Attributes:
+        listen_port (int): The UDP port on which the controller listens for incoming feedback events.
+        onm_sender (Optional[UdpFanoutSender]): Optional sender used for relaying specific feedback
+            data under certain conditions.
+        aq (AdmissionQueue): Queue used to manage the admission and prioritization of events.
+        token_bucket (Optional[TokenBucket]): Optional token bucket to enforce rate limiting for
+            processing events or managing throughput.
+    """
     def __init__(
         self,
         listen_port:  int,
@@ -532,6 +639,9 @@ def fast_dispatch(
     ev:         dict,
     payload:    bytes,
 ) -> Tuple[int, int]:
+    """
+    FUnction to dispatch the ON events sent by the ONM towards the N NDTs.
+    """
     is_crit = (
         ev.get("type") == "LOGICAL_LINK_SET"
         and not ev.get("payload", {}).get("up", True)
@@ -580,6 +690,7 @@ def main() -> None:
     ap.add_argument("--experiment-duration", type=float, default=0)
     args = ap.parse_args()
 
+    # Define the global context dictionary
     global run_ctx
     run_ctx = {
         "side":               "NDT",
@@ -596,10 +707,10 @@ def main() -> None:
         "event_limit":        args.event_limit,
         "print_progress":     args.print_progress,
     }
-
+    # Start the log independent thread
     threading.Thread(target=_log_writer, name="log-writer", daemon=True).start()
     _build_log_prefix()
-
+    # To control the exact time for executing the experiment
     if args.experiment_duration > 0:
         def _timer() -> None:
             print(f"[DTM] Timer: {args.experiment_duration}s", flush=True)
@@ -623,14 +734,15 @@ def main() -> None:
     if args.mode == "federated":
         if args.fanout <= 0:
             raise SystemExit("ERROR: --fanout > 0 required in federated mode")
-
+        # Define UDP/TCP sender for the NDTs
         fast_sender = (
             UdpFanoutSender(args.dst_ip, args.base_port, args.fanout)
             if args.proto == "udp"
             else TcpFanoutSender(args.dst_ip, args.base_port, args.fanout)
         )
-
+        # Define the dispatch sender
         onm_sender = UdpFanoutSender(args.relay_ip, args.onm_port, 1)
+        # Define the admision queue
         aq = AdmissionQueue(
             max_queue=args.max_queue,
             drop_prio_if_full=args.drop_prio_if_full,
@@ -646,7 +758,7 @@ def main() -> None:
             print("[DTM] Mode: UNLIMITED QUEUE — no drops", flush=True)
 
         tb = TokenBucket(args.max_rate) if args.max_rate > 0 else None
-
+        # Instantiate the event controller
         FeedbackController(
             listen_port=args.feedback_port,
             onm_sender=onm_sender,
@@ -685,6 +797,7 @@ def main() -> None:
         })
 
         if args.mode == "1:1":
+            # Logic to apply the changes in the NDT
             if ev_type == "LOGICAL_LINK_SET":
                 p = ev.get("payload", {})
                 try:
