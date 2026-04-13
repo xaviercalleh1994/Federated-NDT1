@@ -112,6 +112,23 @@ python3 ndt_gen_ev.py --mode generate --fanout 15 --feedback-ip 192.168.99.1 --f
 ```
 
 ### Get metrics:
+To get the metrics, it is recommended next folder structure:
+
+- losses/
+    - run1/
+        - 1to1/
+            - dtm.log
+        - 1to5/
+            - dtm.log
+        - 1to10/
+        - 1to20/
+    - run2/
+        - 1to1/
+        - 1to20/
+    - run3/
+    - run4/
+    - run5/
+
 ```bash
 python3 experiment_2.py --logs /home/ubuntu/final_test/experiment2/losses/ --out  /home/ubuntu/final_test/results/losses/ --C 2000
 ```
