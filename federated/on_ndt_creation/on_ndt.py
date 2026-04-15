@@ -1,3 +1,7 @@
+"""
+Authors: Xavier Calle-Heredia & Xavier Hesselbach
+Date: 2026-04-08
+"""
 import os
 import json
 import socket

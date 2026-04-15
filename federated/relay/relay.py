@@ -1,3 +1,8 @@
+"""
+Authors: Xavier Calle-Heredia & Xavier Hesselbach
+Date: 2026-04-08
+"""
+
 import argparse
 import socket
 import threading

@@ -1,3 +1,7 @@
+"""
+Authors: Xavier Calle-Heredia & Xavier Hesselbach
+Date: 2026-04-08
+"""
 import json
 import time
 import uuid

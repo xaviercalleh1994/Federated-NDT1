@@ -1,5 +1,8 @@
 """
-NDT Simulator — deterministic build
+Authors: Xavier Calle-Heredia & Xavier Hesselbach
+Date: 2026-04-08
+
+NDT Simulator
 
 listen   : passive sink for Experiment 1 (fanout downstream).
 generate : clock-disciplined alert generator for Experiment 2 (upstream load).
