@@ -80,15 +80,35 @@ python3 on_events_gen.py --file onm_commands.txt --rate <rate: events per second
 
 ### DTM:
 - 1:1 Mode:
+
 ![1:1_Mode](Images/Poc_11.png)
 ```bash
 python3 dtm.py --proto tcp --relay-ip 172.16.2.1 --relay-port 7001 --mode 1:1 --log-file /home/ubuntu/dtm_events.log -experiment-duration 75
 ```
 
 - 1:N Mode:
+
 ![1:N_mode](Images/PoC_fed.png)
+
+To further gather the metrics, it is recommended next folder structure for saving experiments, where 1toN it is the suggested name of the folder which stores the DTM log and N is the number of NDTs deployed:
+
+- losses/
+    - run1/
+        - 1to1/
+            - dtm.log
+        - 1to5/
+            - dtm.log
+        - 1to10/
+        - 1to20/
+    - run2/
+        - 1to1/
+        - 1to20/
+    - run3/
+    - run4/
+    - run5/
+
 ```bash
-python3 dtm.py --proto tcp  --relay-ip 172.16.2.1  --relay-port 7001  --mode federated  --fanout 15  --dst-ip 192.168.99.2  --base-port 8001  --feedback-port 9000  --group-size 1  --wave-delay 0  --max-queue 10  --drop-prio-if-full 20  --experiment-duration 75  --disable-priorities  --log-file /home/ubuntu/final_test/experiment2/losses/1to15/dtm.log
+python3 dtm.py --proto tcp  --relay-ip 172.16.2.1  --relay-port 7001  --mode federated  --fanout 15  --dst-ip 192.168.99.2  --base-port 8001  --feedback-port 9000  --group-size 1  --wave-delay 0  --max-queue 30  --experiment-duration 75  --disable-priorities  --log-file /home/ubuntu/final_test/experiment2/losses/1to15/dtm.log
 ```
 
 Arguments:
@@ -100,12 +120,24 @@ Arguments:
   - group size (federated mode-optional): used to forward events to the NDTs in groups.
   - wave-delay (federated mode-optional): delay between transmission groups.
   - max-queue (federated mode-optional): size of the queue handled by the DTM, if no size is proved the queue is unlimited.
-  - drop-prio-if-full (federated mode-optional): priority to discard events when the queue is full.
   - experiment-duration: duration of the experiment in seconds.
   - disable-priorities (federated mode-optional): if it is turned on the events are discarded equally when the queue is full; if is turned off the critical events are forwarded while non-critical events might be discarded.
 
 ### NDTs and generator:
 Generate mode
+- Uniform
+
 ```bash
-python3 ndt_gen_ev.py --mode generate --fanout 15 --feedback-ip 192.168.99.1 --feedback-port 9000 --priority-mode paper_mix --rate 3000 --duration 60 --start-delay 5
+python3 ndt_gen_ev.py --mode generate --fanout 15 --feedback-ip 192.168.99.1 --feedback-port 9000 --priority-mode paper_mix --rate 3000 -arrival-mode uniform --duration 60 --start-delay 5
+```
+
+- Poisson
+
+```bash
+python3 ndt_gen_ev.py --mode generate --fanout 15 --feedback-ip 192.168.99.1 --feedback-port 9000 --priority-mode paper_mix --rate 3000 -arrival-mode poisson --duration 60 --start-delay 5
+```
+
+### Get metrics:
+```bash
+python3 experiment_2.py --logs /home/ubuntu/final_test/experiment2/losses/ --out  /home/ubuntu/final_test/results/losses/ --C 2000
 ```
