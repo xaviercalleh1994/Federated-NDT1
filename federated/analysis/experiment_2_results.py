@@ -1,4 +1,7 @@
 """
+Authors: Xavier Calle-Heredia & Xavier Hesselbach
+Date: 2026-04-08
+
 NDT Federation Loss Analyser — uniform vs Poisson, multiple runs
 ================================================================
 Reads multiple experimental runs and produces plots with 95% confidence
