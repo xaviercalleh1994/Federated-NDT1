@@ -247,6 +247,43 @@ class TcpSender(SyncSender):
         self.s.close()
 
 
+# ── NEW (Exp. 1): send topology to DTM before any events ─────────────────────
+
+def send_topology(sender: SyncSender) -> None:
+    """
+    Send the ON topology to the DTM as the very first message.
+    The DTM uses it to build the graph needed to resolve LOGICAL_LINK_SET
+    into physical LINK_SET segments before fanning out to the N real NDTs.
+
+    Called once, immediately after the relay connection is established,
+    before any interactive commands are processed.
+
+    Backward compatible: if the DTM is running in 1:1 or Exp. 2 mode,
+    it receives a TOPOLOGY event and silently drops it with continue.
+    """
+    with open(TOPO_FILE) as f:
+        topo = json.load(f)
+
+    ev = {
+        "type":    "TOPOLOGY",
+        "payload": topo,   # {nodes: [...], links: [[a,b], ...]}
+    }
+    payload = json.dumps(ev).encode()
+    sender.send(payload)
+    print(
+        f"[ON] Topology sent to DTM "
+        f"({len(topo['nodes'])} nodes, {len(topo['links'])} links)",
+        flush=True,
+    )
+    log_event("ON_TOPOLOGY_SENT", {
+        "nodes":      len(topo["nodes"]),
+        "links":      len(topo["links"]),
+        "size_bytes": len(payload),
+    })
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--proto", choices=["udp", "tcp"], required=True)
@@ -271,9 +308,18 @@ def main():
     }
 
     # Transport selection
-    sender = UdpSender(args.relay_ip, args.relay_port) if args.proto == "udp" else TcpSender(args.relay_ip, args.relay_port)
+    sender = (
+        UdpSender(args.relay_ip, args.relay_port)
+        if args.proto == "udp"
+        else TcpSender(args.relay_ip, args.relay_port)
+    )
 
     nodes, g = load_topo_graph()
+
+    # NEW (Exp. 1): send topology to DTM so it can resolve logical links.
+    # The DTM drops this silently in 1:1 mode and Exp. 2 — no side effects.
+    send_topology(sender)
+
     M = Matrix()
 
     print("[ON] Ready. Commands:")

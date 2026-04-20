@@ -18,6 +18,13 @@ federated 1:N deployment. It operates in two modes:
                   them through an admission queue, and forwards them to the ONM.
                   This mode is used for Experiment 2 (upstream load analysis).
 
+  federated mode (Exp. 1) — Same as federated but NDTs are real Mininet
+                  instances on a second machine. The ONM sends a TOPOLOGY
+                  event as its first message; the DTM uses it to resolve
+                  LOGICAL_LINK_SET into physical LINK_SET segments before
+                  fanning out. Each NDT sends a UDP ACK after applying;
+                  DTM logs DTM_EVENT_COMPLETE when all N ACKs arrive.
+
 Threading model
 ---------------
   Main thread   : Receives events from the relay (ONM→DTM direction).
@@ -278,6 +285,117 @@ def apply_logical_link(g: Dict[str, List[str]], a: str, b: str, e: Edge) -> int:
     return len(phys)
 
 
+# ── NEW (Exp. 1): build adjacency graph from TOPOLOGY event payload ───────────
+
+def build_graph_from_payload(payload: dict) -> Dict[str, List[str]]:
+    """
+    Build adjacency graph from a TOPOLOGY event payload sent by the ONM.
+    Called once when {"type":"TOPOLOGY","payload":{nodes,links}} arrives.
+    Same structure as load_topo_graph() but reads from the event, not disk.
+    """
+    g: Dict[str, List[str]] = defaultdict(list)
+    for a, b in payload.get("links", []):
+        g[a].append(b)
+        g[b].append(a)
+    return g
+
+
+def resolve_to_physical(
+    g: Dict[str, List[str]],
+    ev: dict,
+) -> List[bytes]:
+    """
+    Resolve a LOGICAL_LINK_SET event into physical LINK_SET + ROUTE_REASSERT
+    payloads ready to fan out to the NDTs (Exp. 1).
+
+    Each NDT receives adjacent-node LINK_SET events that handle_event()
+    can apply directly — same as what the DTM sends in 1:1 mode.
+
+    Returns the original payload unchanged for any non-LOGICAL_LINK_SET type,
+    or when g is None (Exp. 2 passive sinks — full backward compatibility).
+    """
+    if ev.get("type") != "LOGICAL_LINK_SET" or g is None:
+        return [_dumps(ev)]
+
+    p    = ev.get("payload", {})
+    a, b = p.get("a"), p.get("b")
+    segs = path_only_switches_middle(g, a, b)
+    eid  = ev.get("event_id", "")
+
+    if not segs:
+        log_event("DTM_NO_PATH", {"event_id": eid, "a": a, "b": b})
+        return []
+
+    edge = {
+        "delay_ms": float(p.get("delay_ms", 0.0)),
+        "loss_pct": float(p.get("loss_pct", 0.0)),
+        "bw_mbps":  float(p.get("bw_mbps", 1000.0)),
+        "up":       bool(p.get("up", True)),
+    }
+
+    payloads: List[bytes] = []
+    for x, y in segs:
+        payloads.append(_dumps({
+            "type":     "LINK_SET",
+            "event_id": eid,
+            "payload":  {"a": x, "b": y, **edge},
+        }))
+    payloads.append(_dumps({
+        "type":     "ROUTE_REASSERT",
+        "event_id": eid,
+        "payload":  {"routers": ["r1", "r2"], "gateway": "10.0.0.254"},
+    }))
+    return payloads
+
+
+# ── NEW (Exp. 1): ACK completion tracker ─────────────────────────────────────
+
+class AckTracker:
+    """
+    Tracks UDP ACKs sent by each NDT after applying an event (Exp. 1).
+    When all N NDTs have ACKed the same event_id, logs DTM_EVENT_COMPLETE.
+
+    Created only when the TOPOLOGY event arrives (i.e. only for Exp. 1).
+    For Exp. 2 passive sinks no TOPOLOGY is sent so ack_tracker stays None
+    and FeedbackController behaviour is identical to the original.
+    """
+    def __init__(self, fanout: int) -> None:
+        self._fanout  = fanout
+        self._lock    = threading.Lock()
+        # event_id → {port: t_apply_ns}
+        self._acks:      Dict[str, Dict[int, int]] = defaultdict(dict)
+        # event_id → t_dispatch_ns
+        self._t_dispatch: Dict[str, int] = {}
+
+    def register_dispatched(self, event_id: str, t_ns: int) -> None:
+        with self._lock:
+            self._t_dispatch[event_id] = t_ns
+
+    def register_ack(self, event_id: str, port: int,
+                     ok: bool, t_apply_ns: int) -> None:
+        """Called by FeedbackController when an NDT_APPLY_ACK arrives."""
+        with self._lock:
+            self._acks[event_id][port] = t_apply_ns
+            n_acked = len(self._acks[event_id])
+            t_disp  = self._t_dispatch.get(event_id, 0)
+            complete = (n_acked >= self._fanout)
+
+        if complete:
+            t_now = time.time_ns()
+            log_event("DTM_EVENT_COMPLETE", {
+                "event_id":      event_id,
+                "fanout":        self._fanout,
+                "acks":          n_acked,
+                "t_dispatch_ns": t_disp,
+                "t_complete_ns": t_now,
+                "wall_ms":       (t_now - t_disp) / 1e6 if t_disp else None,
+            })
+            count_done_event(event_id)
+            limit_reached()
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class UdpRelayReceiver:
     """
     Communicates the ONM and DTM via UDP connection
@@ -531,6 +649,8 @@ class FeedbackController:
         aq (AdmissionQueue): Queue used to manage the admission and prioritization of events.
         token_bucket (Optional[TokenBucket]): Optional token bucket to enforce rate limiting for
             processing events or managing throughput.
+        ack_tracker (Optional[AckTracker]): NEW — tracks NDT_APPLY_ACK events for Exp. 1.
+            None for Exp. 2 (passive sinks), created when TOPOLOGY arrives.
     """
     def __init__(
         self,
@@ -538,11 +658,13 @@ class FeedbackController:
         onm_sender:   Optional[UdpFanoutSender],
         aq:           AdmissionQueue,
         token_bucket: Optional[TokenBucket] = None,
+        ack_tracker:  Optional[AckTracker]  = None,   # NEW (Exp. 1)
     ) -> None:
-        self._aq   = aq
-        self._onm  = onm_sender
-        self._tb   = token_bucket
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._aq      = aq
+        self._onm     = onm_sender
+        self._tb      = token_bucket
+        self._tracker = ack_tracker   # NEW (Exp. 1)
+        self._sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
         self._sock.bind(("0.0.0.0", listen_port))
         threading.Thread(target=self._rx_loop,       name="fb-rx",       daemon=True).start()
@@ -563,6 +685,26 @@ class FeedbackController:
             event_id = str(ev.get("event_id", ""))
             ev_type  = ev.get("type", "NA")
             pr       = int(ev.get("priority", 100))
+
+            # NEW (Exp. 1): intercept NDT_APPLY_ACK before the AdmissionQueue
+            # so the tracker can mark completion without queueing delay.
+            # When tracker is None (Exp. 2) this branch is never taken.
+            if ev_type == "NDT_APPLY_ACK" and self._tracker:
+                self._tracker.register_ack(
+                    event_id   = event_id,
+                    port       = int(ev.get("port", 0)),
+                    ok         = bool(ev.get("ok", False)),
+                    t_apply_ns = int(ev.get("t_apply_ns", t_rx_ns)),
+                )
+                log_event("DTM_ACK_RX", {
+                    "event_id": event_id,
+                    "port":     ev.get("port"),
+                    "ok":       ev.get("ok"),
+                    "apply_ms": ev.get("apply_ms"),
+                    "t_rx_ns":  t_rx_ns,
+                })
+                continue   # ACKs are not forwarded to the ONM
+
             log_event("NDT_EVENT_RX", {
                 "event_id":   event_id,
                 "type":       ev_type,
@@ -641,9 +783,16 @@ def fast_dispatch(
     wave_delay: float,
     ev:         dict,
     payload:    bytes,
+    g:          Optional[Dict[str, List[str]]] = None,    # NEW (Exp. 1)
+    tracker:    Optional[AckTracker]           = None,    # NEW (Exp. 1)
 ) -> Tuple[int, int]:
     """
     FUnction to dispatch the ON events sent by the ONM towards the N NDTs.
+
+    NEW (Exp. 1): if g is provided, LOGICAL_LINK_SET is resolved into
+    physical LINK_SET + ROUTE_REASSERT segments before fanout so each NDT
+    receives adjacent-node events that handle_event() can apply directly.
+    If g is None (Exp. 2 passive sinks) behaviour is identical to original.
     """
     is_crit = (
         ev.get("type") == "LOGICAL_LINK_SET"
@@ -652,18 +801,32 @@ def fast_dispatch(
     targets     = list(range(fanout))
     sent_ok     = 0
     dispatch_ns = 0
-    if is_crit:
-        t0          = time.time_ns()
-        sent_ok     = sender.send_all(payload, targets)
-        dispatch_ns = time.time_ns() - t0
-    else:
-        gs = max(1, group_size)
-        for i in range(0, fanout, gs):
-            t0           = time.time_ns()
-            sent_ok     += sender.send_all(payload, targets[i: i + gs])
+
+    # NEW (Exp. 1): resolve logical → physical when topology is known
+    payloads = resolve_to_physical(g, ev) if g is not None else [_dumps(ev)]
+    if not payloads:
+        return 0, 0
+
+    t_dispatch_start = time.time_ns()
+
+    for pld in payloads:
+        if is_crit:
+            t0          = time.time_ns()
+            sent_ok    += sender.send_all(pld, targets)
             dispatch_ns += time.time_ns() - t0
-            if wave_delay > 0:
-                time.sleep(wave_delay)
+        else:
+            gs = max(1, group_size)
+            for i in range(0, fanout, gs):
+                t0           = time.time_ns()
+                sent_ok     += sender.send_all(pld, targets[i: i + gs])
+                dispatch_ns += time.time_ns() - t0
+                if wave_delay > 0:
+                    time.sleep(wave_delay)
+
+    # NEW (Exp. 1): register dispatch time for ACK completion tracking
+    if tracker and ev.get("event_id"):
+        tracker.register_dispatched(ev["event_id"], t_dispatch_start)
+
     return sent_ok, dispatch_ns
 
 
@@ -724,7 +887,11 @@ def main() -> None:
 
     gc.disable()
 
-    g = load_topo_graph() if args.mode == "1:1" else None
+    # 1:1 mode loads topology from local file at startup (NDT Mininet already up).
+    # federated mode receives topology from the ONM via a TOPOLOGY event.
+    g: Optional[Dict[str, List[str]]] = (
+        load_topo_graph() if args.mode == "1:1" else None
+    )
 
     rx = (
         UdpRelayReceiver(args.relay_ip, args.relay_port)
@@ -732,7 +899,9 @@ def main() -> None:
         else TcpRelayReceiver(args.relay_ip, args.relay_port)
     )
 
-    fast_sender = None
+    fast_sender  = None
+    ack_tracker  = None   # NEW (Exp. 1) — created when TOPOLOGY arrives
+    fc           = None   # reference kept to wire tracker after creation
 
     if args.mode == "federated":
         if args.fanout <= 0:
@@ -762,11 +931,14 @@ def main() -> None:
 
         tb = TokenBucket(args.max_rate) if args.max_rate > 0 else None
         # Instantiate the event controller
-        FeedbackController(
+        # ack_tracker starts as None — wired in when TOPOLOGY arrives (Exp. 1).
+        # For Exp. 2 passive sinks no TOPOLOGY is sent so it stays None.
+        fc = FeedbackController(
             listen_port=args.feedback_port,
             onm_sender=onm_sender,
             aq=aq,
             token_bucket=tb,
+            ack_tracker=ack_tracker,
         )
         print(
             f"[NDT] Federated | fanout={args.fanout} "
@@ -791,6 +963,30 @@ def main() -> None:
 
         event_id = str(ev.get("event_id", ""))
         ev_type  = ev.get("type", "NA")
+
+        # NEW (Exp. 1): TOPOLOGY handshake.
+        # The ONM sends {"type":"TOPOLOGY","payload":{nodes,links}} as its
+        # very first message after connecting. The DTM builds the adjacency
+        # graph and wires up the AckTracker. Not forwarded to NDTs.
+        # In 1:1 mode or Exp. 2 this event is never sent so the branch
+        # is never taken.
+        if ev_type == "TOPOLOGY":
+            if args.mode == "federated":
+                g = build_graph_from_payload(ev.get("payload", {}))
+                # Create AckTracker now that we know this is Exp. 1
+                if ack_tracker is None and fc is not None:
+                    ack_tracker = AckTracker(fanout=args.fanout)
+                    fc._tracker = ack_tracker
+                print(
+                    f"[DTM] Topology received from ONM ({len(g)} nodes) — ready",
+                    flush=True,
+                )
+                log_event("DTM_TOPOLOGY_RX", {
+                    "nodes":      len(g),
+                    "size_bytes": len(data),
+                    "t_rx_ns":    t_rx_ns,
+                })
+            continue   # not forwarded to NDTs
 
         log_event("NDT_EVENT_RX", {
             "event_id":   event_id,
@@ -847,6 +1043,14 @@ def main() -> None:
                 })
         else:
             assert fast_sender is not None
+
+            # NEW (Exp. 1): guard — drop LOGICAL_LINK_SET if topology not yet received
+            if ev_type == "LOGICAL_LINK_SET" and g is None:
+                log_event("DTM_NO_TOPOLOGY", {"event_id": event_id})
+                print("[DTM] WARNING: LOGICAL_LINK_SET before TOPOLOGY — dropped",
+                      flush=True)
+                continue
+
             t0 = time.time_ns()
             sent_ok, dispatch_ns = fast_dispatch(
                 sender=fast_sender,
@@ -855,6 +1059,8 @@ def main() -> None:
                 wave_delay=args.wave_delay,
                 ev=ev,
                 payload=data,
+                g=g,                 # NEW (Exp. 1): None for Exp. 2
+                tracker=ack_tracker, # NEW (Exp. 1): None for Exp. 2
             )
             t1 = time.time_ns()
             log_event("NDT_EVENT_DISPATCHED", {

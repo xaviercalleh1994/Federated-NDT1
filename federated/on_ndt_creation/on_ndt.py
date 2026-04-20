@@ -1,9 +1,23 @@
 """
 Authors: Xavier Calle-Heredia & Xavier Hesselbach
 Date: 2026-04-08
+
+Changes vs original (NDT role only — ON role is completely unchanged)
+----------------------------------------------------------------------
+- Added --relay-port, --proto, --dtm-ip, --ack-port, --bare-metal,
+  --controller-port arguments.
+- Added TcpServerReceiver: NDT binds and waits for DTM to connect (TCP).
+- Added UdpReceiver: NDT binds a UDP port (UDP mode).
+- Added event_loop(): receives physical LINK_SET / ROUTE_REASSERT / EXEC_CMD
+  from the DTM, calls handle_event(), sends UDP ACK back to DTM.
+- --bare-metal: skips WAN/K8S interface config (enp0s8/enp0s9 do not exist
+  on the second bare-metal machine).
+- --controller-port: each container gets a unique OVS controller port to
+  avoid conflicts when running N instances on the same host.
 """
 import os
 import json
+import time
 import socket
 import threading
 import argparse
@@ -16,7 +30,7 @@ from mininet.cli import CLI
 from mininet.log import setLogLevel, info
 from mininet.link import TCLink, Intf
 
-PID_FILE = "/run/mininet.pid"
+PID_FILE  = "/run/mininet.pid"
 TOPO_FILE = "/run/topology.json"
 
 CONTROL_HOST = "127.0.0.1"
@@ -201,12 +215,162 @@ def control_server(net: Mininet):
                     conn.sendall((json.dumps(resp) + "\n").encode())
 
 
-def redComplejaFinal(role: str):
+# ── NEW (Exp. 1 — NDT role only) ─────────────────────────────────────────────
+
+def recv_framed(sock: socket.socket) -> bytes:
+    """Read a [4-byte length][payload] TCP frame."""
+    hdr = b""
+    while len(hdr) < 4:
+        chunk = sock.recv(4 - len(hdr))
+        if not chunk:
+            return b""
+        hdr += chunk
+    size = int.from_bytes(hdr, "big")
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            return b""
+        data += chunk
+    return data
+
+
+class TcpServerReceiver:
+    """
+    TCP server: the NDT binds a port and waits for the DTM to connect.
+    Each accepted connection is handled in its own daemon thread.
+    Received frames are put into self.queue for event_loop() to consume.
+    """
+    def __init__(self, port: int) -> None:
+        import queue
+        self.queue: queue.Queue = queue.Queue()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+        srv.listen(5)
+        info(f"*** [NDT] TCP server listening on port {port}\n")
+        threading.Thread(target=self._accept_loop,
+                         args=(srv,), daemon=True).start()
+
+    def _accept_loop(self, srv):
+        while True:
+            conn, addr = srv.accept()
+            info(f"*** [NDT] DTM connected from {addr}\n")
+            threading.Thread(target=self._recv_loop,
+                             args=(conn,), daemon=True).start()
+
+    def _recv_loop(self, conn):
+        while True:
+            data = recv_framed(conn)
+            if not data:
+                break
+            self.queue.put(data)
+
+
+class UdpReceiver:
+    """
+    UDP receiver: the NDT binds a port and receives datagrams from the DTM.
+    Received payloads are put into self.queue for event_loop() to consume.
+    """
+    def __init__(self, port: int) -> None:
+        import queue
+        self.queue: queue.Queue = queue.Queue()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        sock.bind(("0.0.0.0", port))
+        info(f"*** [NDT] UDP receiver listening on port {port}\n")
+        threading.Thread(target=self._recv_loop,
+                         args=(sock,), daemon=True).start()
+
+    def _recv_loop(self, sock):
+        while True:
+            data, _ = sock.recvfrom(65535)
+            if data:
+                self.queue.put(data)
+
+
+def event_loop(net: Mininet, relay_port: int, proto: str,
+               dtm_ip: str, ack_port: int) -> None:
+    """
+    Main loop for the NDT role (Exp. 1).
+
+    Receives physical LINK_SET / ROUTE_REASSERT / EXEC_CMD events from the
+    DTM, calls handle_event(), and sends a UDP ACK back to the DTM
+    FeedbackController so it can track completion.
+
+    Uses TcpServerReceiver or UdpReceiver depending on --proto.
+    """
+    import queue as qmod
+    import orjson
+
+    # Create the receiver — DTM connects to us (TCP) or sends datagrams (UDP)
+    if proto == "tcp":
+        rx = TcpServerReceiver(relay_port)
+    else:
+        rx = UdpReceiver(relay_port)
+
+    # UDP socket to send ACKs back to the DTM FeedbackController
+    ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    info(f"*** [NDT] ACK -> {dtm_ip}:{ack_port}\n")
+    info(f"*** [NDT] Event loop ready — {proto.upper()} port={relay_port}\n")
+
+    while True:
+        try:
+            data = rx.queue.get(timeout=1.0)
+        except qmod.Empty:
+            continue
+
+        t_rx_ns = time.time_ns()
+        try:
+            ev = orjson.loads(data)
+        except Exception:
+            continue
+
+        event_id = str(ev.get("event_id", ""))
+
+        # Apply the physical event in this Mininet instance
+        result = handle_event(net, ev)
+
+        t_apply_ns = time.time_ns()
+        apply_ms   = (t_apply_ns - t_rx_ns) / 1e6
+
+        info(f"*** [NDT] {ev.get('type')} ok={result.get('ok')} "
+             f"apply={apply_ms:.1f}ms\n")
+
+        # Send UDP ACK to DTM FeedbackController
+        if dtm_ip:
+            ack = orjson.dumps({
+                "type":       "NDT_APPLY_ACK",
+                "event_id":   event_id,
+                "port":       relay_port,
+                "ok":         result.get("ok", False),
+                "t_apply_ns": t_apply_ns,
+                "apply_ms":   apply_ms,
+            })
+            try:
+                ack_sock.sendto(ack, (dtm_ip, ack_port))
+            except Exception as exc:
+                info(f"*** [NDT] ACK send error: {exc}\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def redComplejaFinal(role: str, relay_port: int = 7001, proto: str = "tcp",
+                     dtm_ip: str = "", ack_port: int = 9000,
+                     bare_metal: bool = False,
+                     controller_port: int = 6653):
     """
     APlicable tanto para ON y NDT, debe recibir el rol.
     Configura rutas en routers y host, asegura nat para acceso a redes externas
 
     Nuevo: control_server en thread y export_topology al inicio.
+
+    NEW (Exp. 1):
+      - bare_metal: skip WAN/K8S interface config (enp0s8/enp0s9 absent on
+        the second bare-metal machine).
+      - controller_port: unique OVS controller port per container instance.
+      - relay_port, proto, dtm_ip, ack_port: passed to event_loop() for NDT.
     """
     if role == "ndt":
         print("--- MODE: DIGITAL TWIN (DT) ---")
@@ -225,14 +389,20 @@ def redComplejaFinal(role: str):
         VM_ROUTER_GW = "172.16.1.1"
         K8S_ENABLE = False
 
-    # Limpiar las interfaces que conectan ON-NDT y la interfaz para K8S en DT
-    os.system(f"ip addr flush dev {WAN_INTF}")
-    if K8S_ENABLE:
-        os.system(f"ip addr flush dev {K8S_INTF}")
+    # NEW (Exp. 1): on bare-metal the WAN/K8S interfaces do not exist —
+    # skip all physical interface config. The DTM connects to this machine
+    # directly via its LAN IP; no relay interface is needed.
+    if not bare_metal:
+        # Limpiar las interfaces que conectan ON-NDT y la interfaz para K8S en DT
+        os.system(f"ip addr flush dev {WAN_INTF}")
+        if K8S_ENABLE:
+            os.system(f"ip addr flush dev {K8S_INTF}")
 
     # Crea el controlador para la red para que se controle mediante software
+    # NEW (Exp. 1): controller_port allows each Docker container to use a
+    # different OVS port so N instances do not collide on port 6653.
     net = Mininet(controller=OVSController, link=TCLink) # TCLink permite usar TC para los eventos
-    net.addController("c0", controller=OVSController)
+    net.addController("c0", controller=OVSController, port=controller_port)
 
     # Crear el switch principal
     info("*** Creating Backbone\n")
@@ -275,23 +445,25 @@ def redComplejaFinal(role: str):
     info("*** Starting network\n")
     net.start()
 
-    # Conectar r_nat a las intefaces "físicas" de la VM
-    info(f"*** Connecting {WAN_INTF} to r_nat\n")
-    Intf(WAN_INTF, node=r_nat)
-    r_nat.cmd(f"ip addr add {WAN_IP} dev {WAN_INTF}")
-    r_nat.cmd(f"ip link set {WAN_INTF} up")
+    # NEW (Exp. 1): only bind physical interfaces when they exist on this host
+    if not bare_metal:
+        # Conectar r_nat a las intefaces "físicas" de la VM
+        info(f"*** Connecting {WAN_INTF} to r_nat\n")
+        Intf(WAN_INTF, node=r_nat)
+        r_nat.cmd(f"ip addr add {WAN_IP} dev {WAN_INTF}")
+        r_nat.cmd(f"ip link set {WAN_INTF} up")
 
-    if K8S_ENABLE:
-        info(f"*** Conectando {K8S_INTF} a r_nat\n")
-        Intf(K8S_INTF, node=r_nat)
-        r_nat.cmd(f"ip addr add {K8S_IP} dev {K8S_INTF}")
-        r_nat.cmd(f"ip link set {K8S_INTF} up")
+        if K8S_ENABLE:
+            info(f"*** Conectando {K8S_INTF} a r_nat\n")
+            Intf(K8S_INTF, node=r_nat)
+            r_nat.cmd(f"ip addr add {K8S_IP} dev {K8S_INTF}")
+            r_nat.cmd(f"ip link set {K8S_INTF} up")
 
-    # Agregar las rutas en r_nat
-    r_nat.cmd("ip route add 192.168.10.0/24 via 10.0.0.1")
-    r_nat.cmd("ip route add 192.168.20.0/24 via 10.0.0.2")
-    info(f"*** Adding route to {OTHER_NET} via {VM_ROUTER_GW}\n")
-    r_nat.cmd(f"ip route add {OTHER_NET} via {VM_ROUTER_GW}")
+        # Agregar las rutas en r_nat
+        r_nat.cmd("ip route add 192.168.10.0/24 via 10.0.0.1")
+        r_nat.cmd("ip route add 192.168.20.0/24 via 10.0.0.2")
+        info(f"*** Adding route to {OTHER_NET} via {VM_ROUTER_GW}\n")
+        r_nat.cmd(f"ip route add {OTHER_NET} via {VM_ROUTER_GW}")
 
     # Nateo para salida externa
     r_nat.cmd("iptables -t nat -A POSTROUTING -s 192.168.0.0/16 -j MASQUERADE")
@@ -313,23 +485,46 @@ def redComplejaFinal(role: str):
     export_topology(net)
 
     # Control server local mediante hilos
-    t = threading.Thread(target=control_server, args=(net,), daemon=True)
-    t.start()
+    threading.Thread(target=control_server, args=(net,), daemon=True).start()
 
-    # para debuggear:
-    info("*** CLI started\n")
-    CLI(net)
-    net.stop()
+    if role == "ndt":
+        # NEW (Exp. 1): enter event loop — receives events from DTM and applies them
+        event_loop(net, relay_port, proto, dtm_ip, ack_port)
+    else:
+        # para debuggear:
+        info("*** CLI started\n")
+        CLI(net)
+        net.stop()
 
 
 if __name__ == "__main__":
     setLogLevel("info")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--role", choices=["on", "ndt"], required=True)
+    ap.add_argument("--role",            choices=["on", "ndt"], required=True)
+    ap.add_argument("--relay-port",      type=int, default=7001,
+                    help="Port this NDT listens on (TCP server or UDP)")
+    ap.add_argument("--proto",           choices=["tcp", "udp"], default="tcp",
+                    help="Transport protocol for DTM→NDT events")
+    ap.add_argument("--dtm-ip",          default="",
+                    help="DTM IP for UDP ACK replies (empty = disabled)")
+    ap.add_argument("--ack-port",        type=int, default=9000,
+                    help="DTM FeedbackController UDP port for ACKs")
+    ap.add_argument("--bare-metal",      action="store_true",
+                    help="Skip WAN/K8S interface config (bare-metal, not VM)")
+    ap.add_argument("--controller-port", type=int, default=6653,
+                    help="OVS controller port (unique per container instance)")
     args = ap.parse_args()
 
     os.makedirs("/run", exist_ok=True)
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
-    redComplejaFinal(args.role)
+    redComplejaFinal(
+        role            = args.role,
+        relay_port      = args.relay_port,
+        proto           = args.proto,
+        dtm_ip          = args.dtm_ip,
+        ack_port        = args.ack_port,
+        bare_metal      = args.bare_metal,
+        controller_port = args.controller_port,
+    )
