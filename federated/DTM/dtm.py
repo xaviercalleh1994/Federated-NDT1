@@ -802,8 +802,9 @@ def fast_dispatch(
     sent_ok     = 0
     dispatch_ns = 0
 
-    # NEW (Exp. 1): resolve logical → physical when topology is known
-    payloads = resolve_to_physical(g, ev) if g is not None else [_dumps(ev)]
+    # Each NDT resolves LOGICAL_LINK_SET locally (same as DTM 1:1 mode).
+    # The DTM sends the raw payload unchanged — no resolution needed here.
+    payloads = [_dumps(ev)]
     if not payloads:
         return 0, 0
 

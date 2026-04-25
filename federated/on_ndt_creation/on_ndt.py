@@ -294,9 +294,10 @@ def event_loop(net: Mininet, relay_port: int, proto: str,
     """
     Main loop for the NDT role (Exp. 1).
 
-    Receives physical LINK_SET / ROUTE_REASSERT / EXEC_CMD events from the
-    DTM, calls handle_event(), and sends a UDP ACK back to the DTM
-    FeedbackController so it can track completion.
+    Receives LOGICAL_LINK_SET / EXEC_CMD events from the DTM.
+    LOGICAL_LINK_SET is resolved locally (same as DTM 1:1 mode) —
+    the NDT reads its own topology and applies each physical segment.
+    Sends a UDP ACK back to the DTM FeedbackController on completion.
 
     Uses TcpServerReceiver or UdpReceiver depending on --proto.
     """
@@ -328,9 +329,67 @@ def event_loop(net: Mininet, relay_port: int, proto: str,
             continue
 
         event_id = str(ev.get("event_id", ""))
+        ev_type  = ev.get("type", "")
 
-        # Apply the physical event in this Mininet instance
-        result = handle_event(net, ev)
+        # For LOGICAL_LINK_SET: resolve path and apply via control server,
+        # identical to how the DTM works in 1:1 mode.
+        # For all other events (LINK_SET, ROUTE_REASSERT, EXEC_CMD): apply directly.
+        if ev_type == "LOGICAL_LINK_SET":
+            from collections import defaultdict
+            p = ev.get("payload", {})
+            try:
+                with open(TOPO_FILE) as _f:
+                    _topo = json.load(_f)
+                _g = defaultdict(list)
+                for _a, _b in _topo["links"]:
+                    _g[_a].append(_b)
+                    _g[_b].append(_a)
+                from mininet.node import Node as _Node
+                _e_up    = bool(p.get("up", True))
+                _e_delay = float(p.get("delay_ms", 0.0))
+                _e_loss  = float(p.get("loss_pct", 0.0))
+                _e_bw    = float(p.get("bw_mbps", 1000.0))
+                _phys = []
+                _src, _dst = p.get("a"), p.get("b")
+                # BFS to find path with only switches in the middle
+                from collections import deque as _deque
+                _q = _deque([_src])
+                _prev = {_src: None}
+                while _q:
+                    _cur = _q.popleft()
+                    if _cur == _dst:
+                        break
+                    for _nxt in _g[_cur]:
+                        if _nxt not in _prev:
+                            _prev[_nxt] = _cur
+                            _q.append(_nxt)
+                if _dst in _prev:
+                    _path = []
+                    _cur = _dst
+                    while _cur is not None:
+                        _path.append(_cur)
+                        _cur = _prev[_cur]
+                    _path.reverse()
+                    if all(_x.startswith("s") for _x in _path[1:-1]):
+                        _phys = [(_path[_i], _path[_i+1]) for _i in range(len(_path)-1)]
+                _ok = True
+                for _x, _y in _phys:
+                    _r = handle_event(net, {"type": "LINK_SET", "payload": {
+                        "a": _x, "b": _y,
+                        "up": _e_up, "delay_ms": _e_delay,
+                        "loss_pct": _e_loss, "bw_mbps": _e_bw,
+                    }})
+                    if not _r.get("ok"):
+                        _ok = False
+                handle_event(net, {"type": "ROUTE_REASSERT", "payload": {
+                    "routers": ["r1", "r2"], "gateway": "10.0.0.254"
+                }})
+                result = {"ok": _ok, "segments": len(_phys)}
+            except Exception as _exc:
+                result = {"ok": False, "err": str(_exc)}
+        else:
+            # Apply the physical event directly in this Mininet instance
+            result = handle_event(net, ev)
 
         t_apply_ns = time.time_ns()
         apply_ms   = (t_apply_ns - t_rx_ns) / 1e6

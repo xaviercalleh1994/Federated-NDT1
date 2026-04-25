@@ -7,6 +7,7 @@
     <list default="true" id="0b183594-d838-4778-b6bd-46d1679400a4" name="Changes" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/federated/DTM/dtm.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/DTM/dtm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/federated/on_ndt_creation/on_ndt.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/on_ndt_creation/on_ndt.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
