@@ -4,14 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="0b183594-d838-4778-b6bd-46d1679400a4" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/federated/ndt_deployment/mininet_ndts/Dockerfile" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/ndt_deployment/mininet_ndts/entrypoint.sh" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/ndt_deployment/mininet_ndts/launch_ndts.sh" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/federated/ndt_deployment/mininet_ndts/stop_ndts.sh" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/federated/ndt_event_gen/ndt_gen.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/ndt_deployment/simulated_ndts/ndt_gen.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/federated/on_ndt_creation/on_ndt.py" beforeDir="false" afterPath="$PROJECT_DIR$/federated/on_ndt_creation/on_ndt.py" afterDir="false" />
-    </list>
+    <list default="true" id="0b183594-d838-4778-b6bd-46d1679400a4" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
