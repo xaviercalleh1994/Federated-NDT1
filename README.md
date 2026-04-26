@@ -2,10 +2,19 @@
 This framework is implemented to function as a Proof-of-Concept (PoC) for a novel conceptualization of Network Digital Ttwins (NDTs), which is the federation of multiple NDT instances, as proposed by both authors: Xavier Calle-Heredia and Xavier Hesselbach.
 
 ## Overview
-The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. By means of a centrallized manager entity, defined as the Digital Twin Manager, it is possible to coordinate the N NDT replicas deployed. 
+The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. By means of a centralized manager entity, defined as the Digital Twin Manager, it is possible to coordinate the N NDT replicas deployed. 
 
 To deploy the ON as well as the NDT replicas, a python script is used. This script creates a simple Mininet network containing 2 LANs as it can be appreciated next:
 ![net_arch](Images/mininet_net.png)
+
+In addition to the main DTM, the PoC relies in a complementary entuty named as Original Network Manager (ONM). The ONM allows to introduce network modifications to the ON; after apply those modifications, the ONM forwards the same modification command to the DTM in order to achieve synchronization between the ON and the N NDTs. Next, an overview of the PoC can be seen:
+![1:N_mode](Images/PoC_fed.png) 
+
+
+## Running the Federated Framework
+
+### First steps:
+First, it is required to deploy the complete framework. 
 
 
 # NDT-PoC
