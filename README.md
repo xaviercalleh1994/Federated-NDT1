@@ -14,7 +14,23 @@ In addition to the main DTM, the PoC relies in a complementary entuty named as O
 ## Running the Federated Framework
 
 ### First steps:
-First, it is required to deploy the complete framework. 
+First, it is required to deploy the complete framework. Let's start with the configuration of Virtual Machines. Three independent VMs are required with next networking configuration:
+
+    1. VM ON
+        Bridge: enp0s3
+        Internal Network (ON) enp0s8: 172.16.1.2/30
+
+    2. VM NDT
+        Bridge: enp0s3
+        Internal Network(DT) enp0s8: 172.16.2.2/30
+        Internal Network(s8s) enp0s8: 192.168.99.X -> OPTIONAL: For future XR services integration based on Kubernetes
+
+    3 Relay: VM router
+        Bridge: enp0s3
+        Internal Network (ON) enp0s8: 172.16.1.1/30
+        Internal Network (DT) enp0s9: 172.16.2.1/30  
+
+For configuring the VMs, follow this tutorial: [config_guide](federated/VBox_VMs_config/configuration.md)
 
 
 # NDT-PoC
