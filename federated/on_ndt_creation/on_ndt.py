@@ -2,7 +2,6 @@
 Authors: Xavier Calle-Heredia & Xavier Hesselbach
 Date: 2026-04-08
 
-Changes vs original (NDT role only — ON role is completely unchanged)
 ----------------------------------------------------------------------
 - Added --relay-port, --proto, --dtm-ip, --ack-port, --bare-metal,
   --controller-port arguments.
