@@ -11,9 +11,11 @@ In addition to the main DTM, the PoC relies in a complementary entuty named as O
 ![1:N_mode](Images/PoC_fed.png) 
 
 In this current version, the framework runs in two different computers. Our current conditions are:
-- First computer (Windows laptop) hosts three Virtual Machines (VMs) to support the ONM, DTM and a router node to emulate a communication channel between both managers. All VMs use Linux Mint 22.3.
-- On the other hand, second computer supports the deployment of the N NDTs based on Docker containers. This PC uses Linux Mint 22.3.
+- ***PC1*** (Windows laptop) hosts three Virtual Machines (VMs) to support the ONM, DTM and a router node to emulate a communication channel between both managers. All VMs use Linux Mint 22.3.
+- On the other hand, ***PC2*** supports the deployment of the N NDTs based on Docker containers. This PC uses Linux Mint 22.3.
 It is important to guarantee that both PCs are conencted to same network to facilitate the communication between VMs and containers. 
+
+***Note:*** In this current version, the ON as well as the N NDTs are required to be run sepparately, i.e. In ***PC1*** on the corresponding ON VM, as well as in ***PC2***.
 
 
 ## Running the Federated Framework
@@ -62,7 +64,7 @@ It is recommended to create a dedicated directory:
 mkdir /home/ubuntu/federated
 ```
 
-In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deployment/mininet_ndts)
+In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deployment/mininet_ndts). This directory contains the Dockerfile to create the image with mininet and all required components that is invoked to create each NDT container. In addition, d
 
 
 # NDT-PoC
