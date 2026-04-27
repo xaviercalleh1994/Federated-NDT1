@@ -88,6 +88,10 @@ In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deploy
 docker build -t ndt-mininet .
 ```
 
+## Running the Testbed
+After completing the set-up process, the testbed is ready to run. We have thought in two experiments. 
+- Experiment 1: 
+- Experiment 2
 
 # NDT-PoC
 
