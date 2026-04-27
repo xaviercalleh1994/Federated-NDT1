@@ -62,7 +62,7 @@ It is recommended to create a dedicated directory:
 mkdir /home/ubuntu/federated
 ```
 
-In this directory, you can copy these files: [text](federated/ndt_deployment/mininet_ndts)
+In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deployment/mininet_ndts)
 
 
 # NDT-PoC
