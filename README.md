@@ -45,11 +45,11 @@ mkdir /home/ubuntu/federated
 ```
 
 Then, copy the scripts to each VM:
-    - VM ON:
+    1. VM ON:
         - [ONM-files](federated/ONM)
         - [on-ndt-deplyment](federated/on_ndt_creation/on_ndt.py)
 
-    - VM DTM:
+    2. VM DTM:
         - 
 
 
