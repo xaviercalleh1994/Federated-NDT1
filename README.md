@@ -163,6 +163,9 @@ In order to automate the experiment, we have prepared a script to automatically 
     --relay-kind router
 ```
 
+You can check that the synchronization is actually working (Running the ON in manual mode, i.e. without send_events.sh).
+
+
 
 # NDT-PoC
 
