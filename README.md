@@ -45,13 +45,17 @@ mkdir /home/ubuntu/federated
 ```
 
 Then, copy the scripts to each VM:
-    1. VM ON:
-        - [ONM-files](federated/ONM)
-        - [on-ndt-deplyment](federated/on_ndt_creation/on_ndt.py)
 
-    2. VM DTM:
-        - 
+1. VM ON:
+   - [ONM files](federated/ONM/)
+   - [ON-NDT deployment](federated/on_ndt_creation/on_ndt.py)
 
+2. VM DTM:
+   - [DTM](federated/DTM/dtm.py)
+   - [ON-NDT deployment](federated/on_ndt_creation/on_ndt.py)
+
+3. VM Router:
+    - [router](federated/relay/relay.py)
 
 ### PC2:
 Following the installation in PC2. Docker must be installed. In case Docker is missing you can install it as follows:
