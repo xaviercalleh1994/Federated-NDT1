@@ -26,7 +26,9 @@ Let's start with the configuration of Virtual Machines in PC1. Three independent
     1. VM ON
         - Bridge: enp0s3
         - Internal Network (ON) enp0s8: 172.16.1.2/30
-
+        ```bash
+        asdasdasd
+        ```
 
     2. VM NDT
         Bridge: enp0s3
