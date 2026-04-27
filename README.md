@@ -90,8 +90,79 @@ docker build -t ndt-mininet .
 
 ## Running the Testbed
 After completing the set-up process, the testbed is ready to run. We have thought in two experiments. 
-- Experiment 1: 
-- Experiment 2
+- Experiment 1 (Ready to test): Intended to test the synchronization from the ON to the N NDTs. Therefore, the ONM will receive a modification command, the ONM will apply this in the ON mininet and after that i will forward the modification to the DTM which will forward the command and apply it to the NDTs.
+- Experiment 2 (Under development): Intended to demonstrate the DTM coordination whn receiving updates from the NDTs and requires to arrange them to forward them properly to the ONM.
+
+Therefore, ww will focus just in Experiment 1. The order to run the experiment is:
+### 1. Run the N NDTs (PC2):
+```bash
+./launch_ndts.sh <number of NDTs> <DTMs IP Address> <listening port> udp <ACK port> 
+# For instantce:
+./launch_ndts.sh 8 10.4.47.53 8001 udp 9000
+# Wait until all NDTs are ready.
+# You can check with:
+docker ps
+```
+
+### 2. Run the router VM
+```bash
+python3 relay.py --proto udp --port 7001
+```
+
+### 3. Run the ON (PC1-VM ON)
+```bash
+sudo python3 on_ndt.py --role on
+```
+
+### 4. Run the DTM (PC1-VM DTM)
+```bash
+python3 dtm.py \
+    --proto udp \
+    --relay-ip 172.16.2.1 \
+    --relay-port 7001 \
+    --mode federated \
+    --fanout <Number of NDTs> \
+    --dst-ip <PC2 ip address> \
+    --base-port <NDTs listenning port> \
+    --feedback-port <ACKs receiving port> \
+    --experiment-duration <Duration time in seconds> \
+    --log-file /home/ubuntu/exp1/run1/1to1/dtm.log
+
+# For instance:
+python3 dtm.py \
+    --proto udp \
+    --relay-ip 172.16.2.1 \
+    --relay-port 7001 \
+    --mode federated \
+    --fanout 1 \
+    --dst-ip 10.4.47.50 \
+    --base-port 8001 \
+    --feedback-port 9000 \
+    --experiment-duration 150 \
+    --log-file /home/ubuntu/exp1/run1/1to1/dtm.log
+```
+
+### 5. Run the ONM (PC1-VM ON)
+The ONM can be run as follows:
+```bash
+python3 onm.py \
+    --proto udp \
+    --relay-ip 172.16.1.1 \
+    --relay-port 7001 \
+    --relay-kind router
+```
+
+Then, you can manually introduce a command from [ON-commands](federated/ONM/onm_commands.txt) (Just copy and paste). 
+
+In order to automate the experiment, we have prepared a script to automatically send the commands each 2 seconds (a safe time to allow each NDT to apply the modification). Therefore, we recommend to run the ONM like this:
+```bash
+./send_events.sh | python3 onm.py \
+    --proto udp \
+    --relay-ip 172.16.1.1 \
+    --relay-port 7001 \
+    --relay-kind router
+```
+
 
 # NDT-PoC
 
