@@ -183,7 +183,7 @@ mnexec -a $(pgrep -f "mininet:r1") ping r2
 ```
 
 
-## Further Implementation of Experiment 2 (Under development and testing):
+## Further Implementation of Experiment 2 (Under development and testing) and Experiment 3 (XR integration):
 
 ## Start the Experiments
 ### ONM
@@ -202,14 +202,11 @@ python3 on_events_gen.py --file onm_commands.txt --rate <rate: events per second
 ### DTM:
 - 1:1 Mode:
 
-![1:1_Mode](Images/Poc_11.png)
 ```bash
 python3 dtm.py --proto tcp --relay-ip 172.16.2.1 --relay-port 7001 --mode 1:1 --log-file /home/ubuntu/dtm_events.log -experiment-duration 75
 ```
 
 - 1:N Mode:
-
-![1:N_mode](Images/PoC_fed.png)
 
 To further gather the metrics, it is recommended next folder structure for saving experiments, where 1toN it is the suggested name of the folder which stores the DTM log and N is the number of NDTs deployed:
 
