@@ -10,11 +10,16 @@ To deploy the ON as well as the NDT replicas, a python script is used. This scri
 In addition to the main DTM, the PoC relies in a complementary entuty named as Original Network Manager (ONM). The ONM allows to introduce network modifications to the ON; after apply those modifications, the ONM forwards the same modification command to the DTM in order to achieve synchronization between the ON and the N NDTs. Next, an overview of the PoC can be seen:
 ![1:N_mode](Images/PoC_fed.png) 
 
+In this current version, the framework runs in two different computers. Our current conditions are:
+- First computer (Windows laptop) hosts three Virtual Machines (VMs) to support the ONM, DTM and a router node to emulate a communication channel between both managers. All VMs use Linux Mint 22.3.
+- On the other hand, second computer supports the deployment of the N NDTs based on Docker containers. This PC uses Linux Mint 22.3.
+It is important to guarantee that both PCs are conencted to same network to facilitate the communication between VMs and containers. 
+
 
 ## Running the Federated Framework
 
 ### First steps:
-First, it is required to deploy the complete framework. Let's start with the configuration of Virtual Machines. Three independent VMs are required with next networking configuration:
+Let's start with the configuration of Virtual Machines. Three independent VMs are required with next networking configuration:
 
     1. VM ON
         Bridge: enp0s3
@@ -31,6 +36,33 @@ First, it is required to deploy the complete framework. Let's start with the con
         Internal Network (DT) enp0s9: 172.16.2.1/30  
 
 For configuring the VMs, follow this tutorial: [config_guide](federated/VBox_VMs_config/configuration.md)
+
+Following the installation in the second PC. Docker must be installed. In case Docker is missing you can install it as follows:
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) \
+    signed-by=/etc/apt/keyrings/docker.asc] \
+    https://download.docker.com/linux/ubuntu noble stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+It is recommended to create a dedicated directory:
+```bash
+mkdir /home/ubuntu/federated
+```
+
+In this directory, you can copy these files: [text](federated/ndt_deployment/mininet_ndts)
 
 
 # NDT-PoC
