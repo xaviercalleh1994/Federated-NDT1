@@ -20,12 +20,13 @@ It is important to guarantee that both PCs are conencted to same network to faci
 
 ## Running the Federated Framework
 
-### First steps:
-Let's start with the configuration of Virtual Machines. Three independent VMs are required with next networking configuration:
+### First steps: Preparing the environment
+Let's start with the configuration of Virtual Machines in PC1. Three independent VMs are required with next networking configuration:
 
     1. VM ON
-        Bridge: enp0s3
-        Internal Network (ON) enp0s8: 172.16.1.2/30
+        - Bridge: enp0s3
+        - Internal Network (ON) enp0s8: 172.16.1.2/30
+
 
     2. VM NDT
         Bridge: enp0s3
@@ -39,7 +40,7 @@ Let's start with the configuration of Virtual Machines. Three independent VMs ar
 
 For configuring the VMs, follow this tutorial: [config_guide](federated/VBox_VMs_config/configuration.md)
 
-Following the installation in the second PC. Docker must be installed. In case Docker is missing you can install it as follows:
+Following the installation in PC2. Docker must be installed. In case Docker is missing you can install it as follows:
 ```bash
 sudo apt update
 sudo apt install -y ca-certificates curl
@@ -64,7 +65,10 @@ It is recommended to create a dedicated directory:
 mkdir /home/ubuntu/federated
 ```
 
-In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deployment/mininet_ndts). This directory contains the Dockerfile to create the image with mininet and all required components that is invoked to create each NDT container. In addition, d
+In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deployment/mininet_ndts). This directory contains the Dockerfile to create the image with mininet and all required components that is invoked to create each NDT container. In addition, it is required to copy the script to launch the mininet network: [on-ndt-deployment](federated/on_ndt_creation/on_ndt.py). Finally, the Docker image can be built:
+```bash
+docker build -t ndt-mininet .
+```
 
 
 # NDT-PoC
