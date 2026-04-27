@@ -163,7 +163,16 @@ In order to automate the experiment, we have prepared a script to automatically 
     --relay-kind router
 ```
 
-You can check that the synchronization is actually working (Running the ON in manual mode, i.e. without send_events.sh).
+You can check that the synchronization is actually working (Running the ON in manual mode, i.e. without send_events.sh). To do so, you can send an ON command and then access to any NDT container as follows:
+```bash
+# In VM ON in ONM console down the link between r1 and r2 nodes:
+set r1 r2 down 0 0 1000
+
+# in PC2:
+mnexec -a $(pgrep -f "mininet:r1") ping r2
+# you should notice that r2 is unreachable from r1. 
+# You can bring the link up again from the ONM and re-test.
+```
 
 
 
