@@ -150,6 +150,23 @@ python3 dtm.py \
     --log-file /home/ubuntu/exp1/run1/1to1/dtm.log
 ```
 
+We recommend to save dtm log files in an appropriate folde structure similar as the one shown next where 1toX will store the dtm log of the experiment with X NDTs deployed. This will facilitate gathering the federation metrics.
+
+- exp1/
+    - run1/
+        - 1to1/
+            - dtm.log
+        - 1to8/
+            - dtm.log
+        - 1to16/
+        - 1to64/
+    - run2/
+        - 1to1/
+        - 1to64/
+    - run3/
+    - run4/
+    - run5/
+
 ### 5. Run the ONM (PC1-VM ON)
 The ONM can be run as follows:
 ```bash
@@ -182,6 +199,13 @@ mnexec -a $(pgrep -f "mininet:r1") ping r2
 # You can bring the link up again from the ONM and re-test.
 ```
 
+### Gather metrics
+Metrics that can be retrieved are related with the synchronization latencies due to federation. To gather the metrics use the script [exp-1-analysis](federated/analysis/experiment_1.py):
+```bash
+python3 experiment_1.py \
+    --logs /home/ubuntu/exp1/ \
+    --out  /home/ubuntu/exp1/results/
+```
 
 # What is comming in the future?
 ## Further Implementation of Experiment 2 (***Under development and testing***) and Experiment 3 (XR integration):
