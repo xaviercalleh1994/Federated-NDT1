@@ -19,7 +19,7 @@ It is important to guarantee that both PCs are conencted to same network to faci
 
 Additionally, The PoC can run under two different execution modes: normal (1:1) and federated (1:N). 
 
-- 1:1 Mode (Under development and testing): In this operation mode, the ONM is used as the input interface to modify the ON mininet with actions such a: "set r1 r2 down 0 0 1000", "set r1 r2 up 50 1 10", "exec r1 "ip route add 10.20.30.40 via 10.0.0.254"", "exec r1 "ip route del 10.20.30.40 via 10.0.0.254"". The ONM applies these modifications in the ON and then transmits the command to the DTM vis the relay node. The DTM receives the ON modification and applies locally the modification (the NDT mininet need to run). ***The 1:1 mode will be further analyzed to test the integration of XR services in the NDT approached supported by Kubernetes***. In 1:1 mode, the architecture may look like this:
+- 1:1 Mode (***Under development and testing***): In this operation mode, the ONM is used as the input interface to modify the ON mininet with actions such a: "set r1 r2 down 0 0 1000", "set r1 r2 up 50 1 10", "exec r1 "ip route add 10.20.30.40 via 10.0.0.254"", "exec r1 "ip route del 10.20.30.40 via 10.0.0.254"". The ONM applies these modifications in the ON and then transmits the command to the DTM vis the relay node. The DTM receives the ON modification and applies locally the modification (the NDT mininet need to run). ***The 1:1 mode will be further analyzed to test the integration of XR services in the NDT approached supported by Kubernetes***. In 1:1 mode, the architecture may look like this:
 ![1:1_Mode](Images/Poc_11.png)
 
 
@@ -31,19 +31,19 @@ Additionally, The PoC can run under two different execution modes: normal (1:1) 
 ### PC1:
 Let's start with the configuration of Virtual Machines in PC1. Three independent VMs are required with next networking configuration:
 
-    1. VM ON
-        - Bridge: enp0s3
-        - Internal Network (ON) enp0s8: 172.16.1.2/30
+1. VM ON
+    - Bridge: enp0s3
+    - Internal Network (ON) enp0s8: 172.16.1.2/30
 
-    2. VM DTM
-        Bridge: enp0s3
-        Internal Network(DT) enp0s8: 172.16.2.2/30
-        Internal Network(s8s) enp0s8: 192.168.99.X -> OPTIONAL: For future XR services integration based on Kubernetes
+2. VM DTM
+    Bridge: enp0s3
+    Internal Network(DT) enp0s8: 172.16.2.2/30
+    Internal Network(s8s) enp0s8: 192.168.99.X -> ***OPTIONAL***: For future XR services integration based on Kubernetes
 
-    3 Relay: VM router
-        Bridge: enp0s3
-        Internal Network (ON) enp0s8: 172.16.1.1/30
-        Internal Network (DT) enp0s9: 172.16.2.1/30  
+3. Relay: VM router
+    Bridge: enp0s3
+    Internal Network (ON) enp0s8: 172.16.1.1/30
+    Internal Network (DT) enp0s9: 172.16.2.1/30  
 
 For configuring the VMs, follow this tutorial: [config_guide](federated/VBox_VMs_config/configuration.md)
 
@@ -99,7 +99,7 @@ docker build -t ndt-mininet .
 ## Running the Testbed
 After completing the set-up process, the testbed is ready to run. We have thought in two experiments. 
 - Experiment 1 (Ready to test): Intended to test the synchronization from the ON to the N NDTs. Therefore, the ONM will receive a modification command, the ONM will apply this in the ON mininet and after that i will forward the modification to the DTM which will forward the command and apply it to the NDTs.
-- Experiment 2 (Under development): Intended to demonstrate the DTM coordination whn receiving updates from the NDTs and requires to arrange them to forward them properly to the ONM.
+- Experiment 2 (***Under development***): Intended to demonstrate the DTM coordination whn receiving updates from the NDTs and requires to arrange them to forward them properly to the ONM.
 
 Therefore, ww will focus just in Experiment 1. The order to run the experiment is:
 ### 1. Run the N NDTs (PC2):
@@ -184,7 +184,7 @@ mnexec -a $(pgrep -f "mininet:r1") ping r2
 
 
 # What is comming in the future?
-## Further Implementation of Experiment 2 (Under development and testing) and Experiment 3 (XR integration):
+## Further Implementation of Experiment 2 (***Under development and testing***) and Experiment 3 (XR integration):
 
 ## Start the Experiments
 ### ONM
