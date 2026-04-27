@@ -17,6 +17,12 @@ It is important to guarantee that both PCs are conencted to same network to faci
 
 ***Note:*** In this current version, the ON as well as the N NDTs are required to be run sepparately, i.e. In ***PC1*** on the corresponding ON VM, as well as in ***PC2***.
 
+Additionally, The PoC can run under two different execution modes: normal (1:1) and federated (1:N). 
+
+- 1:1 Mode (Under development and testing): In this operation mode, the ONM is used as the input interface to modify the ON mininet with actions such a: "set r1 r2 down 0 0 1000", "set r1 r2 up 50 1 10", "exec r1 "ip route add 10.20.30.40 via 10.0.0.254"", "exec r1 "ip route del 10.20.30.40 via 10.0.0.254"". The ONM applies these modifications in the ON and then transmits the command to the DTM vis the relay node. The DTM receives the ON modification and applies locally the modification (the NDT mininet need to run). ***The 1:1 mode will be further analyzed to test the integration of XR services in the NDT approached supported by Kubernetes***
+
+- 1:N Mode: in this mode, the ONM operates as in the 1:1; however, the DTM, doesn't require the NDT mininet running. Therefore, the DTM just forwards the ON commands to N NDTs while it receives and coordinates the NDT's generated events to transmit them coordinated to the ONM.
+
 
 ## Preparing the environment
 
@@ -218,11 +224,7 @@ powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e
 ```
 
 
-The PoC can run under two different execution modes: normal (1:1) and federated (1:N). 
 
-- 1:1 Mode: In this operation mode, the ONM is used as the input interface to modify the ON mininet with actions such a: "set r1 r2 down 0 0 1000", "set r1 r2 up 50 1 10", "exec r1 "ip route add 10.20.30.40 via 10.0.0.254"", "exec r1 "ip route del 10.20.30.40 via 10.0.0.254"". The ONM applies these modifications in the ON and then transmits the command to the DTM vis the relay node. The DTM receives the ON modification and applies locally the modification (the NDT mininet need to run).
-
-- 1:N Mode: in this mode, the ONM operates as in the 1:1; however, the DTM, doesn't require the NDT mininet running. Therefore, the DTM just forwards the ON commands to N NDTs while it receives and coordinates the NDT's generated events to transmit them coordinated to the ONM.
 
 
 Initiate the ON
