@@ -18,19 +18,16 @@ It is important to guarantee that both PCs are conencted to same network to faci
 ***Note:*** In this current version, the ON as well as the N NDTs are required to be run sepparately, i.e. In ***PC1*** on the corresponding ON VM, as well as in ***PC2***.
 
 
-## Running the Federated Framework
+## Preparing the environment
 
-### First steps: Preparing the environment
+### PC1:
 Let's start with the configuration of Virtual Machines in PC1. Three independent VMs are required with next networking configuration:
 
     1. VM ON
         - Bridge: enp0s3
         - Internal Network (ON) enp0s8: 172.16.1.2/30
-        ```bash
-        asdasdasd
-        ```
 
-    2. VM NDT
+    2. VM DTM
         Bridge: enp0s3
         Internal Network(DT) enp0s8: 172.16.2.2/30
         Internal Network(s8s) enp0s8: 192.168.99.X -> OPTIONAL: For future XR services integration based on Kubernetes
@@ -42,6 +39,21 @@ Let's start with the configuration of Virtual Machines in PC1. Three independent
 
 For configuring the VMs, follow this tutorial: [config_guide](federated/VBox_VMs_config/configuration.md)
 
+It is recommended to create a dedicated directory in each VM:
+```bash
+mkdir /home/ubuntu/federated
+```
+
+Then, copy the scripts to each VM:
+    - VM ON:
+        - [ONM-files](federated/ONM)
+        - [on-ndt-deplyment](federated/on_ndt_creation/on_ndt.py)
+
+    - VM DTM:
+        - 
+
+
+### PC2:
 Following the installation in PC2. Docker must be installed. In case Docker is missing you can install it as follows:
 ```bash
 sudo apt update
