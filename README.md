@@ -122,7 +122,7 @@ python3 relay.py --proto udp --port 7001
 ```bash
 sudo python3 on_ndt.py --role on
 ```
-
+![ON-mininet](Images/on_mininet.png)
 
 ### 4. Run the DTM (PC1-VM DTM)
 ```bash
@@ -151,6 +151,7 @@ python3 dtm.py \
     --experiment-duration 150 \
     --log-file /home/ubuntu/exp1/run1/1to1/dtm.log
 ```
+![DTM_run](Images/dtm_run.png)
 
 We recommend to save dtm log files in an appropriate folde structure similar as the one shown next where 1toX will store the dtm log of the experiment with X NDTs deployed. This will facilitate gathering the federation metrics.
 
@@ -179,6 +180,8 @@ python3 onm.py \
     --relay-kind router
 ```
 
+![ONM_cli](Images/onm_cli.png)
+
 Then, you can manually introduce a command from [ON-commands](federated/ONM/onm_commands.txt) (Just copy and paste). 
 
 In order to automate the experiment, we have prepared a script to automatically send the commands each 2 seconds (a safe time to allow each NDT to apply the modification). Therefore, we recommend to run the ONM like this:
@@ -196,10 +199,12 @@ You can check that the synchronization is actually working (Running the ON in ma
 set r1 r2 down 0 0 1000
 
 # in PC2:
-mnexec -a $(pgrep -f "mininet:r1") ping r2
+mnexec -a $(pgrep -f "mininet:r1") ping 10.0.0.2
 # you should notice that r2 is unreachable from r1. 
 # You can bring the link up again from the ONM and re-test.
 ```
+![ping_test](Images/ping_test_ndt.png)
+
 
 ### Gather metrics
 Metrics that can be retrieved are related with the synchronization latencies due to federation. To gather the metrics use the script [exp-1-analysis](federated/analysis/experiment_1.py):
