@@ -101,7 +101,7 @@ After completing the set-up process, the testbed is ready to run. We have though
 - Experiment 1 (Ready to test): Intended to test the synchronization from the ON to the N NDTs. Therefore, the ONM will receive a modification command, the ONM will apply this in the ON mininet and after that i will forward the modification to the DTM which will forward the command and apply it to the NDTs.
 - Experiment 2 (***Under development***): Intended to demonstrate the DTM coordination whn receiving updates from the NDTs and requires to arrange them to forward them properly to the ONM.
 
-Therefore, ww will focus just in Experiment 1. The order to run the experiment is:
+Therefore, we will focus just in Experiment 1. The order to run the experiment is:
 ### 1. Run the N NDTs (PC2):
 ```bash
 ./launch_ndts.sh <number of NDTs> <DTMs IP Address> <listening port> udp <ACK port> 
@@ -111,6 +111,7 @@ Therefore, ww will focus just in Experiment 1. The order to run the experiment i
 # You can check with:
 docker ps
 ```
+![ndts_ready](Images/ndts_ready.png)
 
 ### 2. Run the router VM
 ```bash
