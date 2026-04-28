@@ -123,6 +123,7 @@ python3 relay.py --proto udp --port 7001
 sudo python3 on_ndt.py --role on
 ```
 
+
 ### 4. Run the DTM (PC1-VM DTM)
 ```bash
 python3 dtm.py \
