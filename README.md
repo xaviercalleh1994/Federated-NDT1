@@ -217,6 +217,14 @@ python3 experiment_1.py \
 # What is comming in the future?
 ## Further Implementation of Experiment 2 (***Under development and testing***) and Experiment 3 (XR integration):
 
+## Set the host laptop in high efficiency mode:
+```bash
+# ON
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+# off
+powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e
+```
+
 ## Start the Experiments
 ### ONM
 To autoamte the ONM commands execution there are two supporting files: on_events_gen.py and onm_commands.txt.
