@@ -214,6 +214,10 @@ python3 experiment_1.py \
     --out  /home/ubuntu/exp1/results/
 ```
 
+## License
+This project is licensed under the GNU General Public License v3.0.
+See the [LICENSE](LICENSE) file for details.
+
 # What is comming in the future?
 ## Further Implementation of Experiment 2 (***Under development and testing***) and Experiment 3 (XR integration):
 
