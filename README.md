@@ -125,6 +125,18 @@ sudo python3 on_ndt.py --role on
 ![ON-mininet](Images/on_mininet.png)
 
 ### 4. Run the DTM (PC1-VM DTM)
+Before running, it is required to install some python dependencies to properly run the DTM and then, gather the latency metrics. 
+Before running the DTM for the first time you can create a virtual environment and install dependecies:
+```bash
+chmod +x install_dependencies.sh 
+./install_dependencies.sh 
+```
+
+Once the script has concluded the virtual environment is ready and you can start the DTM. If you want to use the DTM again, you just need to activate the virtual environment:
+```bash
+source venv/bin/activate
+```
+
 ```bash
 python3 dtm.py \
     --proto udp \
