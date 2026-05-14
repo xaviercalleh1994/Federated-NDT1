@@ -10,18 +10,21 @@ Currently, the framework is provided with two operational configurations:
 
     - The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
     - The DTM is the main entity of the system and is in charge of the synchronization of the NDTs. The DTM is decompossed in two agents: the DTM Core is a centralized agent that receives and distribute ON events. While the DTM distributed agents are in charge of implementing each ON event into the NDT.
-    ![Framework_architecture](Images/PoC_fed_arch.png)
+    ![Framework_architecture_fed](Images/PoC_fed_arch.png)
 - A conventional mode (1:1): this is the currently analyzed configuration in the literature and considers a sinlge NDT instance derived from an ON. This mode will be further analyzed for the inclusion of Extended Reality (XR) services.
-![alt text](Images/PoC_11_arch.png)
+![Framework_architecture_fed_11](Images/PoC_11_arch.png)
 
-
-
+## Framework Components
+The framework relies in a Kubernetes architecture to support the deployment of each component. Therefore, main components deployed as K8s pods are:
+- ONM 
+- DTM (core)
+- ON
+- NDTs (includes two containers: the NDT and the DTM distributed agent)
 
 
 ## Requirements
 
 ### Single machine (v1.6 — Kubernetes)
-
 | Component | Version |
 |-----------|---------|
 | Linux | Ubuntu 24.04 / Linux Mint 22.3 |
@@ -40,6 +43,7 @@ Python dependencies (see `requirements.txt`):
 ---
 
 ## Repository Structure
+This repository includes the necessary files for supporting the experiments including: python scripts, bash scripts, Dockerfiles and yaml files
 
 ```
 federated-ndt-framework/
@@ -83,9 +87,17 @@ federated-ndt-framework/
 ---
 
 
+## Prepare the environment
+### 1. Build Docker images directly into containerd
+Using `nerdctl` builds images directly into the Kubernetes namespace
+```bash
+cd federated-ndt-framework/federated
 
-
-
+sudo nerdctl --namespace k8s.io build -t dtm:1.0         DTM/
+sudo nerdctl --namespace k8s.io build -t onm:1.0         ONM/
+sudo nerdctl --namespace k8s.io build -t on-mininet:1.0  on_ndt_creation/
+sudo nerdctl --namespace k8s.io build -t ndt-mininet:1.0 ndt_deployment/mininet_ndts/
+```
 
 
 
