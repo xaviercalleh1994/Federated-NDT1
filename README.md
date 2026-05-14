@@ -359,11 +359,12 @@ Results are saved with the following structure:
  
 ### Analysing the results
  
-Once all runs are complete, run the analysis script:
+Once all runs are complete, run the analysis script. To run the script, some python packages are required within a venv.
  
 ```bash
-source 
-pip install numpy pandas matplotlib scipy tabulate --break-system-packages
+python3 -m venv venv 
+source venv/bin/activate
+pip install numpy pandas matplotlib scipy tabulate 
  
 python3 federated/analysis/experiment_1.py \
     --logs /tmp/exp1 \
