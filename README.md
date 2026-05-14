@@ -4,18 +4,18 @@ This framework is a Proof-of-Concept (PoC) for the federation of multiple Networ
 The proposed federation of multiple NDTs is a novel topic that is envisioned as 
 
 ## Overview
-The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. The framework relies in two manager entities: the Original Network Manager (ONM) and the Digital Twin Manager (DTM).
-
-- The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
-- The DTM is the main entity of the system and is in charge of the synchronization of the NDTs. The DTM is decompossed in two agents: the DTM Core is a centralized agent that receives and distribute ON events. While the DTM distributed agents are in charge of implementing each ON event into the NDT.
-
-The architecture of the testbed is seen next:
-
-![Framework_architecture](Images/PoC_fed_arch.png)
-
 Currently, the framework is provided with two operational configurations: 
+- The federated Mode (1:N): 
+    The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. The framework relies in two manager entities: the Original Network Manager (ONM) and the Digital Twin Manager (DTM).
+
+    - The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
+    - The DTM is the main entity of the system and is in charge of the synchronization of the NDTs. The DTM is decompossed in two agents: the DTM Core is a centralized agent that receives and distribute ON events. While the DTM distributed agents are in charge of implementing each ON event into the NDT.
+    ![Framework_architecture](Images/PoC_fed_arch.png)
 - A conventional mode (1:1): this is the currently analyzed configuration in the literature and considers a sinlge NDT instance derived from an ON. This mode will be further analyzed for the inclusion of Extended Reality (XR) services.
-- The federated Mode (1:N): The mode seen in previous image.
+![alt text](Images/PoC_11_arch.png)
+
+
+
 
 
 ## Requirements
