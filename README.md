@@ -362,6 +362,7 @@ Results are saved with the following structure:
 Once all runs are complete, run the analysis script:
  
 ```bash
+source 
 pip install numpy pandas matplotlib scipy tabulate --break-system-packages
  
 python3 federated/analysis/experiment_1.py \
