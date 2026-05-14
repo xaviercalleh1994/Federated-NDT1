@@ -1,9 +1,27 @@
-# ============================================================
-# Dockerfile — NDT Mininet container
-# Base: ubuntu:24.04 (matches Linux Mint 22.3 kernel)
+# Copyright (C) 2026 Xavier Calle-Heredia, Xavier Hesselbach
+# Universitat Politècnica de Catalunya (UPC)
 #
-# Build (once):
-#   docker build -t ndt-mininet .
+# ============================================================
+# Dockerfile — NDT (Network Digital Twin, Mininet keeper)
+#
+# Runs on_ndt.py --role ndt --bare-metal via entrypoint.sh.
+# on_ndt.py only responsibility: start and maintain Mininet.
+# All NDT event logic lives in dtm.py --mode agent
+# (runs as a second container in the same Pod).
+#
+# Exposes control API on localhost:6001 for dtm-agent to call
+# LINK_SET, EXEC, SNAPSHOT, RELOAD primitives.
+#
+# Requires privileged mode (OVS + Mininet kernel namespaces).
+#
+# Build:
+#   docker build -t ndt-mininet:1.0 .
+#
+# Import to containerd:
+#   docker save ndt-mininet:1.0 | sudo ctr -n k8s.io images import -
+#
+# Note: on_ndt.py and topology_config.json are mounted as
+#       ConfigMaps at runtime — no need to COPY them here.
 # ============================================================
 
 FROM ubuntu:24.04
@@ -24,16 +42,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Allow ovs-controller for mininet
+# Allow ovs-controller for Mininet
 RUN ln -sf /usr/bin/ovs-testcontroller /usr/local/bin/ovs-controller
 
-# Install orjson for log collection
-RUN pip3 install --no-cache-dir --break-system-packages orjson
+# Install orjson
+RUN pip3 install --no-cache-dir --break-system-packages orjson==3.10.1
 
 WORKDIR /app
 
-# PRepare entry point file which deploys a single NDT
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# on_ndt.py and topology_config.json injected via ConfigMap at runtime
 
 ENTRYPOINT ["/entrypoint.sh"]

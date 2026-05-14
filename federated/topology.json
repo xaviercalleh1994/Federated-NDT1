@@ -1,0 +1,18 @@
+{
+  "description": "Federated NDT testbed topology — shared by ON and all NDTs",
+  "backbone": {
+    "nat_ip": "10.0.0.254/24"
+  },
+  "lans": [
+    {
+      "id": 1,
+      "subnet": "192.168.10",
+      "hosts": 2
+    },
+    {
+      "id": 2,
+      "subnet": "192.168.20",
+      "hosts": 2
+    }
+  ]
+}

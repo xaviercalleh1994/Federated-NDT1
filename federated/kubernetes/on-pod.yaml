@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-on
+  namespace: ndt
+  labels:
+    app: "on"
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: on-ndt-script
+      configMap:
+        name: on-ndt-script
+        defaultMode: 493
+    - name: topology-config
+      configMap:
+        name: topology-config
+    - name: run-data
+      hostPath:
+        path: /tmp/ndt-run
+        type: DirectoryOrCreate
+  containers:
+    - name: "on"
+      image: on-mininet:1.0
+      imagePullPolicy: Never
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: on-ndt-script
+          mountPath: /app/on_ndt.py
+          subPath: on_ndt.py
+        - name: topology-config
+          mountPath: /app/topology_config.json
+          subPath: topology.json
+        - name: run-data
+          mountPath: /run
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-on
+  namespace: ndt
+  labels:
+    app: "on"
+spec:
+  type: ClusterIP
+  selector:
+    app: "on"
+  ports:
+    - name: control-tcp
+      protocol: TCP
+      port: 6001
+      targetPort: 6001

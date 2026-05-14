@@ -7,58 +7,89 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 # ============================================================
-# stop_ndts.sh — stop NDT containers and clean up everything
+# stop_ndts.sh — Kubernetes version
+#
+# Stops and removes all NDT pods from the 'ndt' namespace.
+# Optionally saves logs to a destination directory before deletion.
 #
 # Usage:
-#   ./stop_ndts.sh [LOG_DEST]
+#   ./stop_ndts.sh [LOG_DST_DIR]
 #
-# With LOG_DEST: archives logs before cleaning
-# Without:      just stops and cleans
+# Examples:
+#   ./stop_ndts.sh                          # just stop
+#   ./stop_ndts.sh ./logs/run1/1to8        # save logs then stop
 # ============================================================
 
 set -euo pipefail
 
-LOG_DEST=${1:-""}
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DST=${1:-""}
+NAMESPACE="ndt"
 PREFIX="exp1-ndt"
-LOG_DIR="${SCRIPT_DIR}/logs/current"
 
-# ── Archive logs if destination given ────────────────────────
-if [ -n "${LOG_DEST}" ]; then
-    mkdir -p "${LOG_DEST}"
-    if ls "${LOG_DIR}"/*.log > /dev/null 2>&1; then
-        cp "${LOG_DIR}"/*.log "${LOG_DEST}/"
-        echo "Logs saved to ${LOG_DEST}"
-    fi
+# ── Save logs if destination provided ───────────────────────
+if [ -n "${LOG_DST}" ]; then
+    mkdir -p "${LOG_DST}"
+    echo "Saving NDT logs to ${LOG_DST}..."
+
+    PODS=$(kubectl get pods -n "${NAMESPACE}" \
+        --selector="app=ndt-exp1" \
+        --no-headers \
+        -o custom-columns=":metadata.name" 2>/dev/null || true)
+
+    for pod in ${PODS}; do
+        INDEX=$(kubectl get pod "${pod}" -n "${NAMESPACE}" \
+            -o jsonpath='{.metadata.labels.ndt-index}' 2>/dev/null || echo "x")
+        LOG_FILE="${LOG_DST}/ndt_${INDEX}_mininet.log"
+        echo "  Saving logs of ${pod} → ${LOG_FILE}"
+        kubectl logs "${pod}" -n "${NAMESPACE}" > "${LOG_FILE}" 2>/dev/null || true
+    done
+
+    echo "Logs saved."
+    echo ""
 fi
 
-# ── Stop and remove all NDT containers ───────────────────────
-echo "Stopping containers..."
-FOUND=0
-for container in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep "^${PREFIX}-" || true); do
-    docker rm -f "${container}" > /dev/null 2>&1 && \
-        echo "  Removed ${container}" || true
-    FOUND=1
+# ── Delete all NDT pods and services ─────────────────────────
+echo "Stopping all NDT pods in namespace '${NAMESPACE}'..."
+
+kubectl delete pods \
+    --selector="app=ndt-exp1" \
+    --namespace="${NAMESPACE}" \
+    --grace-period=0 \
+    --force \
+    --ignore-not-found=true 2>/dev/null || true
+
+echo "Deleting all NDT services in namespace '${NAMESPACE}'..."
+
+kubectl delete services \
+    --selector="app=ndt-exp1" \
+    --namespace="${NAMESPACE}" \
+    --ignore-not-found=true 2>/dev/null || true
+
+# ── Wait until all pods are gone ────────────────────────────
+echo "Waiting for pods to terminate..."
+MAX_WAIT=30
+elapsed=0
+until [ -z "$(kubectl get pods -n "${NAMESPACE}" \
+    --selector="app=ndt-exp1" \
+    --no-headers 2>/dev/null)" ] || [ "${elapsed}" -ge "${MAX_WAIT}" ]; do
+    sleep 1
+    elapsed=$(( elapsed + 1 ))
 done
-[ "${FOUND}" -eq 0 ] && echo "  No containers found"
 
-# ── Clean log directory ──────────────────────────────────────
-echo "Cleaning logs..."
-rm -f "${LOG_DIR}"/ndt_*.log
-echo "  logs/current/ cleaned"
+if [ "${elapsed}" -ge "${MAX_WAIT}" ]; then
+    echo "WARNING: some pods may still be terminating."
+    kubectl get pods -n "${NAMESPACE}" --selector="app=ndt-exp1" || true
+else
+    echo "All NDT pods stopped."
+fi
 
-# ── Clean Mininet residual state ─────────────────────────────
-echo "Cleaning Mininet state..."
-sudo mn -c > /dev/null 2>&1 && echo "  mn -c done" || true
+# ── Clean leftover Mininet state (optional, same as Docker version) ──
+# Only if mn is available on the host
+if command -v mn > /dev/null 2>&1; then
+    echo "Cleaning Mininet state..."
+    sudo mn -c > /dev/null 2>&1 || true
+fi
 
-echo "Done. Ready for next run."
+echo "Done."
