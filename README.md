@@ -130,15 +130,127 @@ pod-on    1/1     Running
 pod-onm   1/1     Running   
 ```
 
-The script prints the ONM command at the end with the correct `svc-on` IP:
-
+To start the experiment, you need to run the ONM:
 ```bash
 kubectl exec -it pod-onm -n ndt -- python3 onm.py \
     --proto udp --relay-ip 127.0.0.1 \
     --relay-port 7001 --relay-kind router \
-    --on-ip <SVC_ON_IP> \
+    --on-ip 10.233.85.156 \
     --log-file /tmp/onm.log
 ```
+
+You can use multiple windows to oversee the ON and each NDT and execute them:
+```bash
+# Original network:
+kubectl exec -it pod-on -n ndt -- bash
+# Check current topology:
+cat /run/topology.json
+{
+  "nodes": [
+    "r_nat",
+    "r1",
+    "h1_1",
+    "h1_2",
+    "r2",
+    "h2_1",
+    "h2_2",
+    "s_core",
+    "s1",
+    "s2"
+  ],
+  "links": [
+    [
+      "r_nat",
+      "s_core"
+    ],
+    [
+      "r_nat",
+      "s_core"
+    ],
+    [
+      "r1",
+      "s1"
+    ],
+    [
+      "r1",
+      "s_core"
+    ],
+    [
+      "h1_1",
+      "s1"
+    ],
+    [
+      "h1_2",
+      "s1"
+    ],
+    [
+      "r2",
+      "s2"
+    ],
+    [
+      "r2",
+      "s_core"
+    ],
+    [
+      "h2_1",
+      "s2"
+    ],
+    [
+      "h2_2",
+      "s2"
+    ]
+  ]
+}
+```
+
+```bash
+# NDT 1:
+kubectl exec -it ndt-1 -n ndt -- bash
+```
+
+```bash
+# NDT 2:
+kubectl exec -it ndt-2 -n ndt -- bash
+```
+
+In the ON and NDTs pods you can check connectivity between r1 and r2 routers
+```bash
+mnexec -a $(pgrep -f "mininet:r1") ping -c 3 10.0.0.22
+PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
+64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=2.41 ms
+64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.664 ms
+64 bytes from 10.0.0.2: icmp_seq=3 ttl=64 time=0.064 ms
+```
+
+Then, in the ONM pod you can disable the link just by introducing the comand in the CLI:
+```bash
+> set r1 r2 down 0 0 1000
+[ONM] Applied locally and sent to DTM
+> 
+```
+
+Chcek again in the ON and NDTs pods the r1-r2 connectivity:
+```bash
+mnexec -a $(pgrep -f "mininet:r1") ping -c 3 10.0.0.22
+ping: connect: Network is unreachable
+```
+
+You can restart the link in the ONM:
+```bash
+> set r1 r2 down 0 0 1000
+[ONM] Applied locally and sent to DTM
+> 
+```
+
+In the ON and NDTs pods you can check connectivity between r1 and r2 routers
+```bash
+mnexec -a $(pgrep -f "mininet:r1") ping -c 3 10.0.0.22
+PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
+64 bytes from 10.0.0.2: icmp_seq=1 ttl=64 time=2.41 ms
+64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.664 ms
+64 bytes from 10.0.0.2: icmp_seq=3 ttl=64 time=0.064 ms
+```
+
 
 ## Running the Testbed
 ### Federated mode (1:N)
