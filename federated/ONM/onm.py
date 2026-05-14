@@ -16,6 +16,39 @@
 """
 Authors: Xavier Calle-Heredia & Xavier Hesselbach
 Date: 2026-04-08
+
+onm.py — Original Network Manager
+----------------------------------
+Full ONM logic. Connects to on_ndt.py via 127.0.0.1:6001
+to apply physical changes to the ON Mininet network.
+
+Responsibilities:
+  - Interactive CLI for the operator
+  - Read topology graph from topology.json
+  - Resolve logical links to physical segments (BFS)
+  - Apply events locally on the ON via on_ndt.py primitives
+  - Serialize and send events to DTM via relay/direct UDP or TCP
+  - Handle topology updates (write new config + trigger RELOAD)
+
+CLI commands:
+  show
+      Display current logical topology state.
+
+  set A B up|down delay_ms loss_pct bw_mbps
+      Apply a logical link change between nodes A and B.
+      Example: set r1 r2 up 10 0 100
+               set r1 r2 down 0 0 1000
+
+  exec NODE "cmd"
+      Run a shell command inside a Mininet node namespace.
+      Example: exec r1 "ip route"
+
+  topology <file.json>
+      Load a new topology config, apply it to ON, send to DTM.
+      Example: topology /app/topologies/3lan.json
+
+  quit
+      Exit the ONM.
 """
 import json
 import time
@@ -26,35 +59,45 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict, deque
 
-TOPO_FILE = "/run/topology.json"
-
-# Default log file for ONM (can be overridden with --log-file)
+# ── File paths ────────────────────────────────────────────────
+TOPO_FILE        = "/run/topology.json"         # Mininet exported topology
+TOPO_CONFIG_FILE = "/run/topology_config.json"  # topology config (LANs/hosts)
 LOG_FILE_DEFAULT = "/home/ubuntu/onm_events.log"
 
+# ── on_ndt.py control server ──────────────────────────────────
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 6001
 
-# Runtime context appended to every log line
+# ── Runtime context for logging ──────────────────────────────
 RUN_CTX: Dict[str, object] = {}
 
 
-# Log structured events for metrics extraction
-def log_event(tag: str, data: dict):
+# ─────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────
+
+def log_event(tag: str, data: dict) -> None:
     entry = {"ts_ns": time.time_ns(), "tag": tag, **RUN_CTX, **data}
     with open(RUN_CTX.get("log_file", LOG_FILE_DEFAULT), "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-# Logical edge representation (carried in sync events)
+# ─────────────────────────────────────────────────────────────
+# Logical edge representation
+# ─────────────────────────────────────────────────────────────
+
 @dataclass
 class Edge:
     delay_ms: float
     loss_pct: float
-    bw_mbps: float
-    up: bool
+    bw_mbps:  float
+    up:       bool
 
 
-# Local adjacency matrix (visualization/state only)
+# ─────────────────────────────────────────────────────────────
+# Logical topology state (in-memory matrix)
+# ─────────────────────────────────────────────────────────────
+
 class Matrix:
     def __init__(self):
         self.idx: Dict[str, int] = {}
@@ -64,14 +107,11 @@ class Matrix:
     def _ensure(self, n: str):
         if n in self.idx:
             return
-
         i = len(self.idx)
         self.idx[n] = i
         self.rev[i] = n
-
         for row in self.m:
             row.append(None)
-
         self.m.append([None] * (i + 1))
 
     def set(self, a: str, b: str, e: Edge):
@@ -82,164 +122,161 @@ class Matrix:
         self.m[j][i] = e
 
     def show(self):
-        print("\nLogic Nodes:")
-
+        print("\nLogical Nodes:")
         for n, i in self.idx.items():
             print(f"  {i}: {n}")
-        print("\nLOGICAL LINKS:")
-
+        print("\nLogical Links:")
         printed = set()
-
         for i in range(len(self.m)):
             for j in range(len(self.m)):
-
                 e = self.m[i][j]
-
                 if e is None:
                     continue
-
                 a, b = self.rev[i], self.rev[j]
                 key = tuple(sorted([a, b]))
-
                 if key in printed:
                     continue
-
                 printed.add(key)
+                print(f"  {a} <-> {b} | up={e.up} "
+                      f"delay={e.delay_ms}ms "
+                      f"loss={e.loss_pct}% "
+                      f"bw={e.bw_mbps}Mbps")
 
-                print(
-                    f"  {a} <-> {b} | up={e.up} delay={e.delay_ms}ms "
-                    f"loss={e.loss_pct}% bw={e.bw_mbps}Mbps"
-                )
 
+# ─────────────────────────────────────────────────────────────
+# Topology graph helpers
+# ─────────────────────────────────────────────────────────────
 
-# Identify Mininet switches
 def is_switch(n: str) -> bool:
     return n.startswith("s")
 
 
-# Load exported topology into adjacency graph
 def load_topo_graph() -> Tuple[List[str], Dict[str, List[str]]]:
+    """Load Mininet-exported topology.json into adjacency graph."""
     with open(TOPO_FILE) as f:
         t = json.load(f)
-
     g = defaultdict(list)
-
     for a, b in t["links"]:
         g[a].append(b)
         g[b].append(a)
-
     return t["nodes"], g
 
 
-# Find path where only switches are intermediates
-def path_only_switches_middle(g: Dict[str, List[str]], src: str, dst: str) -> List[Tuple[str, str]]:
-    q = deque([src])
+def path_only_switches_middle(
+    g: Dict[str, List[str]], src: str, dst: str
+) -> List[Tuple[str, str]]:
+    """BFS path where only switches are in the middle."""
+    q    = deque([src])
     prev = {src: None}
-
     while q:
         cur = q.popleft()
         if cur == dst:
             break
-
         for nxt in g[cur]:
-            if nxt in prev:
-                continue
-
-            prev[nxt] = cur
-            q.append(nxt)
-
+            if nxt not in prev:
+                prev[nxt] = cur
+                q.append(nxt)
     if dst not in prev:
         return []
-
-    path_nodes = []
-    cur = dst
-
+    path = []
+    cur  = dst
     while cur is not None:
-        path_nodes.append(cur)
+        path.append(cur)
         cur = prev[cur]
-
-    path_nodes.reverse()
-
-    mids = path_nodes[1:-1]
-
-    if any(not is_switch(x) for x in mids):
+    path.reverse()
+    if any(not is_switch(x) for x in path[1:-1]):
         return []
+    return [(path[i], path[i + 1]) for i in range(len(path) - 1)]
 
-    return [(path_nodes[i], path_nodes[i + 1]) for i in range(len(path_nodes) - 1)]
 
+# ─────────────────────────────────────────────────────────────
+# on_ndt.py primitive caller
+# ─────────────────────────────────────────────────────────────
 
-# Send event to local Mininet control server (TCP JSON line)
 def control_call(ev: dict) -> dict:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((CONTROL_HOST, CONTROL_PORT))
-    s.sendall((json.dumps(ev) + "\n").encode())
+    """
+    Send a primitive command to on_ndt.py control server.
+    on_ndt.py applies the physical change to Mininet.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.connect((CONTROL_HOST, CONTROL_PORT))
+        s.sendall((json.dumps(ev) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return json.loads(data.split(b"\n")[0].decode()) if data \
+            else {"ok": False, "err": "no response"}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
 
-    data = b""
-    while b"\n" not in data:
-        chunk = s.recv(4096)
 
-        if not chunk:
-            break
+# ─────────────────────────────────────────────────────────────
+# ON event application
+# ─────────────────────────────────────────────────────────────
 
-        data += chunk
-
-    s.close()
-
-    if not data:
-        return {"ok": False, "err": "no response"}
-
-    return json.loads(data.split(b"\n")[0].decode())
-
-
-# Apply logical edge to ON (physical segments + route reassert)
-def apply_logical_edge_to_on(g, a: str, b: str, e: Edge) -> bool:
-    phys_edges = path_only_switches_middle(g, a, b)
-
-    if not phys_edges:
-        print(f"[ON] No logical path between {a} and {b}")
+def apply_logical_link(
+    g: Dict[str, List[str]], a: str, b: str, e: Edge
+) -> bool:
+    """
+    Resolve logical link A↔B to physical segments and apply via
+    on_ndt.py LINK_SET primitives + ROUTE_REASSERT.
+    """
+    segs = path_only_switches_middle(g, a, b)
+    if not segs:
+        print(f"[ONM] No path between {a} and {b}")
         return False
 
-    for x, y in phys_edges:
+    for x, y in segs:
         resp = control_call({
-            "type": "LINK_SET",
+            "type":    "LINK_SET",
             "payload": {
                 "a": x, "b": y,
-                "up": e.up,
+                "up":       e.up,
                 "delay_ms": e.delay_ms,
                 "loss_pct": e.loss_pct,
-                "bw_mbps": e.bw_mbps
+                "bw_mbps":  e.bw_mbps,
             }
         })
-
-        if not resp.get("ok", False):
-            print("[ON] LINK_SET error:", resp)
+        if not resp.get("ok"):
+            print(f"[ONM] LINK_SET error on {x}↔{y}: {resp}")
             return False
 
-    rr = control_call({
-        "type": "ROUTE_REASSERT",
-        "payload": {"routers": ["r1", "r2"], "gateway": "10.0.0.254"}
+    # Reassert routes on all LAN routers
+    routers = [n for n in g if n.startswith("r") and n != "r_nat"]
+    control_call({
+        "type":    "EXEC",
+        "payload": {"node": "r_nat", "cmd": "true"}   # no-op ping
     })
-
-    if not rr.get("ok", True):
-        print("[ON] ROUTE_REASSERT warning:", rr)
-
+    for r in routers:
+        control_call({
+            "type":    "EXEC",
+            "payload": {
+                "node": r,
+                "cmd":  "ip route replace default via 10.0.0.254",
+            }
+        })
     return True
 
 
-# Abstract sender for synchronization channel
+# ─────────────────────────────────────────────────────────────
+# DTM sender
+# ─────────────────────────────────────────────────────────────
+
 class SyncSender:
-    def send(self, data: bytes):
-        raise NotImplementedError
-
-    def close(self):
-        pass
+    def send(self, data: bytes): raise NotImplementedError
+    def close(self): pass
 
 
-# UDP sender (send events to relay)
 class UdpSender(SyncSender):
     def __init__(self, relay_ip: str, relay_port: int):
         self.addr = (relay_ip, relay_port)
-        self.s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.s    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def send(self, data: bytes):
         self.s.sendto(data, self.addr)
@@ -248,7 +285,6 @@ class UdpSender(SyncSender):
         self.s.close()
 
 
-# TCP sender with framing [len][payload]
 class TcpSender(SyncSender):
     def __init__(self, relay_ip: str, relay_port: int):
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -262,88 +298,162 @@ class TcpSender(SyncSender):
         self.s.close()
 
 
-# ── NEW (Exp. 1): send topology to DTM before any events ─────────────────────
-
-def send_topology(sender: SyncSender) -> None:
-    """
-    Send the ON topology to the DTM as the very first message.
-    The DTM uses it to build the graph needed to resolve LOGICAL_LINK_SET
-    into physical LINK_SET segments before fanning out to the N real NDTs.
-
-    Called once, immediately after the relay connection is established,
-    before any interactive commands are processed.
-
-    Backward compatible: if the DTM is running in 1:1 or Exp. 2 mode,
-    it receives a TOPOLOGY event and silently drops it with continue.
-    """
+def send_topology_to_dtm(sender: SyncSender) -> None:
+    """Send current topology to DTM (Exp. 1 handshake)."""
     with open(TOPO_FILE) as f:
         topo = json.load(f)
-
-    ev = {
-        "type":    "TOPOLOGY",
-        "payload": topo,   # {nodes: [...], links: [[a,b], ...]}
-    }
+    ev      = {"type": "TOPOLOGY", "payload": topo}
     payload = json.dumps(ev).encode()
     sender.send(payload)
-    print(
-        f"[ON] Topology sent to DTM "
-        f"({len(topo['nodes'])} nodes, {len(topo['links'])} links)",
-        flush=True,
-    )
+    print(f"[ONM] Topology sent to DTM "
+          f"({len(topo['nodes'])} nodes, {len(topo['links'])} links)")
     log_event("ON_TOPOLOGY_SENT", {
-        "nodes":      len(topo["nodes"]),
-        "links":      len(topo["links"]),
+        "nodes": len(topo["nodes"]),
+        "links": len(topo["links"]),
         "size_bytes": len(payload),
     })
 
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# Topology update
+# ─────────────────────────────────────────────────────────────
+
+def apply_topology_update(
+    new_topo_path: str,
+    sender: SyncSender,
+    mock_on: bool,
+) -> bool:
+    """
+    Load new topology config, write to topology_config.json,
+    trigger RELOAD on on_ndt.py, send TOPOLOGY_UPDATE to DTM.
+    """
+    try:
+        with open(new_topo_path) as f:
+            new_topo = json.load(f)
+    except Exception as e:
+        print(f"[ONM] Error loading {new_topo_path}: {e}")
+        return False
+
+    if "lans" not in new_topo or "backbone" not in new_topo:
+        print("[ONM] Invalid topology: missing 'lans' or 'backbone'")
+        return False
+
+    # Write new config so on_ndt.py reads it on RELOAD
+    with open(TOPO_CONFIG_FILE, "w") as f:
+        json.dump(new_topo, f, indent=2)
+    print(f"[ONM] New topology saved to {TOPO_CONFIG_FILE}")
+
+    # Trigger Mininet RELOAD on local ON
+    if not mock_on:
+        resp = control_call({"type": "RELOAD"})
+        if not resp.get("ok"):
+            print(f"[ONM] RELOAD error: {resp}")
+            return False
+        print("[ONM] ON Mininet reloading...")
+        # Wait for topology.json to be re-exported
+        for _ in range(30):
+            time.sleep(1)
+            try:
+                with open(TOPO_FILE) as f:
+                    topo = json.load(f)
+                # Check new topology matches expected LAN count
+                expected = len(new_topo["lans"])
+                routers  = [n for n in topo["nodes"]
+                            if n.startswith("r") and n != "r_nat"]
+                if len(routers) == expected:
+                    print(f"[ONM] ON reload complete "
+                          f"({expected} LANs ready)")
+                    break
+            except Exception:
+                pass
+        else:
+            print("[ONM] WARNING: ON reload timeout")
+
+    # Send TOPOLOGY_UPDATE to DTM
+    event_id    = str(uuid.uuid4())
+    t_create_ns = time.time_ns()
+    ev = {
+        "type":       "TOPOLOGY_UPDATE",
+        "event_id":   event_id,
+        "t_create_ns": t_create_ns,
+        "payload":    {"topology": new_topo},
+    }
+    payload = json.dumps(ev).encode()
+    t_tx_ns = time.time_ns()
+    sender.send(payload)
+
+    log_event("ON_TOPOLOGY_UPDATE_SENT", {
+        "event_id":   event_id,
+        "t_create_ns": t_create_ns,
+        "t_tx_ns":    t_tx_ns,
+        "lans":       len(new_topo["lans"]),
+        "size_bytes": len(payload),
+    })
+    print(f"[ONM] TOPOLOGY_UPDATE sent to DTM "
+          f"({len(new_topo['lans'])} LANs)")
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
+# Main CLI
+# ─────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--proto", choices=["udp", "tcp"], required=True)
-    ap.add_argument("--relay-ip", required=True)
+    ap = argparse.ArgumentParser(description="Original Network Manager")
+    ap.add_argument("--proto",      choices=["udp", "tcp"], required=True)
+    ap.add_argument("--relay-ip",   required=True,
+                    help="DTM IP or hostname")
     ap.add_argument("--relay-port", type=int, default=7001)
-    ap.add_argument("--relay-kind", choices=["router", "vps"], required=True,
-                    help="Type of relay used: local router VM or remote VPS server")
-    ap.add_argument("--log-file", default=LOG_FILE_DEFAULT,
-                    help="Path to ON manager log file (JSONL)")
-    ap.add_argument("--mock-on", action="store_true",
-                    help="When activated, it skips the application of local actions")
+    ap.add_argument("--relay-kind", choices=["router", "vps"], required=True)
+    ap.add_argument("--log-file",   default=LOG_FILE_DEFAULT)
+    ap.add_argument("--mock-on",    action="store_true",
+                    help="Skip local ON application (no Mininet available)")
+    ap.add_argument("--on-ip",      default="127.0.0.1",
+                    help="IP of the ON Pod control server (default: 127.0.0.1)")
     args = ap.parse_args()
 
-    global RUN_CTX
+    global RUN_CTX, CONTROL_HOST
+    CONTROL_HOST = args.on_ip
     RUN_CTX = {
-        "side": "ON",
-        "proto": args.proto,
+        "side":       "ON",
+        "proto":      args.proto,
         "relay_kind": args.relay_kind,
-        "relay_ip": args.relay_ip,
+        "relay_ip":   args.relay_ip,
         "relay_port": args.relay_port,
-        "log_file": args.log_file
+        "log_file":   args.log_file,
     }
 
-    # Transport selection
     sender = (
         UdpSender(args.relay_ip, args.relay_port)
         if args.proto == "udp"
         else TcpSender(args.relay_ip, args.relay_port)
     )
 
-    nodes, g = load_topo_graph()
+    # Load topology graph
+    try:
+        nodes, g = load_topo_graph()
+    except FileNotFoundError:
+        print(f"[ONM] WARNING: {TOPO_FILE} not found. "
+              f"Using empty graph (--mock-on recommended).")
+        nodes, g = [], defaultdict(list)
 
-    # NEW (Exp. 1): send topology to DTM so it can resolve logical links.
-    # The DTM drops this silently in 1:1 mode and Exp. 2 — no side effects.
-    send_topology(sender)
+    # Send topology to DTM (Exp. 1 handshake)
+    try:
+        send_topology_to_dtm(sender)
+    except Exception as e:
+        print(f"[ONM] WARNING: Could not send topology: {e}")
 
     M = Matrix()
 
-    print("[ON] Ready. Commands:")
+    print("[ONM] Ready. Commands:")
     print("  show")
     print("  set A B up|down delay_ms loss_pct bw_mbps")
-    print("     ej: set r1 r2 up 50 1 10")
-    print("     ej: set r1 r2 down 0 0 1000")
-    print('  exec NODE "cmd ..."')
-    print('     ej: exec r1 "ip route"')
+    print("    e.g.: set r1 r2 up 10 0 100")
+    print("    e.g.: set r1 r2 down 0 0 1000")
+    print('  exec NODE "cmd"')
+    print('    e.g.: exec r1 "ip route"')
+    print("  topology <file.json>")
+    print("    e.g.: topology /app/topologies/3lan.json")
     print("  quit\n")
 
     while True:
@@ -354,122 +464,118 @@ def main():
 
         if not line:
             continue
-
         if line == "quit":
             break
-
         if line == "show":
             M.show()
             continue
 
         parts = line.split()
-        cmd = parts[0].lower()
+        cmd   = parts[0].lower()
 
+        # ── set A B up|down delay loss bw ────────────────────
         if cmd == "set":
             if len(parts) != 7:
-                print("Uso: set A B up|down delay_ms loss_pct bw_mbps")
+                print("Usage: set A B up|down delay_ms loss_pct bw_mbps")
                 continue
-
             _, a, b, up_s, d, l, bw = parts
-            up = up_s.lower() == "up"
-            e = Edge(delay_ms=float(d), loss_pct=float(l), bw_mbps=float(bw), up=up)
-
-            # Update matrix
+            e = Edge(
+                delay_ms=float(d), loss_pct=float(l),
+                bw_mbps=float(bw), up=(up_s.lower() == "up"),
+            )
             M.set(a, b, e)
-
-            # Create event + metrics
-            event_id = str(uuid.uuid4())
+            event_id    = str(uuid.uuid4())
             t_create_ns = time.time_ns()
-
             log_event("ON_EVENT_CREATED", {
-                "event_id": event_id,
-                "a": a, "b": b,
-                "params": asdict(e)
+                "event_id": event_id, "a": a, "b": b,
+                "params": asdict(e),
             })
 
-            # Apply locally in ON
+            # Apply locally on ON via on_ndt.py primitives
             if not args.mock_on:
-                if not apply_logical_edge_to_on(g, a, b, e):
-                    log_event("ON_EVENT_LOCAL_APPLY_FAIL", {"event_id": event_id, "a": a, "b": b})
+                ok = apply_logical_link(g, a, b, e)
+                if not ok:
+                    log_event("ON_EVENT_LOCAL_APPLY_FAIL",
+                              {"event_id": event_id, "a": a, "b": b})
                     continue
-            else:
-                # Simulamos que lo aplicó localmente al instante para no frenar el test
-                pass
 
-            # Build sync event (sent to relay, not directly to NDT)
+            # Send to DTM
             ev = {
-                "type": "LOGICAL_LINK_SET",
-                "event_id": event_id,
+                "type":        "LOGICAL_LINK_SET",
+                "event_id":    event_id,
                 "t_create_ns": t_create_ns,
-                "payload": {"a": a, "b": b, **asdict(e)}
+                "payload":     {"a": a, "b": b, **asdict(e)},
             }
-
             payload = json.dumps(ev).encode()
             t_tx_ns = time.time_ns()
             sender.send(payload)
-
             log_event("ON_EVENT_SENT", {
-                "event_id": event_id,
+                "event_id":    event_id,
                 "t_create_ns": t_create_ns,
-                "t_tx_ns": t_tx_ns,
-                "size_bytes": len(payload)
+                "t_tx_ns":     t_tx_ns,
+                "size_bytes":  len(payload),
             })
-
-            # Evita inundar la terminal en modo mock de estrés
             if not args.mock_on:
-                print("[ON] Event applied locally and sent to relay")
+                print("[ONM] Applied locally and sent to DTM")
             continue
 
+        # ── exec NODE "cmd" ──────────────────────────────────
         if cmd == "exec":
             if len(parts) < 3:
-                print('Uso: exec NODE "cmd ..."')
+                print('Usage: exec NODE "cmd"')
                 continue
-
-            node = parts[1]
-            shell_cmd = line.split(None, 2)[2].strip()
-
-            # Create event + metrics
-            event_id = str(uuid.uuid4())
+            node      = parts[1]
+            shell_cmd = line.split(None, 2)[2].strip().strip('"')
+            event_id    = str(uuid.uuid4())
             t_create_ns = time.time_ns()
-
             log_event("ON_EXEC_CREATED", {
                 "event_id": event_id,
-                "node": node,
-                "cmd": shell_cmd
+                "node": node, "cmd": shell_cmd,
             })
 
-            if shell_cmd.startswith('"') and shell_cmd.endswith('"'):
-                shell_cmd = shell_cmd[1:-1]
+            if not args.mock_on:
+                resp = control_call({
+                    "type":    "EXEC",
+                    "payload": {"node": node, "cmd": shell_cmd},
+                })
+                print("[ONM EXEC]", resp)
 
             ev = {
-                "type": "EXEC_CMD",
-                "event_id": event_id,
+                "type":        "EXEC_CMD",
+                "event_id":    event_id,
                 "t_create_ns": t_create_ns,
-                "payload": {
-                    "node": node,
-                    "cmd": shell_cmd
-                }
+                "payload":     {"node": node, "cmd": shell_cmd},
             }
-
-            # Execute in ON
-            if not args.mock_on:
-                resp = control_call(ev)
-                print("[ON EXEC]", resp)
-
-            # Also send to NDT via relay (so it mirrors the exec)
             payload = json.dumps(ev).encode()
             t_tx_ns = time.time_ns()
             sender.send(payload)
-
             log_event("ON_EXEC_SENT", {
-                "event_id": event_id,
+                "event_id":    event_id,
                 "t_create_ns": t_create_ns,
-                "t_tx_ns": t_tx_ns,
-                "size_bytes": len(payload)
+                "t_tx_ns":     t_tx_ns,
+                "size_bytes":  len(payload),
             })
             continue
 
-        print("Comando no reconocido.")
+        # ── topology <file.json> ─────────────────────────────
+        if cmd == "topology":
+            if len(parts) != 2:
+                print("Usage: topology <file.json>")
+                continue
+            topo_path = parts[1]
+            ok = apply_topology_update(topo_path, sender, args.mock_on)
+            if ok and not args.mock_on:
+                # Reload topology graph after ON restarts
+                time.sleep(2)
+                try:
+                    nodes, g = load_topo_graph()
+                    print(f"[ONM] Graph reloaded: "
+                          f"{len(nodes)} nodes")
+                except Exception as e:
+                    print(f"[ONM] WARNING: Could not reload graph: {e}")
+            continue
+
+        print(f"Unknown command: {cmd}")
 
     sender.close()
 

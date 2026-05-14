@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-dtm
+  namespace: ndt
+  labels:
+    app: dtm
+    mode: federated
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  volumes:
+    - name: logs
+      emptyDir: {}
+  containers:
+    - name: dtm
+      image: dtm:1.0
+      imagePullPolicy: Never
+      args:
+        - "--proto"
+        - "udp"
+        - "--relay-ip"
+        - "0.0.0.0"
+        - "--relay-port"
+        - "7001"
+        - "--onm-port"
+        - "7002"
+        - "--mode"
+        - "federated"
+        - "--fanout"
+        - "2"
+        - "--dst-ip"
+        - "10.4.47.50"
+        - "--base-port"
+        - "30001"
+        - "--feedback-port"
+        - "9000"
+        - "--experiment-duration"
+        - "0"
+        - "--log-file"
+        - "/dev/stderr"
+      volumeMounts:
+        - name: logs
+          mountPath: /app/logs

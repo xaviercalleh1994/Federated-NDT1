@@ -1,31 +1,30 @@
 #!/bin/bash
-
 # Copyright (C) 2026 Xavier Calle-Heredia, Xavier Hesselbach
 # Universitat Politècnica de Catalunya (UPC)
 #
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+# ============================================================
+# entrypoint.sh — NDT Mininet container
 #
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
+# 1. Starts OVS
+# 2. Launches on_ndt.py --role ndt --bare-metal (Mininet keeper)
 #
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
+# on_ndt.py --role ndt starts Mininet and exposes the control
+# API on localhost:6001. It does NOT handle events — that is
+# the responsibility of dtm.py --mode agent running alongside.
+#
+# The container prints "NDT keeper running" when ready.
+# launch_ndts.sh waits for this string before proceeding.
+# ============================================================
 
 set -e
 
 NDT_PORT=${NDT_PORT:-8001}
-NDT_PROTO=${NDT_PROTO:-tcp}
-DTM_IP=${DTM_IP:-""}
-ACK_PORT=${ACK_PORT:-9000}
+NDT_PROTO=${NDT_PROTO:-udp}
 CTRL_PORT=${CTRL_PORT:-6653}
 
 echo "[entrypoint] NDT starting port=${NDT_PORT} proto=${NDT_PROTO} ctrl=${CTRL_PORT}"
 
+# ── Start OVS ────────────────────────────────────────────────
 mkdir -p /var/run/openvswitch /etc/openvswitch /var/log/openvswitch
 
 if [ ! -f /etc/openvswitch/conf.db ]; then
@@ -40,20 +39,24 @@ ovsdb-server /etc/openvswitch/conf.db \
     --log-file=/var/log/openvswitch/ovsdb.log
 
 ovs-vsctl --no-wait init
+
 ovs-vswitchd --pidfile --detach \
     --log-file=/var/log/openvswitch/vswitchd.log
 
 for i in $(seq 1 15); do
-    ovs-vsctl show > /dev/null 2>&1 && echo "[entrypoint] OVS ready (${i}s)" && break
+    ovs-vsctl show > /dev/null 2>&1 \
+        && echo "[entrypoint] OVS ready (${i}s)" && break
     sleep 1
     [ "$i" -eq 15 ] && echo "[entrypoint] ERROR: OVS timeout" && exit 1
 done
 
+# ── Launch NDT Mininet keeper ─────────────────────────────────
+# --role ndt    : starts Mininet, exposes API on localhost:6001
+# --bare-metal  : skip enp0s8/enp0s9 (not present in container)
+# --topo-file   : reads topology from ConfigMap mount
+# --controller-port: unique OVS port per container instance
 exec python3 /app/on_ndt.py \
     --role ndt \
-    --relay-port "${NDT_PORT}" \
-    --proto "${NDT_PROTO}" \
-    --dtm-ip "${DTM_IP}" \
-    --ack-port "${ACK_PORT}" \
     --bare-metal \
+    --topo-file /app/topology_config.json \
     --controller-port "${CTRL_PORT}"

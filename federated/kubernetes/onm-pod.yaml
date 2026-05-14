@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-onm
+  namespace: ndt
+  labels:
+    app: onm
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  volumes:
+    - name: run-data
+      hostPath:
+        path: /tmp/ndt-run
+        type: DirectoryOrCreate
+    - name: logs
+      emptyDir: {}
+  containers:
+    - name: onm
+      image: onm:1.0
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: logs
+          mountPath: /app/logs

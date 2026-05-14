@@ -1,0 +1,78 @@
+# ============================================================
+# on-onm-pod.yaml — ON + ONM Pod
+#
+# ON (on_ndt.py --role on) and ONM (onm.py) always run together
+# because onm.py calls on_ndt.py primitives via localhost:6001.
+# localhost is shared within the same Pod.
+#
+# Used in both 1:1 and federated modes.
+#
+# Access ONM CLI:
+#   kubectl exec -it pod-on-onm -n ndt -c onm -- python3 onm.py \
+#       --proto udp --relay-ip svc-dtm --relay-port 7001 \
+#       --relay-kind router
+#
+# Access ON Mininet:
+#   kubectl exec -it pod-on-onm -n ndt -c on -- bash
+#   mnexec -a $(pgrep -f "mininet:r1") ip route
+# ============================================================
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-on-onm
+  namespace: ndt
+  labels:
+    app: on-onm
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  dnsPolicy: ClusterFirst
+
+  volumes:
+    - name: on-ndt-script
+      configMap:
+        name: on-ndt-script
+        defaultMode: 493
+    - name: topology-config
+      configMap:
+        name: topology-config
+    - name: logs
+      emptyDir: {}
+    - name: run-data
+      emptyDir: {}    # shared /run between ON and ONM containers
+
+  containers:
+
+    # ── Container 1: ON (Mininet keeper) ──────────────────
+    # Starts OVS + Mininet, exposes API on localhost:6001.
+    # onm.py calls this API to apply physical changes.
+    - name: "on"
+      image: on-mininet:1.0
+      imagePullPolicy: Never
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: on-ndt-script
+          mountPath: /app/on_ndt.py
+          subPath: on_ndt.py
+        - name: topology-config
+          mountPath: /app/topology_config.json
+          subPath: topology.json
+        - name: run-data
+          mountPath: /run
+        - name: logs
+          mountPath: /app/logs
+
+    # ── Container 2: ONM ──────────────────────────────────
+    # Full ONM logic. Connects to ON via localhost:6001.
+    # Stays alive via sleep infinity — use kubectl exec.
+    - name: onm
+      image: onm:1.0
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: logs
+          mountPath: /app/logs
