@@ -123,11 +123,11 @@ kubectl get pods -n ndt
 
 Expected pods:
 ```
-pod-on        1/1   Running
-pod-onm       1/1   Running
-pod-dtm       1/1   Running
-exp1-ndt-1    2/2   Running   (ndt + dtm-agent)
-exp1-ndt-2    2/2   Running   (ndt + dtm-agent)
+ndt-1     2/2     Running   (ndt + dtm-agent)
+ndt-2     2/2     Running   (ndt + dtm-agent)
+pod-dtm   1/1     Running   
+pod-on    1/1     Running   
+pod-onm   1/1     Running   
 ```
 
 The script prints the ONM command at the end with the correct `svc-on` IP:
@@ -140,12 +140,21 @@ kubectl exec -it pod-onm -n ndt -- python3 onm.py \
     --log-file /tmp/onm.log
 ```
 
-
-
-
-
-
 ## Running the Testbed
+### Federated mode (1:N)
+
+```bash
+cd federated
+
+# Launch testbed with N=2 NDTs
+./kubernetes/launch_testbed.sh --mode federated --fanout 2--mode federated --fanout 2
+
+# Check all pods are Running
+kubectl get pods -n ndt
+```
+
+
+
 After completing the set-up process, the testbed is ready to run. We have thought in two experiments. 
 - Experiment 1 (Ready to test): Intended to test the synchronization from the ON to the N NDTs. Therefore, the ONM will receive a modification command, the ONM will apply this in the ON mininet and after that i will forward the modification to the DTM which will forward the command and apply it to the NDTs.
 - Experiment 2 (***Under development***): Intended to demonstrate the DTM coordination whn receiving updates from the NDTs and requires to arrange them to forward them properly to the ONM.
