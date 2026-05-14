@@ -1,0 +1,9 @@
+{
+  "description": "3-LAN topology",
+  "backbone": {"nat_ip": "10.0.0.254/24"},
+  "lans": [
+    {"id": 1, "subnet": "192.168.10", "hosts": 2},
+    {"id": 2, "subnet": "192.168.20", "hosts": 2},
+    {"id": 3, "subnet": "192.168.30", "hosts": 2}
+  ]
+}

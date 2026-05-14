@@ -12,9 +12,6 @@ spec:
       configMap:
         name: on-ndt-script
         defaultMode: 493
-    - name: topology-config
-      configMap:
-        name: topology-config
     - name: run-data
       hostPath:
         path: /tmp/ndt-run
@@ -25,13 +22,11 @@ spec:
       imagePullPolicy: Never
       securityContext:
         privileged: true
+      args: ["--role", "on", "--bare-metal", "--topo-file", "/run/topology_config.json"]
       volumeMounts:
         - name: on-ndt-script
           mountPath: /app/on_ndt.py
           subPath: on_ndt.py
-        - name: topology-config
-          mountPath: /app/topology_config.json
-          subPath: topology.json
         - name: run-data
           mountPath: /run
 ---

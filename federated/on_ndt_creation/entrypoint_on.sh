@@ -52,4 +52,4 @@ done
 exec python3 /app/on_ndt.py \
     --role on \
     --bare-metal \
-    --topo-file /app/topology_config.json
+    --topo-file /run/topology_config.json

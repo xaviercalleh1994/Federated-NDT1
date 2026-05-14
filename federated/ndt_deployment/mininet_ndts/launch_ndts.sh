@@ -45,7 +45,7 @@ NDT_INTERNAL_PORT=8001
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE="ndt-mininet:1.0"
-PREFIX="exp1-ndt"
+PREFIX="ndt"
 NAMESPACE="ndt"
 MANIFEST_DIR="${SCRIPT_DIR}/manifests/current"
 LOG_DIR="${SCRIPT_DIR}/logs/current"

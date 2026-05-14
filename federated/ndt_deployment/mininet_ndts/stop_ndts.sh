@@ -26,7 +26,7 @@ set -euo pipefail
 
 LOG_DST=${1:-""}
 NAMESPACE="ndt"
-PREFIX="exp1-ndt"
+PREFIX="ndt"
 
 # ── Save logs if destination provided ───────────────────────
 if [ -n "${LOG_DST}" ]; then

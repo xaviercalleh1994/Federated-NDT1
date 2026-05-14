@@ -58,5 +58,5 @@ done
 exec python3 /app/on_ndt.py \
     --role ndt \
     --bare-metal \
-    --topo-file /app/topology_config.json \
+    --topo-file /run/topology_config.json \
     --controller-port "${CTRL_PORT}"

@@ -42,6 +42,8 @@ COPY on_events_gen.py .
 COPY onm_commands.txt .
 COPY send_events.sh .
 COPY sned_events_mass.sh .
+COPY 2lan.json .
+COPY 3lan.json .
 
 RUN chmod +x send_events.sh sned_events_mass.sh
 

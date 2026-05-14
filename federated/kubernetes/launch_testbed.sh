@@ -102,7 +102,10 @@ kubectl create configmap on-ndt-script \
     --namespace="${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl create configmap topology-config \
+# Reset topology to default before launch
+    sudo cp "${REPO_ROOT}/topology.json" /tmp/ndt-run/topology_config.json
+
+    kubectl create configmap topology-config \
     --from-file=topology.json="${REPO_ROOT}/topology.json" \
     --namespace="${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -

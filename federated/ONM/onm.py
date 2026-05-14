@@ -351,7 +351,7 @@ def apply_topology_update(
             return False
         print("[ONM] ON Mininet reloading...")
         # Wait for topology.json to be re-exported
-        for _ in range(30):
+        for _ in range(90):
             time.sleep(1)
             try:
                 with open(TOPO_FILE) as f:
