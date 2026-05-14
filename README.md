@@ -1,5 +1,26 @@
 # Federated NDT Framework
-This framework is implemented to function as a Proof-of-Concept (PoC) for a novel conceptualization of Network Digital Ttwins (NDTs), which is the federation of multiple NDT instances, as proposed by both authors: Xavier Calle-Heredia and Xavier Hesselbach.
+This framework is a Proof-of-Concept (PoC) for the federation of multiple Network Digital Twin (NDT) instances, as proposed by Xavier Calle-Heredia and Xavier Hesselbach (UPC).
+
+## Overview
+The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. The framework relies in two manager entities: the Original Network Manager (ONM) and the Digital Twin Manager (DTM).
+
+- The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
+- The DTM is the main entity of the system and is in charge of the synchronization of the NDTs. The DTM is decompossed in two agents: the DTM Core is a centralized agent that receives and distribute ON events. While the DTM distributed agents are in charge of implementing each ON event into the NDT.
+
+The architecture of the testbed is seen next:
+
+![Framework_architecture](Images/PoC_fed_arch.png)
+
+
+
+
+
+
+
+
+
+
+
 
 ## Overview
 The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. By means of a centralized manager entity, defined as the Digital Twin Manager, it is possible to coordinate the N NDT replicas deployed. 
