@@ -13,7 +13,8 @@
 #   pod-dtm-ndt : NDT (Mininet) + DTM agent
 #
 # Mode federated:
-#   pod-on-onm  : ON (Mininet) + ONM
+#   pod-on      : ON (Mininet)
+#   pod-onm     : ONM
 #   pod-dtm     : DTM core
 #   exp1-ndt-i  : NDT (Mininet) + DTM agent  (x N)
 #
@@ -21,7 +22,8 @@
 #   ./launch_testbed.sh --mode 1:1
 #   ./launch_testbed.sh --mode federated --fanout N
 #   ./launch_testbed.sh --mode federated --fanout N \
-#                       --base-port 30001 --proto udp --ack-port 9000
+#                       --base-port 30001 --proto udp --ack-port 9000 \
+#                       --dtm-log /run/dtm.log
 # ============================================================
 
 set -euo pipefail
@@ -32,6 +34,7 @@ FANOUT=2
 BASE_PORT=30001
 PROTO="udp"
 ACK_PORT=9000
+DTM_LOG="/dev/stderr"
 
 # ── Parse arguments ──────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -41,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         --base-port)  BASE_PORT="$2"; shift 2 ;;
         --proto)      PROTO="$2";     shift 2 ;;
         --ack-port)   ACK_PORT="$2";  shift 2 ;;
+        --dtm-log)    DTM_LOG="$2";   shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -48,7 +52,7 @@ done
 if [ -z "${MODE}" ]; then
     echo "Usage: ./launch_testbed.sh --mode 1:1|federated [--fanout N]"
     echo "                           [--base-port PORT] [--proto udp|tcp]"
-    echo "                           [--ack-port PORT]"
+    echo "                           [--ack-port PORT] [--dtm-log PATH]"
     exit 1
 fi
 
@@ -71,6 +75,7 @@ echo "   Node IP  : ${NODE_IP}"
 [ "${MODE}" = "federated" ] && \
     echo "   NDTs     : ${FANOUT} (ports ${BASE_PORT}–$(( BASE_PORT + FANOUT - 1 )))"
 echo "   Protocol : ${PROTO}"
+echo "   DTM log  : ${DTM_LOG}"
 echo "=============================================="
 echo ""
 
@@ -103,25 +108,23 @@ kubectl create configmap on-ndt-script \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # Reset topology to default before launch
-    sudo cp "${REPO_ROOT}/topology.json" /tmp/ndt-run/topology_config.json
+sudo cp "${REPO_ROOT}/topology.json" /tmp/ndt-run/topology_config.json
 
-    kubectl create configmap topology-config \
+kubectl create configmap topology-config \
     --from-file=topology.json="${REPO_ROOT}/topology.json" \
     --namespace="${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
 echo "  ConfigMaps synced."
 
-# ── Pod ON-ONM ───────────────────────────────────────────────
+# ── Pod ON ───────────────────────────────────────────────────
 echo "[3/4] Launching ON + ONM..."
 
-# Delete old pods
 kubectl delete pod pod-on pod-onm pod-on-onm -n "${NAMESPACE}" \
     --ignore-not-found --grace-period=0 --force > /dev/null 2>&1 || true
 kubectl delete service svc-on -n "${NAMESPACE}" \
     --ignore-not-found > /dev/null 2>&1 || true
 
-# Launch ON Pod
 kubectl apply -f "${SCRIPT_DIR}/on-pod.yaml"
 
 echo "  Waiting for ON Mininet..."
@@ -142,12 +145,10 @@ until kubectl logs pod-on -n "${NAMESPACE}" 2>/dev/null | \
 done
 echo "  ON ready (${elapsed}s)"
 
-# Get ON Pod IP
 ON_POD_IP=$(kubectl get pod pod-on -n "${NAMESPACE}" \
     -o jsonpath='{.status.podIP}' 2>/dev/null || echo "127.0.0.1")
 echo "  ON Pod IP: ${ON_POD_IP}"
 
-# Launch ONM Pod (hostNetwork: true — can reach DTM on 127.0.0.1)
 kubectl apply -f "${SCRIPT_DIR}/onm-pod.yaml"
 echo "  ONM ready."
 
@@ -156,7 +157,6 @@ echo "[4/4] Launching DTM..."
 
 if [ "${MODE}" = "1:1" ]; then
 
-    # ── Mode 1:1 — DTM agent + NDT in same Pod ───────────────
     kubectl delete pod pod-dtm-ndt -n "${NAMESPACE}" \
         --ignore-not-found --grace-period=0 --force > /dev/null 2>&1 || true
     kubectl delete service svc-dtm -n "${NAMESPACE}" \
@@ -183,7 +183,6 @@ if [ "${MODE}" = "1:1" ]; then
 
 else
 
-    # ── Mode federated — DTM core + N NDT Pods ───────────────
     kubectl delete pod pod-dtm -n "${NAMESPACE}" \
         --ignore-not-found --grace-period=0 --force > /dev/null 2>&1 || true
     kubectl delete service svc-dtm -n "${NAMESPACE}" \
@@ -202,8 +201,10 @@ spec:
   restartPolicy: Never
   hostNetwork: true
   volumes:
-    - name: logs
-      emptyDir: {}
+    - name: run-data
+      hostPath:
+        path: /tmp/ndt-run
+        type: DirectoryOrCreate
   containers:
     - name: dtm
       image: dtm:1.0
@@ -230,10 +231,10 @@ spec:
         - "--experiment-duration"
         - "0"
         - "--log-file"
-        - "/dev/stderr"
+        - "${DTM_LOG}"
       volumeMounts:
-        - name: logs
-          mountPath: /app/logs
+        - name: run-data
+          mountPath: /run
 EOF
 
     echo "  DTM core launched."
@@ -259,6 +260,12 @@ echo "      --relay-port 7001 --relay-kind router \\"
 echo "      --on-ip ${ON_POD_IP} \\"
 echo "      --log-file /tmp/onm.log"
 echo ""
+echo "ONM automated injection:"
+echo "  kubectl exec -i pod-onm -n ${NAMESPACE} -- bash -c \\"
+echo "      'python3 /app/on_events_gen.py --file /app/onm_commands.txt --rate 0.5 --duration 60 | \\"
+echo "       python3 /app/onm.py --proto ${PROTO} --relay-ip 127.0.0.1 \\"
+echo "       --relay-port 7001 --relay-kind router --on-ip ${ON_POD_IP} --log-file /tmp/onm.log'"
+echo ""
 echo "Access ON Mininet:"
 echo "  kubectl exec -it pod-on -n ${NAMESPACE} -- bash"
 echo ""
@@ -268,4 +275,4 @@ if [ "${MODE}" = "1:1" ]; then
     echo ""
 fi
 echo "Stop testbed:"
-echo "  ./stop_testbed.sh [./logs/run1]"
+echo "  ./stop_testbed.sh"

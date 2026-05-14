@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ndt-9
+  namespace: ndt
+  labels:
+    app: ndt-exp1
+    ndt-index: "9"
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: on-ndt-script
+      configMap:
+        name: on-ndt-script
+        defaultMode: 493
+    - name: topology-config
+      configMap:
+        name: topology-config
+    - name: run-data
+      emptyDir: {}    # shared /run between ndt and dtm-agent
+  containers:
+    - name: ndt
+      image: ndt-mininet:1.0
+      imagePullPolicy: Never
+      securityContext:
+        privileged: true
+      env:
+        - name: NDT_PORT
+          value: "8001"
+        - name: NDT_PROTO
+          value: "udp"
+        - name: CTRL_PORT
+          value: "6661"
+      ports:
+        - containerPort: 8001
+          protocol: UDP
+        - containerPort: 8001
+          protocol: TCP
+      volumeMounts:
+        - name: on-ndt-script
+          mountPath: /app/on_ndt.py
+          subPath: on_ndt.py
+        - name: topology-config
+          mountPath: /app/topology_config.json
+          subPath: topology.json
+        - name: run-data
+          mountPath: /run
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+
+    # DTM distributed agent — receives events from DTM core,
+    # applies them on local NDT via localhost:6001 (on_ndt.py)
+    - name: dtm-agent
+      image: dtm:1.0
+      imagePullPolicy: Never
+      args:
+        - "--proto"
+        - "udp"
+        - "--relay-ip"
+        - "0.0.0.0"
+        - "--relay-port"
+        - "8001"
+        - "--mode"
+        - "agent"
+        - "--dtm-ip"
+        - "10.4.47.50"
+        - "--ack-port"
+        - "9000"
+        - "--log-file"
+        - "/tmp/agent.log"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-ndt-9
+  namespace: ndt
+  labels:
+    app: ndt-exp1
+    ndt-index: "9"
+spec:
+  type: NodePort
+  selector:
+    app: ndt-exp1
+    ndt-index: "9"
+  ports:
+    - name: ndt-udp
+      protocol: UDP
+      port: 8001
+      targetPort: 8001
+      nodePort: 30009
