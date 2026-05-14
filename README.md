@@ -5,7 +5,7 @@ The proposed federation of multiple NDTs is a novel topic that is envisioned as
 
 ## Overview
 Currently, the framework is provided with two operational configurations: 
-- The federated Mode (1:N): 
+- The federated Mode (1:N) (***Under development and testing***): 
     The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. The framework relies in two manager entities: the Original Network Manager (ONM) and the Digital Twin Manager (DTM).
 
     - The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
@@ -20,6 +20,9 @@ The framework relies in a Kubernetes architecture to support the deployment of e
 - DTM (core)
 - ON
 - NDTs (includes two containers: the NDT and the DTM distributed agent)
+
+The ON as well as the NDTs are created from [topology](federated/topology.json) json file. The current topology is shown next:
+![net_arch](Images/mininet_net.png)
 
 
 ## Requirements
@@ -98,103 +101,49 @@ sudo nerdctl --namespace k8s.io build -t onm:1.0         ONM/
 sudo nerdctl --namespace k8s.io build -t on-mininet:1.0  on_ndt_creation/
 sudo nerdctl --namespace k8s.io build -t ndt-mininet:1.0 ndt_deployment/mininet_ndts/
 ```
+### 2. Verify images
 
-
-
-## Overview
-The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. By means of a centralized manager entity, defined as the Digital Twin Manager, it is possible to coordinate the N NDT replicas deployed. 
-
-To deploy the ON as well as the NDT replicas, a python script is used. This script creates a simple Mininet network containing 2 LANs as it can be appreciated next:
-![net_arch](Images/mininet_net.png)
-
-In addition to the main DTM, the PoC relies in a complementary entuty named as Original Network Manager (ONM). The ONM allows to introduce network modifications to the ON; after apply those modifications, the ONM forwards the same modification command to the DTM in order to achieve synchronization between the ON and the N NDTs. Next, an overview of the PoC can be seen:
-![1:N_mode](Images/PoC_fed.png) 
-
-In this current version, the framework runs in two different computers. Our current conditions are:
-- ***PC1*** (Windows laptop) hosts three Virtual Machines (VMs) to support the ONM, DTM and a router node to emulate a communication channel between both managers. All VMs use Linux Mint 22.3.
-- On the other hand, ***PC2*** supports the deployment of the N NDTs based on Docker containers. This PC uses Linux Mint 22.3.
-It is important to guarantee that both PCs are conencted to same network to facilitate the communication between VMs and containers. 
-
-***Note:*** In this current version, the ON as well as the N NDTs are required to be run sepparately, i.e. In ***PC1*** on the corresponding ON VM, as well as in ***PC2***.
-
-Additionally, The PoC can run under two different execution modes: normal (1:1) and federated (1:N). 
-
-- 1:1 Mode (***Under development and testing***): In this operation mode, the ONM is used as the input interface to modify the ON mininet with actions such a: "set r1 r2 down 0 0 1000", "set r1 r2 up 50 1 10", "exec r1 "ip route add 10.20.30.40 via 10.0.0.254"", "exec r1 "ip route del 10.20.30.40 via 10.0.0.254"". The ONM applies these modifications in the ON and then transmits the command to the DTM vis the relay node. The DTM receives the ON modification and applies locally the modification (the NDT mininet need to run). ***The 1:1 mode will be further analyzed to test the integration of XR services in the NDT approached supported by Kubernetes***. In 1:1 mode, the architecture may look like this:
-![1:1_Mode](Images/Poc_11.png)
-
-
-- 1:N Mode: in this mode, the ONM operates as in the 1:1; however, the DTM, doesn't require the NDT mininet running. Therefore, the DTM just forwards the ON commands to N NDTs while it receives and coordinates the NDT's generated events to transmit them coordinated to the ONM.
-
-
-## Preparing the environment
-
-### PC1:
-Let's start with the configuration of Virtual Machines in PC1. Three independent VMs are required with next networking configuration:
-
-1. VM ON
-    - Bridge: enp0s3
-    - Internal Network (ON) enp0s8: 172.16.1.2/30
-
-2. VM DTM
-    - Bridge: enp0s3
-    - Internal Network(DT) enp0s8: 172.16.2.2/30
-    - Internal Network(s8s) enp0s8: 192.168.99.X -> ***OPTIONAL***: For future XR services integration based on Kubernetes
-
-3. Relay: VM router
-    - Bridge: enp0s3
-    - Internal Network (ON) enp0s8: 172.16.1.1/30
-    - Internal Network (DT) enp0s9: 172.16.2.1/30  
-
-For configuring the VMs, follow this tutorial: [config_guide](federated/VBox_VMs_config/configuration.md)
-
-It is recommended to create a dedicated directory in each VM:
 ```bash
-mkdir /home/ubuntu/federated
+sudo crictl images | grep -E "dtm|onm|mininet"
 ```
 
-Then, copy the scripts to each VM:
+## Running the Testbed
 
-1. VM ON:
-   - [ONM files](federated/ONM/)
-   - [ON-NDT deployment](federated/on_ndt_creation)
+### Federated mode (1:N)
 
-2. VM DTM:
-   - [DTM](federated/DTM)
-   - [ON-NDT deployment](federated/on_ndt_creation)
-
-3. VM Router:
-    - [Router](federated/relay)
-
-### PC2:
-Following the installation in PC2. Docker must be installed. In case Docker is missing you can install it as follows:
 ```bash
-sudo apt update
-sudo apt install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-    -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
+cd federated/kubernetes
 
-echo "deb [arch=$(dpkg --print-architecture) \
-    signed-by=/etc/apt/keyrings/docker.asc] \
-    https://download.docker.com/linux/ubuntu noble stable" | \
-    sudo tee /etc/apt/sources.list.d/docker.list
+# Launch testbed with N=2 NDTs
+./launch_testbed.sh --mode federated --fanout 2
 
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io
-sudo usermod -aG docker $USER
-newgrp docker
+# Check all pods are Running
+kubectl get pods -n ndt
 ```
 
-It is recommended to create a dedicated directory:
-```bash
-mkdir /home/ubuntu/federated
+Expected pods:
+```
+pod-on        1/1   Running
+pod-onm       1/1   Running
+pod-dtm       1/1   Running
+exp1-ndt-1    2/2   Running   (ndt + dtm-agent)
+exp1-ndt-2    2/2   Running   (ndt + dtm-agent)
 ```
 
-In this directory, you can copy these files: [mininet-NDTs](federated/ndt_deployment/mininet_ndts). This directory contains the Dockerfile to create the image with mininet and all required components that is invoked to create each NDT container. In addition, it is required to copy the script to launch the mininet network: [on-ndt-deployment](federated/on_ndt_creation/on_ndt.py). Finally, the Docker image can be built:
+The script prints the ONM command at the end with the correct `svc-on` IP:
+
 ```bash
-docker build -t ndt-mininet .
+kubectl exec -it pod-onm -n ndt -- python3 onm.py \
+    --proto udp --relay-ip 127.0.0.1 \
+    --relay-port 7001 --relay-kind router \
+    --on-ip <SVC_ON_IP> \
+    --log-file /tmp/onm.log
 ```
+
+
+
+
+
 
 ## Running the Testbed
 After completing the set-up process, the testbed is ready to run. We have thought in two experiments. 
