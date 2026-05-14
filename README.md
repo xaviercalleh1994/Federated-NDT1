@@ -296,7 +296,11 @@ Expected output for each:
 To verify connectivity in the new LAN 3 (from inside the ON or any NDT pod):
 ```bash
 mnexec -a $(pgrep -f "mininet:h3_1") ping -c 3 8.8.8.8
-
+PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
+64 bytes from 8.8.8.8: icmp_seq=1 ttl=113 time=15.2 ms
+64 bytes from 8.8.8.8: icmp_seq=2 ttl=113 time=10.9 ms
+64 bytes from 8.8.8.8: icmp_seq=3 ttl=113 time=11.4 ms
+```
 
 
 
