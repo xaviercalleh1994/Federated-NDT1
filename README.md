@@ -1,5 +1,7 @@
 # Federated NDT Framework
-This framework is a Proof-of-Concept (PoC) for the federation of multiple Network Digital Twin (NDT) instances, as proposed by Xavier Calle-Heredia and Xavier Hesselbach (UPC).
+This framework is a Proof-of-Concept (PoC) for the federation of multiple Network Digital Twin (NDT) instances, as proposed by Xavier Calle-Heredia and Xavier Hesselbach (UPC). 
+
+The proposed federation of multiple NDTs is a novel topic that is envisioned as 
 
 ## Overview
 The framework considers an existing network deployed with Mininet technology, defined as Original Network (ON), which emulates a simple existing network. With this framework it is possible to deploy multiple Mininet replicas of the ON. The framework relies in two manager entities: the Original Network Manager (ONM) and the Digital Twin Manager (DTM).
@@ -11,9 +13,74 @@ The architecture of the testbed is seen next:
 
 ![Framework_architecture](Images/PoC_fed_arch.png)
 
+Currently, the framework is provided with two operational configurations: 
+- A conventional mode (1:1): this is the currently analyzed configuration in the literature and considers a sinlge NDT instance derived from an ON. This mode will be further analyzed for the inclusion of Extended Reality (XR) services.
+- The federated Mode (1:N): The mode seen in previous image.
 
 
+## Requirements
 
+### Single machine (v1.6 — Kubernetes)
+
+| Component | Version |
+|-----------|---------|
+| Linux | Ubuntu 24.04 / Linux Mint 22.3 |
+| Kubernetes | v1.34+ |
+| containerd | v2.1+ |
+| Calico CNI | any |
+| Docker | 24+ (for building images) |
+| Python | 3.10+ |
+| Open vSwitch | 3.x |
+| Mininet | 2.3+ |
+
+Python dependencies (see `requirements.txt`):
+- `orjson` — fast JSON serialization in DTM
+- `mininet` — network emulation (inside containers)
+
+---
+
+## Repository Structure
+
+```
+federated-ndt-framework/
+└── federated/
+    ├── DTM/
+    │   ├── dtm.py                  DTM core + distributed agent
+    │   └── Dockerfile
+    ├── ONM/
+    │   ├── onm.py                  ONM logic + CLI
+    │   ├── on_events_gen.py        Automated event injector
+    │   ├── onm_commands.txt        Default command set
+    │   ├── send_events.sh
+    │   └── Dockerfile
+    ├── on_ndt_creation/
+    │   ├── on_ndt.py               Mininet keeper (ON + NDT roles)
+    │   ├── Dockerfile
+    │   └── entrypoint_on.sh
+    ├── ndt_deployment/
+    │   ├── mininet_ndts/
+    │   │   ├── Dockerfile
+    │   │   ├── entrypoint.sh
+    │   │   ├── launch_ndts.sh
+    │   │   └── stop_ndts.sh
+    │   └── simulated_ndts/
+    │       ├── ndt_gen.py          NDT simulator (Exp. 2)
+    │       └── Dockerfile
+    ├── topology.json               Default 2-LAN topology
+    ├── kubernetes/
+    │   ├── namespace.yaml
+    │   ├── on-pod.yaml             Pod ON + Service svc-on
+    │   ├── onm-pod.yaml            Pod ONM (hostNetwork)
+    │   ├── dtm-pod.yaml            Pod DTM core (hostNetwork, federated)
+    │   ├── dtm-ndt-pod.yaml        Pod DTM+NDT (1:1 mode)
+    │   ├── launch_testbed.sh       Full testbed launcher
+    │   └── stop_testbed.sh         Full testbed stopper
+    └── analysis/
+        ├── experiment_1.py
+        └── experiment_2.py
+```
+
+---
 
 
 
