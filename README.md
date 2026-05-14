@@ -302,193 +302,99 @@ PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
 64 bytes from 8.8.8.8: icmp_seq=3 ttl=113 time=11.4 ms
 ```
 
+---
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-## Running the Testbed
-### Federated mode (1:N)
-
+## Experiment 1 — Synchronization Metrics vs Federation Size
+ 
+Experiment 1 measures two metrics as a function of the number of NDTs (N):
+ 
+- **L_dispatch** — time for the DTM to fan out one event to all N NDTs (ms)
+- **T_conv** — convergence spread: difference between the first and last NDT to apply the event (ms)
+Both metrics are reported as mean ± 95% confidence interval across 5 runs.
+ 
+### Running the automated experiment
+ 
+The script `run_experiment1.sh` fully automates the experiment. For each value of N in `{1, 2, 4, 8, 16, 32, 64}` it launches the testbed, injects events via `on_events_gen.py`, collects the DTM log, and stops the testbed. This is repeated 5 times.
+ 
 ```bash
-cd federated
-
-# Launch testbed with N=2 NDTs
-./kubernetes/launch_testbed.sh --mode federated --fanout 2--mode federated --fanout 2
-
-# Check all pods are Running
-kubectl get pods -n ndt
+cd federated/kubernetes
+./run_experiment1.sh
+```
+ 
+By default the experiment uses `rate=0.5 ev/s` and `duration=60s` per run (30 events per run). To use more events for more robust statistics:
+ 
+```bash
+./run_experiment1.sh --runs 5 --rate 2 --duration 120 --out /tmp/exp1
+```
+ 
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--runs` | 5 | Number of runs per N value |
+| `--rate` | 0.5 | Event injection rate (ev/s) |
+| `--duration` | 60 | Duration per run (seconds) |
+| `--out` | `/tmp/exp1` | Output directory for logs |
+ 
+The estimated total duration with defaults is approximately 75–90 minutes (35 testbed launches × ~100–150s each). For a quick validation run before the full experiment:
+ 
+```bash
+./run_experiment1.sh --runs 1 --duration 20
+```
+ 
+Results are saved with the following structure:
+```
+/tmp/exp1/
+  run1/
+    1to1/dtm.log
+    1to2/dtm.log
+    1to4/dtm.log
+    1to8/dtm.log
+    1to16/dtm.log
+    1to32/dtm.log
+    1to64/dtm.log
+  run2/
+    ...
+  run5/
+    ...
+```
+ 
+### Analysing the results
+ 
+Once all runs are complete, run the analysis script:
+ 
+```bash
+pip install numpy pandas matplotlib scipy tabulate --break-system-packages
+ 
+python3 federated/analysis/experiment_1.py \
+    --logs /tmp/exp1 \
+    --out  /tmp/exp1/results
+```
+ 
+This produces:
+ 
+| Output file | Description |
+|-------------|-------------|
+| `fig1_l_dispatch_vs_ndts.pdf` | L_dispatch mean and P95 vs N with 95% CI |
+| `fig2_t_conv_vs_ndts.pdf` | T_conv mean and P95 vs N with 95% CI |
+| `fig3_f_sync_vs_ndts.pdf` | Sync fidelity (%) vs N |
+| `exp1_metrics_runs.csv` | Raw per-run data |
+| `exp1_metrics_aggregated.csv` | Aggregated mean ± CI per N |
+ 
+A summary table is also printed to the terminal:
+ 
+```
+======================================================================
+ EXPERIMENT 1 — SYNCHRONIZATION METRICS (mean ± 95% CI)
+======================================================================
+ NDTs | runs | L_disp mean (ms) | T_conv mean (ms) | F_sync (%)
+------+------+------------------+------------------+-----------
+    1 |    5 | 0.18 ±0.01       | 0.00             | 100.00
+    2 |    5 | 0.25 ±0.02       | 1.23 ±0.15       | 100.00
+    4 |    5 | 0.31 ±0.03       | 2.87 ±0.22       | 100.00
+   ...
 ```
 
 
 
-After completing the set-up process, the testbed is ready to run. We have thought in two experiments. 
-- Experiment 1 (Ready to test): Intended to test the synchronization from the ON to the N NDTs. Therefore, the ONM will receive a modification command, the ONM will apply this in the ON mininet and after that i will forward the modification to the DTM which will forward the command and apply it to the NDTs.
-- Experiment 2 (***Under development***): Intended to demonstrate the DTM coordination whn receiving updates from the NDTs and requires to arrange them to forward them properly to the ONM.
-
-Therefore, we will focus just in Experiment 1. The order to run the experiment is:
-### 1. Run the N NDTs (PC2):
-```bash
-./launch_ndts.sh <number of NDTs> <DTMs IP Address> <listening port> udp <ACK port> 
-# For instantce:
-./launch_ndts.sh 8 10.4.47.53 8001 udp 9000
-# Wait until all NDTs are ready.
-# You can check with:
-docker ps
-```
-![ndts_ready](Images/ndts_ready.png)
-
-### 2. Run the router VM
-```bash
-python3 relay.py --proto udp --port 7001
-```
-
-### 3. Run the ON (PC1-VM ON)
-```bash
-sudo python3 on_ndt.py --role on
-```
-![ON-mininet](Images/on_mininet.png)
-
-### 4. Run the DTM (PC1-VM DTM)
-Before running, it is required to install some python dependencies to properly run the DTM and then, gather the latency metrics. 
-Before running the DTM for the first time you can create a virtual environment and install dependecies:
-```bash
-chmod +x install_dependencies.sh 
-./install_dependencies.sh 
-```
-
-Once the script has concluded the virtual environment is ready and you can start the DTM. If you want to use the DTM again, you just need to activate the virtual environment:
-```bash
-source venv/bin/activate
-```
-
-```bash
-python3 dtm.py \
-    --proto udp \
-    --relay-ip 172.16.2.1 \
-    --relay-port 7001 \
-    --mode federated \
-    --fanout <Number of NDTs> \
-    --dst-ip <PC2 ip address> \
-    --base-port <NDTs listenning port> \
-    --feedback-port <ACKs receiving port> \
-    --experiment-duration <Duration time in seconds> \
-    --log-file /home/ubuntu/exp1/run1/1to1/dtm.log
-
-# For instance:
-python3 dtm.py \
-    --proto udp \
-    --relay-ip 172.16.2.1 \
-    --relay-port 7001 \
-    --mode federated \
-    --fanout 1 \
-    --dst-ip 10.4.47.50 \
-    --base-port 8001 \
-    --feedback-port 9000 \
-    --experiment-duration 150 \
-    --log-file /home/ubuntu/exp1/run1/1to1/dtm.log
-```
-![DTM_run](Images/dtm_run.png)
-
-We recommend to save dtm log files in an appropriate folde structure similar as the one shown next where 1toX will store the dtm log of the experiment with X NDTs deployed. This will facilitate gathering the federation metrics.
-
-- exp1/
-    - run1/
-        - 1to1/
-            - dtm.log
-        - 1to8/
-            - dtm.log
-        - 1to16/
-        - 1to64/
-    - run2/
-        - 1to1/
-        - 1to64/
-    - run3/
-    - run4/
-    - run5/
-
-### 5. Run the ONM (PC1-VM ON)
-The ONM can be run as follows:
-```bash
-python3 onm.py \
-    --proto udp \
-    --relay-ip 172.16.1.1 \
-    --relay-port 7001 \
-    --relay-kind router
-```
-
-![ONM_cli](Images/onm_cli.png)
-
-Then, you can manually introduce a command from [ON-commands](federated/ONM/onm_commands.txt) (Just copy and paste). 
-
-In order to automate the experiment, we have prepared a script to automatically send the commands each 2 seconds (a safe time to allow each NDT to apply the modification). Therefore, we recommend to run the ONM like this:
-```bash
-./send_events.sh | python3 onm.py \
-    --proto udp \
-    --relay-ip 172.16.1.1 \
-    --relay-port 7001 \
-    --relay-kind router
-```
-
-You can check that the synchronization is actually working (Running the ON in manual mode, i.e. without send_events.sh). To do so, you can send an ON command and then access to any NDT container as follows:
-```bash
-# In VM ON in ONM console down the link between r1 and r2 nodes:
-set r1 r2 down 0 0 1000
-
-# in PC2:
-mnexec -a $(pgrep -f "mininet:r1") ping 10.0.0.2
-# you should notice that r2 is unreachable from r1. 
-# You can bring the link up again from the ONM and re-test.
-```
-![ping_test](Images/ping_test_ndt.png)
-
-
-### Gather metrics
-Metrics that can be retrieved are related with the synchronization latencies due to federation. To gather the metrics use the script [exp-1-analysis](federated/analysis/experiment_1.py):
-```bash
-python3 experiment_1.py \
-    --logs /home/ubuntu/exp1/ \
-    --out  /home/ubuntu/exp1/results/
-```
-
-## License
-This project is licensed under the GNU General Public License v3.0.
-See the [LICENSE](LICENSE) file for details.
-
-# What is comming in the future?
-## Further Implementation of Experiment 2 (***Under development and testing***) and Experiment 3 (XR integration):
-
-## Set the host laptop in high efficiency mode:
-```bash
-# ON
-powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-# off
-powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e
-```
-
-## Start the Experiments
-### ONM
-To autoamte the ONM commands execution there are two supporting files: on_events_gen.py and onm_commands.txt.
-Arguments: 
-- file: contains the ON commands.
-- rate: rate in ev/second.
-- duration: experiment duration in seconds.
-- monck-on: flag to avoid the execution of the events in the ON
-- log-file: path where a supporting log is saved (optional)
-
-```bash
-python3 on_events_gen.py --file onm_commands.txt --rate <rate: events per second> --duration <experiment time> | python3 onm.py --proto tcp --relay-ip 172.16.1.1 --relay-port 7001 --relay-kind vps  --mock-on  --log-file /home/ubuntu/final_test/2core/1to64_tcp/onm.log
-```
 
 ### DTM:
 - 1:1 Mode:
