@@ -89,18 +89,52 @@ federated-ndt-framework/
 
 ---
 
+## Topology files
+ 
+Topology files define the Mininet network structure loaded by the ON and all NDTs. They are JSON files with the following format:
+ 
+```json
+{
+  "description": "2-LAN topology",
+  "backbone": {"nat_ip": "10.0.0.254/24"},
+  "lans": [
+    {"id": 1, "subnet": "192.168.10", "hosts": 2},
+    {"id": 2, "subnet": "192.168.20", "hosts": 2}
+  ]
+}
+```
+ 
+The default topology (`federated/topology.json`) is a 2-LAN topology. The ONM image includes two topology files available at runtime:
+- `/app/2lan.json` — 2-LAN topology (default, 2 routers, 4 hosts)
+- `/app/3lan.json` — 3-LAN topology (3 routers, 6 hosts)
+To add more topology files, copy them to `ONM/` before building the image — the Dockerfile copies all `.json` files from that directory into `/app/`.
+ 
+The topology is shared between the ON and all NDTs via a hostPath volume (`/tmp/ndt-run`) mounted at `/run` inside each pod. When the ONM writes a new topology, all pods read it from the same path.
+ 
+---
+
 
 ## Prepare the environment
-### 1. Build Docker images directly into containerd
-Using `nerdctl` builds images directly into the Kubernetes namespace
+### 1. Build Docker images and import into containerd
+ 
 ```bash
 cd federated-ndt-framework/federated
-
-sudo nerdctl --namespace k8s.io build -t dtm:1.0         DTM/
-sudo nerdctl --namespace k8s.io build -t onm:1.0         ONM/
-sudo nerdctl --namespace k8s.io build -t on-mininet:1.0  on_ndt_creation/
-sudo nerdctl --namespace k8s.io build -t ndt-mininet:1.0 ndt_deployment/mininet_ndts/
+ 
+docker build -t dtm:1.0         DTM/
+docker build -t onm:1.0         ONM/
+docker build -t on-mininet:1.0  on_ndt_creation/
+docker build -t ndt-mininet:1.0 ndt_deployment/mininet_ndts/
 ```
+ 
+Then import each image into containerd so Kubernetes can use them:
+ 
+```bash
+docker save dtm:1.0         | sudo ctr -n k8s.io images import -
+docker save onm:1.0         | sudo ctr -n k8s.io images import -
+docker save on-mininet:1.0  | sudo ctr -n k8s.io images import -
+docker save ndt-mininet:1.0 | sudo ctr -n k8s.io images import -
+```
+
 ### 2. Verify images
 
 ```bash
@@ -207,21 +241,15 @@ The ONM supports changing the network topology at runtime without restarting the
 6. All Mininet instances restart with the new topology.
 ### Topology files in the ONM pod
  
-Topology files must be present inside the ONM pod at `/app/`. The default image includes:
-- `/app/3lan.json` — 3-LAN topology (3 routers, 6 hosts)
-To add a custom topology file permanently, add it to `ONM/` before building the image. To add it temporarily (lost on pod restart):
+The ONM image includes two topology files at `/app/`:
+- `/app/2lan.json` — 2-LAN topology (default)
+- `/app/3lan.json` — 3-LAN topology
+To add a custom topology permanently, copy the JSON file to `ONM/` and rebuild the image:
  
 ```bash
-kubectl exec -it pod-onm -n ndt -- bash -c 'cat > /app/2lan.json << EOF
-{
-  "description": "2-LAN topology",
-  "backbone": {"nat_ip": "10.0.0.254/24"},
-  "lans": [
-    {"id": 1, "subnet": "192.168.10", "hosts": 2},
-    {"id": 2, "subnet": "192.168.20", "hosts": 2}
-  ]
-}
-EOF'
+cp my_topology.json federated/ONM/
+docker build -t onm:1.0 federated/ONM/
+docker save onm:1.0 | sudo ctr -n k8s.io images import -
 ```
  
 ### Applying a topology change
@@ -267,8 +295,8 @@ Expected output for each:
  
 To verify connectivity in the new LAN 3 (from inside the ON or any NDT pod):
 ```bash
-mnexec -a $(pgrep -f "mininet:h3_1") ping -c 3 192.168.30.12
-```
+mnexec -a $(pgrep -f "mininet:h3_1") ping -c 3 8.8.8.8
+
 
 
 
