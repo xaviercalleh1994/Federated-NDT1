@@ -143,64 +143,6 @@ You can use multiple windows to oversee the ON and each NDT and execute them:
 ```bash
 # Original network:
 kubectl exec -it pod-on -n ndt -- bash
-# Check current topology:
-cat /run/topology.json
-{
-  "nodes": [
-    "r_nat",
-    "r1",
-    "h1_1",
-    "h1_2",
-    "r2",
-    "h2_1",
-    "h2_2",
-    "s_core",
-    "s1",
-    "s2"
-  ],
-  "links": [
-    [
-      "r_nat",
-      "s_core"
-    ],
-    [
-      "r_nat",
-      "s_core"
-    ],
-    [
-      "r1",
-      "s1"
-    ],
-    [
-      "r1",
-      "s_core"
-    ],
-    [
-      "h1_1",
-      "s1"
-    ],
-    [
-      "h1_2",
-      "s1"
-    ],
-    [
-      "r2",
-      "s2"
-    ],
-    [
-      "r2",
-      "s_core"
-    ],
-    [
-      "h2_1",
-      "s2"
-    ],
-    [
-      "h2_2",
-      "s2"
-    ]
-  ]
-}
 ```
 
 ```bash
@@ -250,6 +192,97 @@ PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
 64 bytes from 10.0.0.2: icmp_seq=2 ttl=64 time=0.664 ms
 64 bytes from 10.0.0.2: icmp_seq=3 ttl=64 time=0.064 ms
 ```
+
+## Dynamic Topology Change
+ 
+The ONM supports changing the network topology at runtime without restarting the testbed. When a new topology is applied, the ON and all NDTs reload Mininet with the new configuration simultaneously.
+ 
+### How it works
+ 
+1. The ONM writes the new topology to `/run/topology_config.json` (shared hostPath volume).
+2. The ONM sends a `RELOAD` command to the ON via the control API.
+3. The ONM sends a `TOPOLOGY_UPDATE` event to the DTM core.
+4. The DTM core forwards the `TOPOLOGY_UPDATE` to each NDT's distributed agent.
+5. Each DTM agent writes the new topology to `/run/topology_config.json` and sends a `RELOAD` to its local NDT.
+6. All Mininet instances restart with the new topology.
+### Topology files in the ONM pod
+ 
+Topology files must be present inside the ONM pod at `/app/`. The default image includes:
+- `/app/3lan.json` — 3-LAN topology (3 routers, 6 hosts)
+To add a custom topology file permanently, add it to `ONM/` before building the image. To add it temporarily (lost on pod restart):
+ 
+```bash
+kubectl exec -it pod-onm -n ndt -- bash -c 'cat > /app/2lan.json << EOF
+{
+  "description": "2-LAN topology",
+  "backbone": {"nat_ip": "10.0.0.254/24"},
+  "lans": [
+    {"id": 1, "subnet": "192.168.10", "hosts": 2},
+    {"id": 2, "subnet": "192.168.20", "hosts": 2}
+  ]
+}
+EOF'
+```
+ 
+### Applying a topology change
+ 
+In the ONM CLI:
+```
+> topology /app/3lan.json
+[ONM] New topology saved to /run/topology_config.json
+[ONM] ON Mininet reloading...
+[ONM] ON reload complete (3 LANs ready)
+[ONM] TOPOLOGY_UPDATE sent to DTM (3 LANs)
+[ONM] Graph reloaded: 14 nodes
+```
+ 
+To revert to 2 LANs:
+```
+> topology /app/2lan.json
+```
+ 
+### Verifying the topology change
+ 
+After applying a new topology, verify that the ON and all NDTs reloaded correctly:
+ 
+```bash
+# ON — should show 3 LANs
+kubectl logs pod-on -n ndt --since=2m | grep -E "TOPO|LAN"
+ 
+# NDT-1 — should show 3 LANs
+kubectl logs ndt-1 -n ndt -c ndt --since=2m | grep -E "TOPO|LAN"
+ 
+# NDT-2 — should show 3 LANs
+kubectl logs ndt-2 -n ndt -c ndt --since=2m | grep -E "TOPO|LAN"
+```
+ 
+Expected output for each:
+```
+*** [TOPO] Loaded /run/topology_config.json — 3 LANs, 6 hosts
+*** LAN 1: 192.168.10.x, 2 hosts
+*** LAN 2: 192.168.20.x, 2 hosts
+*** LAN 3: 192.168.30.x, 2 hosts
+*** [TOPO] Exported topology to /run/topology.json
+```
+ 
+To verify connectivity in the new LAN 3 (from inside the ON or any NDT pod):
+```bash
+mnexec -a $(pgrep -f "mininet:h3_1") ping -c 3 192.168.30.12
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 ## Running the Testbed
