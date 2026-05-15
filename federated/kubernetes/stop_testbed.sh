@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Copyright (C) 2026 Xavier Calle-Heredia, Xavier Hesselbach
 # Universitat Politècnica de Catalunya (UPC)
 #
@@ -13,9 +12,7 @@
 #   ./stop_testbed.sh
 #   ./stop_testbed.sh ./logs/run1
 # ============================================================
-
 set -euo pipefail
-
 LOG_DST=${1:-""}
 NAMESPACE="ndt"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -25,7 +22,6 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 if [ -n "${LOG_DST}" ]; then
     mkdir -p "${LOG_DST}"
     echo "Saving logs to ${LOG_DST}..."
-
     for pod_container in \
         "pod-on-onm:on" \
         "pod-on-onm:onm" \
@@ -35,14 +31,13 @@ if [ -n "${LOG_DST}" ]; then
         pod="${pod_container%%:*}"
         container="${pod_container##*:}"
         if kubectl get pod "${pod}" -n "${NAMESPACE}" \
-           > /dev/null 2>&1; then
+            > /dev/null 2>&1; then
             kubectl logs "${pod}" -n "${NAMESPACE}" \
                 -c "${container}" \
                 > "${LOG_DST}/${pod}-${container}.log" 2>/dev/null || true
             echo "  ${pod}/${container} → ${LOG_DST}/${pod}-${container}.log"
         fi
     done
-
     # NDT pods (federated)
     NDTS=$(kubectl get pods -n "${NAMESPACE}" \
         --selector="app=ndt-exp1" \
@@ -61,7 +56,7 @@ fi
 
 # ── Stop NDT pods (federated mode) ───────────────────────────
 if kubectl get pods -n "${NAMESPACE}" \
-   --selector="app=ndt-exp1" --no-headers 2>/dev/null | grep -q .; then
+    --selector="app=ndt-exp1" --no-headers 2>/dev/null | grep -q .; then
     echo "Stopping NDT pods..."
     "${REPO_ROOT}/ndt_deployment/mininet_ndts/stop_ndts.sh"
 fi
@@ -79,5 +74,20 @@ done
 echo "Stopping services..."
 kubectl delete service svc-dtm svc-on -n "${NAMESPACE}" \
     --ignore-not-found > /dev/null 2>&1 || true
+# Delete all NDT services (svc-ndt-N)
+kubectl get services -n "${NAMESPACE}" --no-headers \
+    -o custom-columns=":metadata.name" 2>/dev/null \
+    | grep "^svc-ndt-" \
+    | xargs -r kubectl delete service -n "${NAMESPACE}" \
+    --ignore-not-found > /dev/null 2>&1 || true
+
+# ── Clean OVS stale pidfiles ──────────────────────────────────
+# These are left behind by OVS inside the pod's hostPath mount
+# and cause ovsdb-server to abort on the next run.
+echo "Cleaning stale OVS pidfiles..."
+sudo rm -f /var/run/openvswitch/*.pid \
+           /var/run/openvswitch/*.ctl \
+           /tmp/ndt-run/mininet.pid \
+           2>/dev/null || true
 
 echo "Done."

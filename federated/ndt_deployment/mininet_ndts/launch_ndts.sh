@@ -181,7 +181,7 @@ spec:
           mountPath: /run
       resources:
         requests:
-          memory: "256Mi"
+          memory: "512Mi"
           cpu: "250m"
         limits:
           memory: "512Mi"
