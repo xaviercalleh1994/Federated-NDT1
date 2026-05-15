@@ -113,9 +113,66 @@ def extract_ndts(folder_name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+# ── Resource metrics (from resources.log, optional) ─────────────────────────
+
+def compute_resource_metrics(res_path: Path) -> dict:
+    """
+    Parse resources.log and return peak CPU per component.
+    Uses max (peak during injection) instead of mean to capture
+    the actual resource pressure at the busiest moment.
+    """
+    nan = float("nan")
+    result = {
+        "CPU_dtm_core_peak_m":    nan,
+        "CPU_dtm_agent_peak_m":   nan,
+        "CPU_ndt_mininet_peak_m": nan,
+        "RAM_dtm_core_peak_mi":   nan,
+    }
+
+    if not res_path.exists():
+        return result
+
+    df = load_log(res_path)
+    if df.empty or "pod" not in df.columns:
+        return result
+
+    df["cpu_m"]  = pd.to_numeric(df.get("cpu_m",  0), errors="coerce").fillna(0)
+    df["mem_mi"] = pd.to_numeric(df.get("mem_mi", 0), errors="coerce").fillna(0)
+    has_container = "container" in df.columns
+
+    # DTM core peak
+    if has_container:
+        dtm_rows = df[(df["pod"] == "pod-dtm") & (df["container"] == "dtm")]
+    else:
+        dtm_rows = df[df["pod"] == "pod-dtm"]
+    if not dtm_rows.empty:
+        result["CPU_dtm_core_peak_m"]  = round(float(dtm_rows["cpu_m"].max()),  2)
+        result["RAM_dtm_core_peak_mi"] = round(float(dtm_rows["mem_mi"].max()), 2)
+
+    ndt_mask = df["pod"].str.match(r"ndt-\d+", na=False)
+
+    # DTM agents peak (sum per timestamp, then max over time)
+    if has_container:
+        agent_rows = df[ndt_mask & (df["container"] == "dtm-agent")]
+        ndt_rows   = df[ndt_mask & (df["container"] == "ndt")]
+    else:
+        agent_rows = df[ndt_mask]
+        ndt_rows   = pd.DataFrame()
+
+    if not agent_rows.empty:
+        result["CPU_dtm_agent_peak_m"] = round(
+            float(agent_rows.groupby("ts_ns")["cpu_m"].sum().max()), 2)
+
+    if not ndt_rows.empty:
+        result["CPU_ndt_mininet_peak_m"] = round(
+            float(ndt_rows.groupby("ts_ns")["cpu_m"].sum().max()), 2)
+
+    return result
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
-def compute_metrics(dtm_path: Path, n_ndts: int) -> Optional[dict]:
+def compute_metrics(dtm_path: Path, n_ndts: int, res_path: Optional[Path] = None) -> Optional[dict]:
     dtm = load_log(dtm_path)
     if dtm.empty or "tag" not in dtm.columns:
         return None
@@ -167,6 +224,13 @@ def compute_metrics(dtm_path: Path, n_ndts: int) -> Optional[dict]:
             apply_ms_mean = float(apply_vals.mean())
             apply_ms_p95  = float(apply_vals.quantile(0.95))
 
+    res = compute_resource_metrics(res_path) if res_path else {
+        "CPU_dtm_core_peak_m":    float("nan"),
+        "CPU_dtm_agent_peak_m":   float("nan"),
+        "CPU_ndt_mininet_peak_m": float("nan"),
+        "RAM_dtm_core_peak_mi":   float("nan"),
+    }
+
     return {
         "NDTs":               n_ndts,
         "L_dispatch_mean_ms": round(l_dispatch_mean, 3),
@@ -176,6 +240,7 @@ def compute_metrics(dtm_path: Path, n_ndts: int) -> Optional[dict]:
         "F_sync_pct":         round(f_sync,           2),
         "apply_ms_mean":      round(apply_ms_mean,    3),
         "apply_ms_p95":       round(apply_ms_p95,     3),
+        **res,
     }
 
 
@@ -202,7 +267,8 @@ def load_all_runs(logs_path: Path) -> pd.DataFrame:
             if not dtm_path.exists():
                 print(f"  [SKIP] {exp_dir}: no dtm.log")
                 continue
-            m = compute_metrics(dtm_path, n)
+            res_path = exp_dir / "resources.log"
+            m = compute_metrics(dtm_path, n, res_path if res_path.exists() else None)
             if m is None:
                 print(f"  [SKIP] {exp_dir}: empty or unparseable dtm.log")
                 continue
@@ -314,6 +380,27 @@ def plot_f_sync(df: pd.DataFrame, outdir: Path) -> None:
     print(f"  -> {out.name}")
 
 
+def plot_cpu_resources(df: pd.DataFrame, outdir: Path) -> None:
+    """Plot peak CPU usage per component vs N (only if resources.log was collected)."""
+    agg_core    = aggregate(df, "CPU_dtm_core_peak_m")
+    agg_agents  = aggregate(df, "CPU_dtm_agent_peak_m")
+    agg_mininet = aggregate(df, "CPU_ndt_mininet_peak_m")
+    if agg_core.empty and agg_agents.empty:
+        return
+    fig, ax = plt.subplots()
+    _plot_ci(ax, agg_core,    "#D85A30", "o", "-",   "DTM core (peak)")
+    _plot_ci(ax, agg_agents,  "#534AB7", "s", "--",  "DTM agents total (peak)")
+    _plot_ci(ax, agg_mininet, "#185FA5", "^", "-.",  "Mininet total (peak)")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Peak CPU usage (millicores)")
+    ax.set_title("Peak CPU usage vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    out = outdir / "fig5_cpu_peak_vs_ndts.pdf"
+    fig.savefig(out); plt.close(fig)
+    print(f"  -> {out.name}")
+
+
 def plot_apply_ms(df: pd.DataFrame, outdir: Path) -> None:
     fig, ax = plt.subplots()
     _plot_ci(ax, aggregate(df, "apply_ms_mean"), "#185FA5", "o", "-",  "Mean")
@@ -332,10 +419,13 @@ def plot_apply_ms(df: pd.DataFrame, outdir: Path) -> None:
 
 def print_summary(df: pd.DataFrame) -> None:
     cols = [
-        ("L_dispatch_mean_ms", "L_disp (ms)"),
-        ("T_conv_mean_ms",     "T_conv (ms)"),
-        ("F_sync_pct",         "F_sync (%)"),
-        ("apply_ms_mean",      "apply_ms (ms)"),
+        ("L_dispatch_mean_ms",    "L_disp (ms)"),
+        ("T_conv_mean_ms",        "T_conv (ms)"),
+        ("F_sync_pct",            "F_sync (%)"),
+        ("apply_ms_mean",         "apply_ms (ms)"),
+        ("CPU_dtm_core_peak_m",   "CPU_dtm (m)"),
+        ("CPU_dtm_agent_peak_m",  "CPU_agents (m)"),
+        ("CPU_ndt_mininet_peak_m","CPU_mininet (m)"),
     ]
     rows = []
     for ndts, group in df.groupby("NDTs"):
@@ -399,6 +489,10 @@ def main() -> None:
         "T_conv_mean_ms",     "T_conv_p95_ms",
         "F_sync_pct",
         "apply_ms_mean",      "apply_ms_p95",
+        "CPU_dtm_core_peak_m",
+        "CPU_dtm_agent_peak_m",
+        "CPU_ndt_mininet_peak_m",
+        "RAM_dtm_core_peak_mi",
     ]
     agg_rows = []
     for ndts, group in df.groupby("NDTs"):
@@ -426,6 +520,7 @@ def main() -> None:
     plot_t_conv(df, out_path)
     plot_f_sync(df, out_path)
     plot_apply_ms(df, out_path)
+    plot_cpu_resources(df, out_path)
 
     print(f"\nDone. Results in: {out_path.resolve()}")
 
