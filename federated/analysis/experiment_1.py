@@ -401,6 +401,23 @@ def plot_cpu_resources(df: pd.DataFrame, outdir: Path) -> None:
     print(f"  -> {out.name}")
 
 
+def plot_ram_resources(df: pd.DataFrame, outdir: Path) -> None:
+    """Plot peak RAM usage per component vs N (only if resources.log was collected)."""
+    agg_core = aggregate(df, "RAM_dtm_core_peak_mi")
+    if agg_core.empty or agg_core["mean"].isna().all():
+        return
+    fig, ax = plt.subplots()
+    _plot_ci(ax, agg_core, "#D85A30", "o", "-", "DTM core (peak)")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Peak RAM usage (MiB)")
+    ax.set_title("DTM core peak RAM usage vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    out = outdir / "fig6_ram_peak_vs_ndts.pdf"
+    fig.savefig(out); plt.close(fig)
+    print(f"  -> {out.name}")
+
+
 def plot_apply_ms(df: pd.DataFrame, outdir: Path) -> None:
     fig, ax = plt.subplots()
     _plot_ci(ax, aggregate(df, "apply_ms_mean"), "#185FA5", "o", "-",  "Mean")
@@ -521,6 +538,7 @@ def main() -> None:
     plot_f_sync(df, out_path)
     plot_apply_ms(df, out_path)
     plot_cpu_resources(df, out_path)
+    plot_ram_resources(df, out_path)
 
     print(f"\nDone. Results in: {out_path.resolve()}")
 
