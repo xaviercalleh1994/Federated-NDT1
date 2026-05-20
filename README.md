@@ -164,6 +164,13 @@ pod-on    1/1     Running
 pod-onm   1/1     Running   
 ```
 
+You can check containers in each NDT:
+```bash
+kubectl get pod ndt-1 -n ndt -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
+ndt	      ndt-mininet:1.0   -> NDT running with mininet
+dtm-agent	dtm:1.0           -> DTM distributed agent
+```
+
 To start the experiment, you need to run the ONM:
 ```bash
 kubectl exec -it pod-onm -n ndt -- python3 onm.py \
