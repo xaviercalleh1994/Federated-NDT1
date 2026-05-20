@@ -22,6 +22,7 @@ The framework relies in a Kubernetes architecture to support the deployment of e
 - NDTs (includes two containers: the NDT and the DTM distributed agent)
 
 The ON as well as the NDTs are created from [topology](federated/topology.json) json file. The current topology is shown next:
+
 <img src="Images/mininet_net.png" alt="net_arch" width="60%">
 
 
