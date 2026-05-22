@@ -14,7 +14,7 @@
 # Launches N NDT Mininet pods in Kubernetes.
 # Each NDT Pod gets its own network namespace (no hostNetwork).
 # Each Pod is exposed via a NodePort Service so the DTM on PC1
-# can reach it on 10.4.47.50:NODE_PORT.
+# can reach it on NODE_IP:NODE_PORT.
 #
 # Port mapping:
 #   DTM --base-port BASE_PORT
@@ -23,12 +23,25 @@
 # ACK packets (NDT → DTM) go out directly from the Pod via
 # Calico — no NodePort needed for that direction.
 #
+# Changes vs v1.6:
+#   - dtm-agent receives --ndt-id for state restore on startup.
+#   - dtm-state hostPath volume mounted in dtm-agent so the DTM
+#     core can persist state and the agent can restore it.
+#   - scripts hostPath volume mounted so DTM can call
+#     restart_ndt.sh via subprocess without kubectl in container.
+#   - XRM=1: adds xrm-agent container and xrm-state hostPath.
+#
 # Usage:
-#   ./launch_ndts.sh N DTM_IP BASE_PORT [PROTO] [ACK_PORT]
+#   v1.6-compatible:
+#     ./launch_ndts.sh N DTM_IP BASE_PORT [PROTO] [ACK_PORT]
+#
+#   v2.0 with XRM:
+#     XRM=1 XRM_CORE_IP=<ip> \
+#     ./launch_ndts.sh N DTM_IP BASE_PORT [PROTO] [ACK_PORT]
 #
 # Examples:
 #   ./launch_ndts.sh 8 10.4.47.53 30001 udp 9000
-#   ./launch_ndts.sh 4 10.4.47.53 30001 tcp 9000
+#   XRM=1 XRM_CORE_IP=10.4.47.53 ./launch_ndts.sh 4 10.4.47.53 30001 udp 9000
 # ============================================================
 
 set -euo pipefail
@@ -40,11 +53,17 @@ PROTO=${4:-udp}
 ACK_PORT=${5:-9000}
 MAX_WAIT=120
 
+# XRM parameters — only used when XRM=1
+XRM=${XRM:-0}
+XRM_CORE_IP=${XRM_CORE_IP:-${DTM_IP}}
+
 # Internal port that every NDT container listens on (fixed)
 NDT_INTERNAL_PORT=8001
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE="ndt-mininet:1.0"
+DTM_IMAGE="dtm:1.0"
+XRM_IMAGE="xrm:1.0"
 PREFIX="ndt"
 NAMESPACE="ndt"
 MANIFEST_DIR="${SCRIPT_DIR}/manifests/current"
@@ -58,11 +77,20 @@ if ! kubectl version --client > /dev/null 2>&1; then
     exit 1
 fi
 
-if ! sudo crictl images 2>/dev/null | grep -E "ndt-mininet[[:space:]].*1\.0|ndt-mininet:1\.0" | grep -q .; then
+if ! sudo crictl images 2>/dev/null | \
+   grep -E "ndt-mininet[[:space:]].*1\.0|ndt-mininet:1\.0" | grep -q .; then
     echo "ERROR: image 'ndt-mininet:1.0' not found in containerd."
     echo "Import it with:"
     echo "  docker save ndt-mininet:1.0 | sudo ctr -n k8s.io images import -"
     exit 1
+fi
+
+if [ "${XRM}" = "1" ]; then
+    if ! sudo crictl images 2>/dev/null | \
+       grep -E "xrm[[:space:]].*1\.0|xrm:1\.0" | grep -q .; then
+        echo "ERROR: image 'xrm:1.0' not found in containerd."
+        exit 1
+    fi
 fi
 
 # ── Validate NodePort range ──────────────────────────────────
@@ -87,7 +115,6 @@ for i in $(seq 1 "${N}"); do
     kubectl delete service "svc-${PREFIX}-${i}" -n "${NAMESPACE}" \
         --ignore-not-found > /dev/null 2>&1 || true
 done
-# Also clean any leftovers from a previous run with more NDTs
 for res in $(kubectl get pods -n "${NAMESPACE}" \
     --selector="app=ndt-exp1" --no-headers \
     -o custom-columns=":metadata.name" 2>/dev/null || true); do
@@ -104,19 +131,59 @@ echo "   Namespace : ${NAMESPACE}"
 echo "   NodePorts : ${BASE_PORT} — ${LAST_PORT}"
 echo "   Protocol  : ${PROTO}"
 echo "   DTM IP    : ${DTM_IP}"
-echo "   ACK port  : ${ACK_PORT} (direct Pod → DTM)"
+echo "   XRM       : $([ "${XRM}" = "1" ] && echo "enabled — core ${XRM_CORE_IP}" || echo "disabled")"
 echo "=============================================="
 echo ""
 
-# ── Launch pods and services one by one ─────────────────────
 ALL_OK=true
 
 for i in $(seq 1 "${N}"); do
     NODE_PORT=$(( BASE_PORT + i - 1 ))
     CTRL_PORT=$(( 6653 + i - 1 ))
+    NDT_ID=$(( i - 1 ))
     MANIFEST="${MANIFEST_DIR}/${PREFIX}-${i}.yaml"
 
+    # Ensure state directories exist on host
+    mkdir -p "/tmp/dtm-state/ndt-${NDT_ID}"
+    [ "${XRM}" = "1" ] && mkdir -p "/tmp/xrm-state/ndt-${NDT_ID}"
+
     echo "  Starting NDT ${i}  nodeport=${NODE_PORT}  ctrl=${CTRL_PORT}..."
+
+    # XRM optional blocks
+    XRM_VOLUME=""
+    XRM_CONTAINER=""
+    if [ "${XRM}" = "1" ]; then
+        XRM_VOLUME=$(cat <<XRMVOL
+
+    - name: xrm-state
+      hostPath:
+        path: /tmp/xrm-state/ndt-${NDT_ID}
+        type: DirectoryOrCreate
+XRMVOL
+)
+        XRM_CONTAINER=$(cat <<XRMBLOCK
+
+    # XRM agent — registers with XRM core, manages XR service lifecycle
+    - name: xrm-agent
+      image: ${XRM_IMAGE}
+      imagePullPolicy: Never
+      args:
+        - "--mode"
+        - "agent"
+        - "--ndt-id"
+        - "${NDT_ID}"
+        - "--core-ip"
+        - "${XRM_CORE_IP}"
+        - "--log-file"
+        - "/tmp/xrm_agent_${NDT_ID}.log"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: xrm-state
+          mountPath: /tmp/xrm-state/ndt-${NDT_ID}
+XRMBLOCK
+)
+    fi
 
     # ── Generate Pod + Service manifest ─────────────────────
     #
@@ -126,11 +193,13 @@ for i in $(seq 1 "${N}"); do
     #   - privileged: true → required for OVS + Mininet.
     #   - NDT_PORT is always NDT_INTERNAL_PORT (8001) inside the Pod.
     #   - DTM_IP is passed so the NDT knows where to send ACK packets.
+    #   - dtm-state hostPath: DTM persists state here; agent restores on startup.
+    #   - scripts hostPath: restart_ndt.sh mounted for subprocess calls.
     #
     # Service (NodePort):
-    #   - Exposes the Pod on NODE_PORT of the host (10.4.47.50).
+    #   - Exposes the Pod on NODE_PORT of the host.
     #   - DTM uses --base-port BASE_PORT, so NDT i is reachable at
-    #     10.4.47.50:(BASE_PORT + i - 1).
+    #     NODE_IP:(BASE_PORT + i - 1).
     cat > "${MANIFEST}" <<EOF
 apiVersion: v1
 kind: Pod
@@ -152,6 +221,14 @@ spec:
         name: topology-config
     - name: run-data
       emptyDir: {}    # shared /run between ndt and dtm-agent
+    - name: dtm-state
+      hostPath:
+        path: /tmp/dtm-state/ndt-${NDT_ID}
+        type: DirectoryOrCreate
+    - name: scripts
+      hostPath:
+        path: ${SCRIPT_DIR}
+        type: Directory${XRM_VOLUME}
   containers:
     - name: ndt
       image: ${IMAGE}
@@ -188,9 +265,10 @@ spec:
           cpu: "500m"
 
     # DTM distributed agent — receives events from DTM core,
-    # applies them on local NDT via localhost:6001 (on_ndt.py)
+    # applies them on local NDT via localhost:6001 (on_ndt.py),
+    # restores saved network state on startup from dtm-state volume
     - name: dtm-agent
-      image: dtm:1.0
+      image: ${DTM_IMAGE}
       imagePullPolicy: Never
       args:
         - "--proto"
@@ -201,6 +279,8 @@ spec:
         - "${NDT_INTERNAL_PORT}"
         - "--mode"
         - "agent"
+        - "--ndt-id"
+        - "${NDT_ID}"
         - "--dtm-ip"
         - "${DTM_IP}"
         - "--ack-port"
@@ -210,6 +290,10 @@ spec:
       volumeMounts:
         - name: run-data
           mountPath: /run
+        - name: dtm-state
+          mountPath: /tmp/dtm-state/ndt-${NDT_ID}
+        - name: scripts
+          mountPath: /scripts${XRM_CONTAINER}
 ---
 apiVersion: v1
 kind: Service
@@ -293,8 +377,8 @@ echo ""
 kubectl get pods,services -n "${NAMESPACE}" -o wide
 echo ""
 
-HOST_IP=$(kubectl get node xcalle \
-    -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' \
+NODE_IP=$(kubectl get nodes \
+    -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' \
     2>/dev/null || hostname -I | awk '{print $1}')
 
 echo ""
@@ -306,9 +390,10 @@ echo "    --relay-ip 172.16.2.1 \\"
 echo "    --relay-port 7001 \\"
 echo "    --mode federated \\"
 echo "    --fanout ${N} \\"
-echo "    --dst-ip ${HOST_IP} \\"
+echo "    --dst-ip ${NODE_IP} \\"
 echo "    --base-port ${BASE_PORT} \\"
 echo "    --feedback-port ${ACK_PORT} \\"
+echo "    --restart-script /scripts/restart_ndt.sh \\"
 echo "    --experiment-duration 75 \\"
 echo "    --log-file /home/ubuntu/exp1/1to${N}/dtm.log"
 echo ""

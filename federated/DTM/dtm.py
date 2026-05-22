@@ -50,10 +50,35 @@ Threading model
   log-writer   : drains log deque and writes to disk.
   fb-rx        : receives NDT upstream feedback (federated mode).
   fb-dispatch  : drains AdmissionQueue, forwards critical events to ONM.
+
+NDT state persistence and restart (new)
+----------------------------------------
+  DtmStateManager tracks current network state of each NDT and persists
+  it to /tmp/dtm-state/ndt-{id}/state.json via a hostPath volume.
+  Updated on every LOGICAL_LINK_SET dispatched to NDTs.
+
+  RESTART_NDT event: when the DTM receives a RESTART_NDT event
+  (from XRM or any other source via the relay), it:
+    1. Saves current state to /tmp/dtm-state/ndt-{id}/state.json.
+    2. Calls restart_ndt.sh via subprocess — the script is mounted
+       into the container via a hostPath volume and has kubectl access
+       because it runs as a subprocess that inherits the host context
+       via the mounted volume.
+    3. On pod restart, dtm-agent reads state.json and re-applies all
+       links via on_ndt.py:6001.
+
+  The DTM does not call kubectl directly — restart_ndt.sh does.
+  restart_ndt.sh is mounted at --restart-script path (default
+  /scripts/restart_ndt.sh) via a hostPath volume in the DTM pod.
+
+  Agent startup: if --ndt-id is provided, the agent reads state.json
+  and re-applies all saved links before entering the receive loop.
 """
 import gc
 import os
 import sys
+import json as _json
+import subprocess
 import time
 import math
 import socket
@@ -85,6 +110,11 @@ TOPO_CONFIG_FILE = "/run/topology_config.json"
 LOG_FILE_DEFAULT = "/home/ubuntu/ndtm_events.log"
 CONTROL_HOST     = "127.0.0.1"
 CONTROL_PORT     = 6001
+
+# State persistence base path — hostPath volume on cluster node
+DTM_STATE_BASE        = "/tmp/dtm-state"
+# Default path where restart_ndt.sh is mounted inside the container
+RESTART_SCRIPT_DEFAULT = "/scripts/restart_ndt.sh"
 
 run_ctx: Dict[str, object] = {}
 _done_ids: set   = set()
@@ -315,6 +345,168 @@ def resolve_to_physical(
 
 
 # ─────────────────────────────────────────────────────────────
+# DTM State Manager (new)
+# Persists per-NDT network state to hostPath volume so the
+# dtm-agent can restore it after a pod restart.
+# Updated on every LOGICAL_LINK_SET dispatched to NDTs.
+# ─────────────────────────────────────────────────────────────
+
+class DtmStateManager:
+    def __init__(self) -> None:
+        self._lock  = threading.Lock()
+        self._cache: Dict[int, dict] = {}
+
+    def _path(self, ndt_id: int) -> str:
+        return os.path.join(DTM_STATE_BASE, f"ndt-{ndt_id}", "state.json")
+
+    def update_link(self, ndt_id: int, link: dict) -> None:
+        """Update a single link in the in-memory cache and persist."""
+        with self._lock:
+            state = self._cache.setdefault(ndt_id, {
+                "ndt_id": ndt_id, "links": [], "services": []
+            })
+            links = state["links"]
+            for i, lk in enumerate(links):
+                if lk.get("a") == link.get("a") and \
+                   lk.get("b") == link.get("b"):
+                    links[i] = link
+                    break
+            else:
+                links.append(link)
+            state_copy = dict(state)
+        try:
+            path = self._path(ndt_id)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                _json.dump(state_copy, f, indent=2)
+        except Exception as exc:
+            log_event("DTM_STATE_PERSIST_ERR",
+                      {"ndt_id": ndt_id, "err": str(exc)})
+
+    def get_state(self, ndt_id: int) -> dict:
+        with self._lock:
+            return dict(self._cache.get(ndt_id, {
+                "ndt_id": ndt_id, "links": [], "services": []
+            }))
+
+
+# ─────────────────────────────────────────────────────────────
+# NDT restart (new)
+# Called by the DTM core on RESTART_NDT event.
+# Saves state then calls restart_ndt.sh via subprocess.
+# restart_ndt.sh is mounted into the container via hostPath
+# and has kubectl access on the host.
+# ─────────────────────────────────────────────────────────────
+
+def restart_ndt(
+    ndt_id: int,
+    state_mgr: DtmStateManager,
+    restart_script: str,
+    dtm_ip: str,
+    base_port: int,
+    proto: str,
+    ack_port: int,
+    xrm: bool = False,
+    xrm_core_ip: str = "",
+) -> dict:
+    """
+    Restart NDT pod ndt_id.
+    1. State is already persisted by DtmStateManager on every event.
+    2. Call restart_ndt.sh via subprocess — it does kubectl delete+apply.
+    3. dtm-agent restores state on startup from state.json.
+    Returns {ok, err}.
+    """
+    state = state_mgr.get_state(ndt_id)
+    n_links = len(state.get("links", []))
+
+    log_event("DTM_NDT_RESTART", {
+        "ndt_id":   ndt_id,
+        "n_links":  n_links,
+        "script":   restart_script,
+    })
+    print(f"[DTM] Restarting ndt-{ndt_id} "
+          f"({n_links} links to restore)...", flush=True)
+
+    if not os.path.isfile(restart_script):
+        err = f"restart script not found: {restart_script}"
+        log_event("DTM_NDT_RESTART_ERR",
+                  {"ndt_id": ndt_id, "err": err})
+        return {"ok": False, "err": err}
+
+    cmd = [
+        "bash", restart_script,
+        str(ndt_id), dtm_ip, str(base_port), proto, str(ack_port),
+    ]
+    env = os.environ.copy()
+    if xrm and xrm_core_ip:
+        env["XRM"] = "1"
+        env["XRM_CORE_IP"] = xrm_core_ip
+
+    try:
+        r = subprocess.run(
+            cmd, env=env,
+            capture_output=True, text=True, timeout=180,
+        )
+        if r.returncode != 0:
+            log_event("DTM_NDT_RESTART_ERR", {
+                "ndt_id": ndt_id,
+                "err":    r.stderr[:500],
+            })
+            return {"ok": False, "err": r.stderr[:500]}
+        log_event("DTM_NDT_RESTARTED", {"ndt_id": ndt_id})
+        print(f"[DTM] ndt-{ndt_id} restarted.", flush=True)
+        return {"ok": True}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "err": "restart timeout"}
+    except Exception as exc:
+        return {"ok": False, "err": str(exc)}
+
+
+# ─────────────────────────────────────────────────────────────
+# NDT state restore (agent side, new)
+# Called on agent startup before entering the receive loop.
+# Reads saved state from hostPath and re-applies all links.
+# ─────────────────────────────────────────────────────────────
+
+def _restore_ndt_state(ndt_id: int) -> None:
+    path = os.path.join(DTM_STATE_BASE, f"ndt-{ndt_id}", "state.json")
+    try:
+        with open(path) as f:
+            state = _json.load(f)
+    except FileNotFoundError:
+        print(f"[AGENT] No saved state for ndt-{ndt_id}", flush=True)
+        return
+    except Exception as exc:
+        print(f"[AGENT] Could not read state: {exc}", flush=True)
+        return
+
+    links = state.get("links", [])
+    if not links:
+        print(f"[AGENT] ndt-{ndt_id}: no links to restore", flush=True)
+        return
+
+    print(f"[AGENT] ndt-{ndt_id}: restoring {len(links)} links...",
+          flush=True)
+    for link in links:
+        resp = control_call({
+            "type": "LINK_SET",
+            "payload": {
+                "a":        link["a"],
+                "b":        link["b"],
+                "delay_ms": link.get("delay_ms", 0.0),
+                "loss_pct": link.get("loss_pct", 0.0),
+                "bw_mbps":  link.get("bw_mbps", 1000.0),
+                "up":       link.get("up", True),
+            },
+        })
+        log_event("AGENT_LINK_RESTORED", {
+            "ndt_id": ndt_id, "link": link, "ok": resp.get("ok"),
+        })
+        print(f"[AGENT]   {link['a']}↔{link['b']} "
+              f"ok={resp.get('ok')}", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────
 # DTM distributed agent — apply events on local NDT
 # ─────────────────────────────────────────────────────────────
 
@@ -354,7 +546,6 @@ def apply_event_on_ndt(
         new_topo = ev.get("payload", {}).get("topology")
         if new_topo:
             with open(TOPO_CONFIG_FILE, "w") as f:
-                import json as _json
                 _json.dump(new_topo, f, indent=2)
             resp   = control_call({"type": "RELOAD"})
             result = resp
@@ -825,6 +1016,7 @@ def run_agent(args: argparse.Namespace) -> None:
     Runs inside the NDT Pod alongside on_ndt.py.
     Receives events from DTM core, applies them via on_ndt.py,
     sends ACKs back.
+    On startup: restores saved network state from hostPath if present.
     """
     global run_ctx
     run_ctx = {
@@ -846,6 +1038,10 @@ def run_agent(args: argparse.Namespace) -> None:
     except FileNotFoundError:
         print("[AGENT] topology.json not found — "
               "waiting for TOPOLOGY event", flush=True)
+
+    # Restore saved network state if --ndt-id provided
+    if args.ndt_id >= 0:
+        _restore_ndt_state(args.ndt_id)
 
     # Connect to DTM core
     if args.proto == "udp":
@@ -941,6 +1137,15 @@ def main() -> None:
     ap.add_argument("--event-limit", type=int, default=0)
     ap.add_argument("--print-progress", action="store_true")
     ap.add_argument("--experiment-duration", type=float, default=0)
+    # New args for NDT restart support
+    ap.add_argument("--ndt-id",         type=int, default=-1,
+                    help="[agent] NDT identifier (0-based) for state restore")
+    ap.add_argument("--restart-script", default=RESTART_SCRIPT_DEFAULT,
+                    help="[federated] path to restart_ndt.sh inside container")
+    ap.add_argument("--xrm",            action="store_true",
+                    help="[federated] include xrm-agent in restarted pods")
+    ap.add_argument("--xrm-core-ip",    default="",
+                    help="[federated] XRM core IP for restarted pods")
     args = ap.parse_args()
 
     # ── Agent mode — runs in NDT Pod ──────────────────────────
@@ -994,6 +1199,7 @@ def main() -> None:
     fast_sender  = None
     ack_tracker  = None
     fc           = None
+    state_mgr: Optional[DtmStateManager] = None
 
     if args.mode == "federated":
         if args.fanout <= 0:
@@ -1018,6 +1224,8 @@ def main() -> None:
             token_bucket = tb,
             ack_tracker  = ack_tracker,
         )
+        # Initialise state manager — tracks NDT network state for restart
+        state_mgr = DtmStateManager()
         print(
             f"[DTM] Federated | fanout={args.fanout} "
             f"max_queue={args.max_queue}",
@@ -1085,6 +1293,47 @@ def main() -> None:
                 log_event("DTM_NO_TOPOLOGY", {"event_id": event_id})
                 print("[DTM] WARNING: LOGICAL_LINK_SET before TOPOLOGY",
                       flush=True)
+                continue
+
+            # Update state manager on every link change so restart
+            # can restore the NDT to its current state
+            if ev_type == "LOGICAL_LINK_SET" and state_mgr is not None:
+                p = ev.get("payload", {})
+                for ndt_id in range(args.fanout):
+                    state_mgr.update_link(ndt_id, {
+                        "a":        p.get("a"),
+                        "b":        p.get("b"),
+                        "delay_ms": float(p.get("delay_ms", 0.0)),
+                        "loss_pct": float(p.get("loss_pct", 0.0)),
+                        "bw_mbps":  float(p.get("bw_mbps", 1000.0)),
+                        "up":       bool(p.get("up", True)),
+                    })
+
+            # RESTART_NDT event — requested by XRM or operator
+            # Saves state and calls restart_ndt.sh via subprocess
+            if ev_type == "RESTART_NDT":
+                ndt_id = int(ev.get("payload", {}).get("ndt_id", -1))
+                if ndt_id < 0 or ndt_id >= args.fanout:
+                    log_event("DTM_RESTART_INVALID",
+                              {"event_id": event_id, "ndt_id": ndt_id})
+                else:
+                    def _do_restart(nid: int) -> None:
+                        restart_ndt(
+                            ndt_id         = nid,
+                            state_mgr      = state_mgr,
+                            restart_script = args.restart_script,
+                            dtm_ip         = args.relay_ip,
+                            base_port      = args.base_port,
+                            proto          = args.proto,
+                            ack_port       = args.ack_port,
+                            xrm            = args.xrm,
+                            xrm_core_ip    = args.xrm_core_ip,
+                        )
+                    # Run in background thread so main loop is not blocked
+                    threading.Thread(
+                        target=_do_restart, args=(ndt_id,),
+                        name=f"restart-ndt-{ndt_id}", daemon=True,
+                    ).start()
                 continue
 
             t0 = time.time_ns()

@@ -1,93 +1,75 @@
 #!/bin/bash
+
 # Copyright (C) 2026 Xavier Calle-Heredia, Xavier Hesselbach
 # Universitat Politècnica de Catalunya (UPC)
 #
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
 # ============================================================
-# stop_testbed.sh — stops all testbed pods and services
+# stop_testbed.sh — Stop all testbed pods and services
 #
-# Works for both 1:1 and federated modes.
-# Detects automatically which pods are running.
+# Stops all pods and services in the ndt namespace.
+# Optionally copies logs to a destination directory.
 #
 # Usage:
-#   ./stop_testbed.sh
-#   ./stop_testbed.sh ./logs/run1
+#   ./stop_testbed.sh [LOG_DIR]
+#
+# Example:
+#   ./stop_testbed.sh ./logs/run1/1to4
 # ============================================================
+
 set -euo pipefail
-LOG_DST=${1:-""}
+
+LOG_DIR="${1:-}"
 NAMESPACE="ndt"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# ── Save logs ────────────────────────────────────────────────
-if [ -n "${LOG_DST}" ]; then
-    mkdir -p "${LOG_DST}"
-    echo "Saving logs to ${LOG_DST}..."
-    for pod_container in \
-        "pod-on-onm:on" \
-        "pod-on-onm:onm" \
-        "pod-dtm-ndt:ndt" \
-        "pod-dtm-ndt:dtm" \
-        "pod-dtm:dtm"; do
-        pod="${pod_container%%:*}"
-        container="${pod_container##*:}"
-        if kubectl get pod "${pod}" -n "${NAMESPACE}" \
-            > /dev/null 2>&1; then
-            kubectl logs "${pod}" -n "${NAMESPACE}" \
-                -c "${container}" \
-                > "${LOG_DST}/${pod}-${container}.log" 2>/dev/null || true
-            echo "  ${pod}/${container} → ${LOG_DST}/${pod}-${container}.log"
-        fi
-    done
-    # NDT pods (federated)
-    NDTS=$(kubectl get pods -n "${NAMESPACE}" \
-        --selector="app=ndt-exp1" \
-        --no-headers \
-        -o custom-columns=":metadata.name" 2>/dev/null || true)
-    for pod in ${NDTS}; do
-        kubectl logs "${pod}" -n "${NAMESPACE}" -c ndt \
-            > "${LOG_DST}/${pod}-ndt.log" 2>/dev/null || true
+echo "=============================================="
+echo " Stopping testbed"
+echo "=============================================="
+
+# ── Optionally collect logs ───────────────────────────────────
+if [ -n "${LOG_DIR}" ]; then
+    mkdir -p "${LOG_DIR}"
+    echo "Collecting logs to ${LOG_DIR}..."
+
+    # DTM log
+    kubectl cp pod-dtm:/tmp/ndt-run/dtm.log \
+        "${LOG_DIR}/dtm.log" 2>/dev/null || \
+    kubectl logs pod-dtm -n "${NAMESPACE}" -c dtm \
+        > "${LOG_DIR}/dtm.log" 2>/dev/null || true
+
+    # ONM log
+    kubectl logs pod-onm -n "${NAMESPACE}" \
+        > "${LOG_DIR}/onm.log" 2>/dev/null || true
+
+    # Per-NDT agent logs
+    for pod in $(kubectl get pods -n "${NAMESPACE}" \
+        --selector="app=ndt-exp1" --no-headers \
+        -o custom-columns=":metadata.name" 2>/dev/null || true); do
         kubectl logs "${pod}" -n "${NAMESPACE}" -c dtm-agent \
-            > "${LOG_DST}/${pod}-dtm-agent.log" 2>/dev/null || true
-        echo "  ${pod} → ${LOG_DST}/${pod}-*.log"
+            > "${LOG_DIR}/${pod}_agent.log" 2>/dev/null || true
     done
-    echo "Logs saved."
-    echo ""
+
+    echo "  Logs saved to ${LOG_DIR}"
 fi
 
-# ── Stop NDT pods (federated mode) ───────────────────────────
-if kubectl get pods -n "${NAMESPACE}" \
-    --selector="app=ndt-exp1" --no-headers 2>/dev/null | grep -q .; then
-    echo "Stopping NDT pods..."
-    "${REPO_ROOT}/ndt_deployment/mininet_ndts/stop_ndts.sh"
-fi
+# ── Delete all pods ───────────────────────────────────────────
+echo "Deleting pods..."
+kubectl delete pods --all -n "${NAMESPACE}" \
+    --grace-period=5 --wait=false 2>/dev/null || true
 
-# ── Stop core pods ───────────────────────────────────────────
-echo "Stopping core pods..."
-for pod in pod-on pod-onm pod-on-onm pod-dtm pod-dtm-ndt; do
-    kubectl delete pod "${pod}" -n "${NAMESPACE}" \
-        --ignore-not-found \
-        --grace-period=0 \
-        --force > /dev/null 2>&1 || true
-done
-
-# ── Stop services ─────────────────────────────────────────────
-echo "Stopping services..."
-kubectl delete service svc-dtm svc-on -n "${NAMESPACE}" \
-    --ignore-not-found > /dev/null 2>&1 || true
-# Delete all NDT services (svc-ndt-N)
+# ── Delete all services (except kubernetes) ───────────────────
+echo "Deleting services..."
 kubectl get services -n "${NAMESPACE}" --no-headers \
-    -o custom-columns=":metadata.name" 2>/dev/null \
-    | grep "^svc-ndt-" \
-    | xargs -r kubectl delete service -n "${NAMESPACE}" \
-    --ignore-not-found > /dev/null 2>&1 || true
+    -o custom-columns=":metadata.name" 2>/dev/null | \
+    grep -v "^kubernetes$" | \
+    xargs -r kubectl delete service -n "${NAMESPACE}" \
+    --ignore-not-found 2>/dev/null || true
 
-# ── Clean OVS stale pidfiles ──────────────────────────────────
-# These are left behind by OVS inside the pod's hostPath mount
-# and cause ovsdb-server to abort on the next run.
-echo "Cleaning stale OVS pidfiles..."
-sudo rm -f /var/run/openvswitch/*.pid \
-           /var/run/openvswitch/*.ctl \
-           /tmp/ndt-run/mininet.pid \
-           2>/dev/null || true
-
-echo "Done."
+echo ""
+echo "=============================================="
+echo " Testbed stopped."
+echo "=============================================="
