@@ -57,28 +57,35 @@ NDT state persistence and restart (new)
   it to /tmp/dtm-state/ndt-{id}/state.json via a hostPath volume.
   Updated on every LOGICAL_LINK_SET dispatched to NDTs.
 
-  RESTART_NDT event: when the DTM receives a RESTART_NDT event
-  (from XRM or any other source via the relay), it:
-    1. Saves current state to /tmp/dtm-state/ndt-{id}/state.json.
-    2. Calls restart_ndt.sh via subprocess — the script is mounted
-       into the container via a hostPath volume and has kubectl access
-       because it runs as a subprocess that inherits the host context
-       via the mounted volume.
-    3. On pod restart, dtm-agent reads state.json and re-applies all
-       links via on_ndt.py:6001.
-
-  The DTM does not call kubectl directly — restart_ndt.sh does.
-  restart_ndt.sh is mounted at --restart-script path (default
-  /scripts/restart_ndt.sh) via a hostPath volume in the DTM pod.
+  RESTART_NDT event: DTM writes restart_requested signal file.
+  watch_restarts.sh on the host detects it and calls restart_ndt.sh.
+  On pod restart dtm-agent reads state.json and re-applies all links.
 
   Agent startup: if --ndt-id is provided, the agent reads state.json
   and re-applies all saved links before entering the receive loop.
+
+Upstream mode — XR service coordination (new)
+----------------------------------------------
+  The DTM upstream-core receives XR service commands from xrm-agents,
+  serialises them via AdmissionQueue (priority order, one-by-one),
+  forwards each to the ONM upstream server, waits for ACK, and
+  broadcasts ON_STATE_UPDATE to ALL registered xrm-agents.
+
+  Port layout (upstream, separate from Exp1):
+    7005  DTM upstream-core rx    (xrm-agents → DTM)
+    7006  DTM → ONM upstream      (DTM forwards to ONM)
+    7007  DTM upstream ACK rx     (ONM → DTM)
+    7008  DTM → xrm-agents bc     (DTM broadcasts to agents)
+
+  xrm-agent status per broadcast:
+    ACK       — this agent's command was applied on ON
+    QUEUED    — this agent has a command pending in queue
+    PENDING   — idle
+    DISCARDED — this agent's command was dropped
 """
 import gc
 import os
-import sys
 import json as _json
-import subprocess
 import time
 import math
 import socket
@@ -112,9 +119,13 @@ CONTROL_HOST     = "127.0.0.1"
 CONTROL_PORT     = 6001
 
 # State persistence base path — hostPath volume on cluster node
-DTM_STATE_BASE        = "/tmp/dtm-state"
-# Default path where restart_ndt.sh is mounted inside the container
-RESTART_SCRIPT_DEFAULT = "/scripts/restart_ndt.sh"
+DTM_STATE_BASE = "/tmp/dtm-state"
+
+# Upstream ports — XR service coordination (new)
+DTM_UPSTREAM_RX_PORT  = 7005   # rx from xrm-agents
+DTM_UPSTREAM_ONM_PORT = 7006   # tx to ONM upstream
+DTM_UPSTREAM_ACK_PORT = 7007   # rx ACK from ONM
+DTM_UPSTREAM_BC_PORT  = 7008   # tx broadcast to xrm-agents
 
 run_ctx: Dict[str, object] = {}
 _done_ids: set   = set()
@@ -346,8 +357,7 @@ def resolve_to_physical(
 
 # ─────────────────────────────────────────────────────────────
 # DTM State Manager (new)
-# Persists per-NDT network state to hostPath volume so the
-# dtm-agent can restore it after a pod restart.
+# Persists per-NDT network state to hostPath volume.
 # Updated on every LOGICAL_LINK_SET dispatched to NDTs.
 # ─────────────────────────────────────────────────────────────
 
@@ -383,83 +393,26 @@ class DtmStateManager:
             log_event("DTM_STATE_PERSIST_ERR",
                       {"ndt_id": ndt_id, "err": str(exc)})
 
-    def get_state(self, ndt_id: int) -> dict:
-        with self._lock:
-            return dict(self._cache.get(ndt_id, {
-                "ndt_id": ndt_id, "links": [], "services": []
-            }))
 
-
-# ─────────────────────────────────────────────────────────────
-# NDT restart (new)
-# Called by the DTM core on RESTART_NDT event.
-# Saves state then calls restart_ndt.sh via subprocess.
-# restart_ndt.sh is mounted into the container via hostPath
-# and has kubectl access on the host.
-# ─────────────────────────────────────────────────────────────
-
-def restart_ndt(
-    ndt_id: int,
-    state_mgr: DtmStateManager,
-    restart_script: str,
-    dtm_ip: str,
-    base_port: int,
-    proto: str,
-    ack_port: int,
-    xrm: bool = False,
-    xrm_core_ip: str = "",
-) -> dict:
+def request_ndt_restart(ndt_id: int) -> None:
     """
-    Restart NDT pod ndt_id.
-    1. State is already persisted by DtmStateManager on every event.
-    2. Call restart_ndt.sh via subprocess — it does kubectl delete+apply.
-    3. dtm-agent restores state on startup from state.json.
-    Returns {ok, err}.
+    Signal watch_restarts.sh to restart NDT ndt_id.
+    Writes restart_requested in the hostPath directory.
+    watch_restarts.sh on the host detects this file and calls
+    restart_ndt.sh which performs kubectl delete + apply.
+    The DTM has no dependency on kubectl or subprocess.
     """
-    state = state_mgr.get_state(ndt_id)
-    n_links = len(state.get("links", []))
-
-    log_event("DTM_NDT_RESTART", {
-        "ndt_id":   ndt_id,
-        "n_links":  n_links,
-        "script":   restart_script,
-    })
-    print(f"[DTM] Restarting ndt-{ndt_id} "
-          f"({n_links} links to restore)...", flush=True)
-
-    if not os.path.isfile(restart_script):
-        err = f"restart script not found: {restart_script}"
-        log_event("DTM_NDT_RESTART_ERR",
-                  {"ndt_id": ndt_id, "err": err})
-        return {"ok": False, "err": err}
-
-    cmd = [
-        "bash", restart_script,
-        str(ndt_id), dtm_ip, str(base_port), proto, str(ack_port),
-    ]
-    env = os.environ.copy()
-    if xrm and xrm_core_ip:
-        env["XRM"] = "1"
-        env["XRM_CORE_IP"] = xrm_core_ip
-
+    signal_path = os.path.join(
+        DTM_STATE_BASE, f"ndt-{ndt_id}", "restart_requested")
     try:
-        r = subprocess.run(
-            cmd, env=env,
-            capture_output=True, text=True, timeout=180,
-        )
-        if r.returncode != 0:
-            log_event("DTM_NDT_RESTART_ERR", {
-                "ndt_id": ndt_id,
-                "err":    r.stderr[:500],
-            })
-            return {"ok": False, "err": r.stderr[:500]}
-        log_event("DTM_NDT_RESTARTED", {"ndt_id": ndt_id})
-        print(f"[DTM] ndt-{ndt_id} restarted.", flush=True)
-        return {"ok": True}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "err": "restart timeout"}
+        os.makedirs(os.path.dirname(signal_path), exist_ok=True)
+        with open(signal_path, "w") as f:
+            _json.dump({"ndt_id": ndt_id, "t_ns": time.time_ns()}, f)
+        log_event("DTM_RESTART_REQUESTED", {"ndt_id": ndt_id})
+        print(f"[DTM] Restart requested for ndt-{ndt_id}", flush=True)
     except Exception as exc:
-        return {"ok": False, "err": str(exc)}
+        log_event("DTM_RESTART_SIGNAL_ERR",
+                  {"ndt_id": ndt_id, "err": str(exc)})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -468,7 +421,12 @@ def restart_ndt(
 # Reads saved state from hostPath and re-applies all links.
 # ─────────────────────────────────────────────────────────────
 
-def _restore_ndt_state(ndt_id: int) -> None:
+def _restore_ndt_state(
+        ndt_id: int,
+        g: Optional[Dict[str, List[str]]] = None) -> None:
+    # Restore saved network state after pod restart.
+    # Uses apply_logical_link with the topology graph so logical links
+    # are resolved to physical segments correctly.
     path = os.path.join(DTM_STATE_BASE, f"ndt-{ndt_id}", "state.json")
     try:
         with open(path) as f:
@@ -488,22 +446,364 @@ def _restore_ndt_state(ndt_id: int) -> None:
     print(f"[AGENT] ndt-{ndt_id}: restoring {len(links)} links...",
           flush=True)
     for link in links:
-        resp = control_call({
-            "type": "LINK_SET",
-            "payload": {
-                "a":        link["a"],
-                "b":        link["b"],
-                "delay_ms": link.get("delay_ms", 0.0),
-                "loss_pct": link.get("loss_pct", 0.0),
-                "bw_mbps":  link.get("bw_mbps", 1000.0),
-                "up":       link.get("up", True),
-            },
-        })
+        a = link["a"]
+        b = link["b"]
+        e = Edge(
+            delay_ms=float(link.get("delay_ms", 0.0)),
+            loss_pct=float(link.get("loss_pct", 0.0)),
+            bw_mbps= float(link.get("bw_mbps", 1000.0)),
+            up=      bool(link.get("up", True)),
+        )
+        if g is not None:
+            segs = apply_logical_link(g, a, b, e)
+            ok   = segs > 0
+            err  = None if ok else "no path found"
+        else:
+            resp = control_call({
+                "type": "LINK_SET",
+                "payload": {
+                    "a": a, "b": b,
+                    "delay_ms": e.delay_ms,
+                    "loss_pct": e.loss_pct,
+                    "bw_mbps":  e.bw_mbps,
+                    "up":       e.up,
+                },
+            })
+            ok  = resp.get("ok", False)
+            err = resp.get("err")
         log_event("AGENT_LINK_RESTORED", {
-            "ndt_id": ndt_id, "link": link, "ok": resp.get("ok"),
+            "ndt_id": ndt_id, "link": link, "ok": ok, "err": err,
         })
-        print(f"[AGENT]   {link['a']}↔{link['b']} "
-              f"ok={resp.get('ok')}", flush=True)
+        print(f"[AGENT]   {a}\u2194{b} ok={ok}"
+              + (f" err={err}" if err else ""), flush=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# DTM upstream — XR service coordination (new)
+# Receives XR service commands from xrm-agents, serialises
+# via AdmissionQueue (priority order), forwards to ONM,
+# waits for ACK, broadcasts ON_STATE_UPDATE to all xrm-agents.
+# ─────────────────────────────────────────────────────────────
+
+class XrmAgentRegistry:
+    """
+    Tracks all xrm-agents that have sent at least one command.
+    ndt_id → {ip, bc_port}
+    Used for broadcasting ON_STATE_UPDATE.
+    """
+    def __init__(self) -> None:
+        self._lock  = threading.Lock()
+        self._agents: Dict[int, dict] = {}
+        self._inflight: Dict[str, int] = {}  # event_id → ndt_id
+
+    def register(self, ndt_id: int, ip: str, bc_port: int) -> None:
+        with self._lock:
+            self._agents[ndt_id] = {"ip": ip, "bc_port": bc_port}
+
+    def set_inflight(self, event_id: str, ndt_id: int) -> None:
+        with self._lock:
+            self._inflight[event_id] = ndt_id
+
+    def clear_inflight(self, event_id: str) -> None:
+        with self._lock:
+            self._inflight.pop(event_id, None)
+
+    def all_agents(self) -> Dict[int, dict]:
+        with self._lock:
+            return dict(self._agents)
+
+    def queued_ndt_ids(self, queued_ids: set) -> set:
+        with self._lock:
+            return {nid for eid, nid in self._inflight.items()
+                    if eid in queued_ids}
+
+
+def _broadcast_state_update(
+    bc_sock: socket.socket,
+    registry: XrmAgentRegistry,
+    processed_event_id: str,
+    processed_ndt_id: int,
+    service: str,
+    node: str,
+    state: dict,
+    apply_ms: float,
+    t_applied_ns: int,
+    t_create_ns: int,
+    queued_ids: set,
+    status_override: Optional[Dict[int, str]] = None,
+) -> None:
+    """
+    Broadcast ON_STATE_UPDATE to all registered xrm-agents.
+    Each agent receives its individual status:
+      ACK       — this agent's command was applied
+      QUEUED    — this agent has a pending command
+      PENDING   — idle
+      DISCARDED — this agent's command was dropped
+    """
+    queued_ndt_ids = registry.queued_ndt_ids(queued_ids)
+    for ndt_id, info in registry.all_agents().items():
+        if status_override and ndt_id in status_override:
+            your_status = status_override[ndt_id]
+        elif ndt_id == processed_ndt_id:
+            your_status = "ACK"
+        elif ndt_id in queued_ndt_ids:
+            your_status = "QUEUED"
+        else:
+            your_status = "PENDING"
+
+        msg = _dumps({
+            "type":               "ON_STATE_UPDATE",
+            "processed_event_id": processed_event_id,
+            "processed_ndt_id":   processed_ndt_id,
+            "service":            service,
+            "node":               node,
+            "state":              state,
+            "apply_ms":           apply_ms,
+            "t_applied_ns":       t_applied_ns,
+            "t_create_ns":        t_create_ns,
+            "your_status":        your_status,
+            "ndt_id":             ndt_id,
+        })
+        try:
+            bc_sock.sendto(msg, (info["ip"], info["bc_port"]))
+        except Exception as exc:
+            log_event("DTM_UPSTREAM_BC_ERR",
+                      {"ndt_id": ndt_id, "err": str(exc)})
+
+    log_event("DTM_UPSTREAM_BC_SENT", {
+        "processed_event_id": processed_event_id,
+        "processed_ndt_id":   processed_ndt_id,
+        "service":            service,
+        "n_agents":           len(registry.all_agents()),
+        "apply_ms":           apply_ms,
+    })
+
+
+def run_upstream(args: argparse.Namespace) -> None:
+    """
+    DTM upstream mode — XR service coordination.
+    Receives XR service commands from xrm-agents on UDP :7005.
+    Serialises via AdmissionQueue (priority order, one-by-one).
+    Forwards each to ONM upstream on UDP :7006.
+    Waits for ACK from ONM on UDP :7007.
+    Broadcasts ON_STATE_UPDATE to all xrm-agents on UDP :7008.
+    """
+    global run_ctx
+    run_ctx = {
+        "side":        "DTM_UPSTREAM",
+        "onm_ip":      args.onm_ip,
+        "log_file":    args.log_file,
+        "event_limit": args.event_limit,
+    }
+    threading.Thread(target=_log_writer, name="log-writer",
+                     daemon=True).start()
+    _build_log_prefix()
+
+    gc.disable()
+
+    registry = XrmAgentRegistry()
+    aq = AdmissionQueue(
+        max_queue          = args.max_queue,
+        drop_prio_if_full  = args.drop_prio_if_full,
+        disable_priorities = args.disable_priorities,
+    )
+
+    # Receive XR service commands from xrm-agents
+    rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                       64 * 1024 * 1024)
+    rx_sock.bind(("0.0.0.0", DTM_UPSTREAM_RX_PORT))
+    rx_sock.settimeout(0.5)
+
+    # Forward to ONM upstream
+    onm_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Receive ACK from ONM
+    ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ack_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                        8 * 1024 * 1024)
+    ack_sock.bind(("0.0.0.0", DTM_UPSTREAM_ACK_PORT))
+    ack_sock.settimeout(args.onm_ack_timeout)
+
+    # Broadcast to xrm-agents
+    bc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    print(f"[DTM-UPSTREAM] Ready", flush=True)
+    print(f"[DTM-UPSTREAM] rx :{DTM_UPSTREAM_RX_PORT}  "
+          f"ack :{DTM_UPSTREAM_ACK_PORT}  "
+          f"bc :{DTM_UPSTREAM_BC_PORT}", flush=True)
+    print(f"[DTM-UPSTREAM] → ONM {args.onm_ip}:{DTM_UPSTREAM_ONM_PORT}",
+          flush=True)
+
+    def _rx_loop() -> None:
+        while True:
+            try:
+                data, addr = rx_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+            t_rx_ns = time.time_ns()
+            try:
+                ev = _loads(data)
+            except Exception as exc:
+                log_event("DTM_UPSTREAM_PARSE_ERR", {"err": str(exc)})
+                continue
+
+            ev_type  = ev.get("type", "")
+            event_id = str(ev.get("event_id", ""))
+            ndt_id   = int(ev.get("ndt_id", -1))
+            pr       = int(ev.get("priority", 100))
+            bc_port  = int(ev.get("agent_bc_port", DTM_UPSTREAM_BC_PORT))
+
+            # Register agent on first contact
+            registry.register(ndt_id, addr[0], bc_port)
+
+            if ev_type != "XR_SERVICE_CMD":
+                log_event("DTM_UPSTREAM_UNKNOWN",
+                          {"event_id": event_id, "type": ev_type})
+                continue
+
+            log_event("DTM_UPSTREAM_RX", {
+                "event_id":   event_id,
+                "ndt_id":     ndt_id,
+                "priority":   pr,
+                "service":    ev.get("service", ""),
+                "t_rx_ns":    t_rx_ns,
+                "size_bytes": len(data),
+            })
+
+            registry.set_inflight(event_id, ndt_id)
+
+            admitted = aq.push(
+                {"ev": ev, "t_rx_ns": t_rx_ns, "priority": pr,
+                 "event_id": event_id, "ndt_id": ndt_id,
+                 "t_create_ns": int(ev.get("t_create_ns", 0))},
+                pr, event_id, ev_type, "upstream",
+            )
+
+            if not admitted:
+                registry.clear_inflight(event_id)
+                _broadcast_state_update(
+                    bc_sock, registry,
+                    processed_event_id=event_id,
+                    processed_ndt_id=ndt_id,
+                    service=ev.get("service", ""),
+                    node=ev.get("payload", {}).get("node", ""),
+                    state={}, apply_ms=0.0,
+                    t_applied_ns=time.time_ns(),
+                    t_create_ns=int(ev.get("t_create_ns", 0)),
+                    queued_ids=set(),
+                    status_override={ndt_id: "DISCARDED"},
+                )
+
+    def _dispatch_loop() -> None:
+        while True:
+            limit_reached()
+            items = aq.drain(max_items=1)
+            for item in items:
+                ev          = item["ev"]
+                event_id    = item["event_id"]
+                ndt_id      = item["ndt_id"]
+                t_rx_ns     = item["t_rx_ns"]
+                t_create_ns = item["t_create_ns"]
+                service     = ev.get("service", "")
+                node        = ev.get("payload", {}).get("node", "")
+
+                # Forward to ONM upstream
+                t_fwd_ns = time.time_ns()
+                try:
+                    onm_sock.sendto(
+                        _dumps(ev),
+                        (args.onm_ip, DTM_UPSTREAM_ONM_PORT),
+                    )
+                except Exception as exc:
+                    log_event("DTM_UPSTREAM_FWD_ERR",
+                              {"event_id": event_id, "err": str(exc)})
+                    registry.clear_inflight(event_id)
+                    _broadcast_state_update(
+                        bc_sock, registry,
+                        processed_event_id=event_id,
+                        processed_ndt_id=ndt_id,
+                        service=service, node=node,
+                        state={}, apply_ms=0.0,
+                        t_applied_ns=time.time_ns(),
+                        t_create_ns=t_create_ns,
+                        queued_ids=set(),
+                        status_override={ndt_id: "DISCARDED"},
+                    )
+                    continue
+
+                log_event("DTM_UPSTREAM_FORWARDED", {
+                    "event_id": event_id,
+                    "ndt_id":   ndt_id,
+                    "service":  service,
+                    "t_fwd_ns": t_fwd_ns,
+                })
+
+                # Wait for ACK from ONM
+                state    = {}
+                apply_ms = 0.0
+                ok       = False
+                try:
+                    ack_data, _ = ack_sock.recvfrom(65535)
+                    ack      = _loads(ack_data)
+                    state    = ack.get("state", {})
+                    apply_ms = float(ack.get("apply_ms", 0.0))
+                    ok       = bool(ack.get("ok", False))
+                except socket.timeout:
+                    log_event("DTM_UPSTREAM_ACK_TIMEOUT",
+                              {"event_id": event_id, "ndt_id": ndt_id})
+
+                t_done_ns = time.time_ns()
+                e2e_ms    = round((t_done_ns - t_create_ns) / 1e6, 3) \
+                            if t_create_ns else None
+
+                log_event("DTM_UPSTREAM_DONE", {
+                    "event_id":    event_id,
+                    "ndt_id":      ndt_id,
+                    "service":     service,
+                    "ok":          ok,
+                    "apply_ms":    apply_ms,
+                    "e2e_ms":      e2e_ms,
+                    "t_create_ns": t_create_ns,
+                    "t_rx_ns":     t_rx_ns,
+                    "t_done_ns":   t_done_ns,
+                    "queue_ms":    round((t_done_ns - t_rx_ns) / 1e6, 3),
+                })
+
+                registry.clear_inflight(event_id)
+
+                # Get current queued event_ids for status assignment
+                queued_ids = set(
+                    item["event_id"] for item in aq.drain_up_to(0)
+                )
+
+                _broadcast_state_update(
+                    bc_sock, registry,
+                    processed_event_id=event_id,
+                    processed_ndt_id=ndt_id,
+                    service=service,
+                    node=node,
+                    state=state,
+                    apply_ms=apply_ms,
+                    t_applied_ns=t_done_ns,
+                    t_create_ns=t_create_ns,
+                    queued_ids=queued_ids,
+                )
+
+                count_done_event(event_id)
+                limit_reached()
+
+    threading.Thread(target=_rx_loop,
+                     name="upstream-rx", daemon=True).start()
+    threading.Thread(target=_dispatch_loop,
+                     name="upstream-dispatch", daemon=True).start()
+
+    while True:
+        limit_reached()
+        time.sleep(0.1)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1030,6 +1330,25 @@ def run_agent(args: argparse.Namespace) -> None:
                      daemon=True).start()
     _build_log_prefix()
 
+    # Wait for Mininet to be fully ready before restoring state.
+    # topology.json is written only after Mininet has finished starting.
+    print("[AGENT] Waiting for Mininet to be ready...", flush=True)
+    for _ in range(90):
+        if os.path.exists(TOPO_FILE):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect((CONTROL_HOST, CONTROL_PORT))
+                s.close()
+                print("[AGENT] Mininet ready", flush=True)
+                break
+            except Exception:
+                pass
+        time.sleep(2)
+    else:
+        print("[AGENT] WARNING: Mininet not ready after timeout",
+              flush=True)
+
     # Load local topology graph
     g: Optional[Dict[str, List[str]]] = None
     try:
@@ -1041,7 +1360,7 @@ def run_agent(args: argparse.Namespace) -> None:
 
     # Restore saved network state if --ndt-id provided
     if args.ndt_id >= 0:
-        _restore_ndt_state(args.ndt_id)
+        _restore_ndt_state(args.ndt_id, g)
 
     # Connect to DTM core
     if args.proto == "udp":
@@ -1117,7 +1436,8 @@ def main() -> None:
     ap.add_argument("--relay-ip",    required=True)
     ap.add_argument("--relay-port",  type=int, default=7001)
     ap.add_argument("--onm-port",    type=int, default=7002)
-    ap.add_argument("--mode",        choices=["1:1", "federated", "agent"],
+    ap.add_argument("--mode",        choices=["1:1", "federated", "agent",
+                                              "upstream"],
                     default="1:1")
     ap.add_argument("--fanout",      type=int, default=0)
     ap.add_argument("--base-port",   type=int, default=8001)
@@ -1137,16 +1457,20 @@ def main() -> None:
     ap.add_argument("--event-limit", type=int, default=0)
     ap.add_argument("--print-progress", action="store_true")
     ap.add_argument("--experiment-duration", type=float, default=0)
-    # New args for NDT restart support
-    ap.add_argument("--ndt-id",         type=int, default=-1,
+    # ndt-id for agent mode — used to restore state on startup
+    ap.add_argument("--ndt-id",      type=int, default=-1,
                     help="[agent] NDT identifier (0-based) for state restore")
-    ap.add_argument("--restart-script", default=RESTART_SCRIPT_DEFAULT,
-                    help="[federated] path to restart_ndt.sh inside container")
-    ap.add_argument("--xrm",            action="store_true",
-                    help="[federated] include xrm-agent in restarted pods")
-    ap.add_argument("--xrm-core-ip",    default="",
-                    help="[federated] XRM core IP for restarted pods")
+    # upstream mode args
+    ap.add_argument("--onm-ip",      default="127.0.0.1",
+                    help="[upstream] ONM IP for XR service commands")
+    ap.add_argument("--onm-ack-timeout", type=float, default=10.0,
+                    help="[upstream] seconds to wait for ONM ACK")
     args = ap.parse_args()
+
+    # ── Upstream mode ─────────────────────────────────────────
+    if args.mode == "upstream":
+        run_upstream(args)
+        return
 
     # ── Agent mode — runs in NDT Pod ──────────────────────────
     if args.mode == "agent":
@@ -1185,7 +1509,6 @@ def main() -> None:
 
     gc.disable()
 
-    # Load topology graph (1:1 mode only — federated gets it via TOPOLOGY)
     g: Optional[Dict[str, List[str]]] = (
         load_topo_graph() if args.mode == "1:1" else None
     )
@@ -1224,7 +1547,6 @@ def main() -> None:
             token_bucket = tb,
             ack_tracker  = ack_tracker,
         )
-        # Initialise state manager — tracks NDT network state for restart
         state_mgr = DtmStateManager()
         print(
             f"[DTM] Federated | fanout={args.fanout} "
@@ -1274,18 +1596,18 @@ def main() -> None:
             "size_bytes": len(data),
         })
 
-        # ── 1:1 mode — apply directly on local NDT ────────────
+        # ── 1:1 mode ──────────────────────────────────────────
         if args.mode == "1:1":
             result = apply_event_on_ndt(
                 ev, g,
                 relay_port = args.relay_port,
-                dtm_ip     = "",        # no ACK in 1:1 mode
+                dtm_ip     = "",
                 ack_port   = 0,
             )
             count_done_event(event_id)
             limit_reached()
 
-        # ── Federated mode — fan out to NDT pods ──────────────
+        # ── Federated mode ────────────────────────────────────
         else:
             assert fast_sender is not None
 
@@ -1295,8 +1617,7 @@ def main() -> None:
                       flush=True)
                 continue
 
-            # Update state manager on every link change so restart
-            # can restore the NDT to its current state
+            # Update state manager on every link change
             if ev_type == "LOGICAL_LINK_SET" and state_mgr is not None:
                 p = ev.get("payload", {})
                 for ndt_id in range(args.fanout):
@@ -1309,31 +1630,14 @@ def main() -> None:
                         "up":       bool(p.get("up", True)),
                     })
 
-            # RESTART_NDT event — requested by XRM or operator
-            # Saves state and calls restart_ndt.sh via subprocess
+            # RESTART_NDT — write signal file for watch_restarts.sh
             if ev_type == "RESTART_NDT":
                 ndt_id = int(ev.get("payload", {}).get("ndt_id", -1))
                 if ndt_id < 0 or ndt_id >= args.fanout:
                     log_event("DTM_RESTART_INVALID",
                               {"event_id": event_id, "ndt_id": ndt_id})
                 else:
-                    def _do_restart(nid: int) -> None:
-                        restart_ndt(
-                            ndt_id         = nid,
-                            state_mgr      = state_mgr,
-                            restart_script = args.restart_script,
-                            dtm_ip         = args.relay_ip,
-                            base_port      = args.base_port,
-                            proto          = args.proto,
-                            ack_port       = args.ack_port,
-                            xrm            = args.xrm,
-                            xrm_core_ip    = args.xrm_core_ip,
-                        )
-                    # Run in background thread so main loop is not blocked
-                    threading.Thread(
-                        target=_do_restart, args=(ndt_id,),
-                        name=f"restart-ndt-{ndt_id}", daemon=True,
-                    ).start()
+                    request_ndt_restart(ndt_id)
                 continue
 
             t0 = time.time_ns()

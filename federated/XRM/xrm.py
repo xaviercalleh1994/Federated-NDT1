@@ -19,88 +19,88 @@ Date: 2026-04-08
 
 xrm.py — Extended Reality Manager
 ------------------------------------
-Manages XR services deployed on NDT pods.
+Manages XR service lifecycle and routes XR service commands.
 
 Modes
 -----
-1:1:
-  Runs inside pod-dtm-ndt alongside dtm (container name: xrm).
-  Acts as both core and agent — no network registration needed.
-  On startup: reads /tmp/xrm-state/ndt-0/state.json and
-  re-applies any saved network state via on_ndt.py:6001.
-  Accepts CLI commands directly (stdin) and via --script file.
+core:
+  Runs in pod-xrm. Manages XR service lifecycle only:
+    - deploy / stop services on NDT pods (via RESTART_NDT to DTM)
+    - maintain AgentRegistry of connected xrm-agents
+    - does NOT participate in the command data path
+  CLI via separate --mode cli process (kubectl exec, port 8103).
+
+cli:
+  Lightweight CLI connecting to a running core.
+  Sends commands to core via UDP :8103, receives replies on :8102.
+  No port binding conflicts with the running core.
+  Usage: kubectl exec -it pod-xrm -n ndt -- python3 xrm.py --mode cli
 
 agent:
-  Runs inside each ndt-i pod (container name: xrm-agent).
-  On startup: reads /tmp/xrm-state/ndt-{id}/state.json,
-  re-applies saved network state via on_ndt.py:6001,
-  then registers with XRM core via UDP.
-  Listens for commands from XRM core on UDP :8100.
-  Reports state back to XRM core.
+  Runs inside each ndt-i pod alongside the XR services.
+  Responsibilities:
+    1. Lifecycle: register with XRM core, receive deploy/stop signals.
+    2. Command routing: receive XR_SERVICE_CMD from ndt-event-cli via
+       NodePort :8110+ndt_id, route to correct service (localhost),
+       forward to DTM upstream for ON application.
+    3. Context: receive ON_STATE_UPDATE broadcast from DTM upstream,
+       store context, forward back to ndt-event-cli.
+  Does NOT call kubectl — lifecycle is managed by XRM core + DTM.
 
-core:
-  Runs in pod-xrm (container name: xrm).
-  Maintains registry of all connected xrm-agents.
-  Accepts CLI commands (stdin) and --script file.
-  Dispatches service commands to agents.
+1:1:
+  Core + agent in one process. Runs in pod-dtm-ndt.
+  Combines lifecycle and command routing for a single NDT.
 
-Service lifecycle (updated)
-----------------------------
-  The XRM does NOT manage pod lifecycle directly — that is the
-  DTM's responsibility. When deploying or stopping a service:
-    1. XRM core updates xrm-state/ndt-{id}/state.json with the
-       new service list.
-    2. XRM core sends a RESTART_NDT event to the DTM relay so
-       the DTM can restart the pod with the updated service list.
-    3. On pod restart, dtm-agent restores network state from
-       dtm-state and xrm-agent restores XR service state from
-       xrm-state — including launching any services listed there.
-  The XRM has no dependency on kubectl.
+Service lifecycle (XRM core only)
+----------------------------------
+  XRM core does NOT manage pod lifecycle directly.
+  On deploy/stop:
+    1. Updates /tmp/xrm-state/ndt-{id}/state.json with service list.
+    2. Sends RESTART_NDT event to DTM relay UDP :7001.
+    3. DTM writes restart_requested signal → watch_restarts.sh →
+       restart_ndt.sh → pod recreated with updated service list.
+  XRM has no dependency on kubectl.
 
-State persistence (for re-launching an NDT with a new XR service)
+Command data path (xrm-agent)
+------------------------------
+  ndt-event-cli → UDP NodePort :31100+ndt_id → pod :8110+ndt_id
+      ↓
+  xrm-agent: validates service, routes to service process (localhost)
+      ↓
+  actuator-control / node-scanner (localhost :9200/:9201)
+      ↓
+  xrm-agent forwards XR_SERVICE_CMD to DTM upstream UDP :7005
+      ↓
+  DTM upstream: AdmissionQueue (priority order, one-by-one)
+      ↓
+  ONM upstream: applies on ON (h1_1), sends ACK
+      ↓
+  DTM upstream: broadcast ON_STATE_UPDATE → xrm-agents UDP :8115+ndt_id
+      ↓
+  xrm-agent: stores context, forwards reply to ndt-event-cli
+
+State persistence
 -----------------
   /tmp/xrm-state/ndt-{id}/state.json  (hostPath on cluster node)
   {
     "ndt_id": N,
-    "links": [
-      {"a": "s1", "b": "s2", "delay_ms": 10,
-       "loss_pct": 0, "bw_mbps": 100, "up": true}
-    ],
-    "services": ["actuator-control"]
+    "services": ["actuator-control"],
+    "context": {<latest ON state>}
   }
-
-CLI commands (core and 1:1 modes)
-----------------------------------
-  list
-      Show all registered NDTs and their active services.
-
-  deploy SERVICE NDT [NDT ...]
-      Deploy a service on one or more NDTs.
-      Example: deploy actuator-control ndt-1 ndt-3
-               deploy node-scanner ndt-1
-
-  stop SERVICE NDT [NDT ...]
-      Stop a service on one or more NDTs.
-      Example: stop actuator-control ndt-1
-
-  restart NDT
-      Request DTM to restart an NDT pod (preserving network state).
-      Example: restart ndt-1
-
-  state NDT
-      Show current network state of an NDT.
-      Example: state ndt-2
-
-  services
-      List known service images.
-
-  quit
-      Exit.
 
 Ports
 -----
-  8100  xrm-agent rx      (XRM core → agent)
-  8101  XRM core rx       (agents → core, registration + state)
+  8100  xrm-core → xrm-agent      (lifecycle: deploy/stop signals)
+  8101  xrm-agent → xrm-core      (lifecycle: registration + results)
+  8102  xrm-core → xrm-cli        (CLI replies)
+  8103  xrm-cli → xrm-core        (CLI commands)
+  8110+i  ndt-event-cli → xrm-agent  (XR service commands, pod internal)
+  31100+i NodePort → xrm-agent :8110+i   (external access)
+  8115+i  DTM upstream → xrm-agent   (ON_STATE_UPDATE broadcast)
+  9200  xrm-agent → actuator-control  (localhost)
+  9201  xrm-agent → node-scanner      (localhost)
+  7001  xrm-core → DTM relay          (RESTART_NDT events)
+  7005  xrm-agent → DTM upstream      (XR_SERVICE_CMD)
 """
 import json
 import os
@@ -110,23 +110,38 @@ import uuid
 import socket
 import argparse
 import threading
-from collections import defaultdict
 from typing import Dict, List, Optional
 
 # ── Constants ────────────────────────────────────────────────
-CONTROL_HOST     = "127.0.0.1"
-CONTROL_PORT     = 6001
-AGENT_RX_PORT    = 8100   # xrm-agent listens for commands from core
-CORE_RX_PORT     = 8101   # xrm-core listens for registration + state
-STATE_BASE_PATH  = "/tmp/xrm-state"
-LOG_FILE_DEFAULT = "/tmp/xrm.log"
-NAMESPACE        = "ndt"
-# CLI mode reply port — used by cli mode to receive responses from core
-CLI_REPLY_PORT   = 8102
-# CLI mode command port — core listens for cli commands here
-CLI_CMD_PORT     = 8103
+CONTROL_HOST      = "127.0.0.1"
+CONTROL_PORT      = 6001
 
-# Known service images — add new services here
+# XRM lifecycle ports
+AGENT_RX_PORT     = 8100   # xrm-agent rx from core (lifecycle)
+CORE_RX_PORT      = 8101   # xrm-core rx from agents
+CLI_REPLY_PORT    = 8102   # xrm-core → xrm-cli replies
+CLI_CMD_PORT      = 8103   # xrm-cli → xrm-core commands
+
+# XR command data path ports
+CMD_BASE_PORT     = 8110   # ndt-event-cli → xrm-agent (pod internal, +ndt_id)
+BC_BASE_PORT      = 8115   # DTM upstream → xrm-agent broadcast (+ndt_id)
+REPLY_BASE_PORT   = 9210   # ndt-event-cli reply port base (+ ndt_id)
+
+# Service local ports (xrm-agent → service, localhost)
+SERVICE_PORTS = {
+    "actuator-control": 9200,
+    "node-scanner":     9201,
+}
+
+# DTM upstream port
+DTM_UPSTREAM_PORT = 7005   # xrm-agent → DTM upstream
+DTM_RELAY_PORT    = 7001   # xrm-core → DTM relay (RESTART_NDT)
+
+STATE_BASE_PATH   = "/tmp/xrm-state"
+LOG_FILE_DEFAULT  = "/tmp/xrm.log"
+NAMESPACE         = "ndt"
+
+# Known service images
 SERVICE_IMAGES = {
     "actuator-control": "actuator-control:1.0",
     "node-scanner":     "node-scanner:1.0",
@@ -150,30 +165,6 @@ def log_event(tag: str, data: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
-# on_ndt.py primitive caller (localhost:6001)
-# ─────────────────────────────────────────────────────────────
-
-def control_call(ev: dict) -> dict:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.settimeout(5.0)
-        s.connect((CONTROL_HOST, CONTROL_PORT))
-        s.sendall((json.dumps(ev) + "\n").encode())
-        data = b""
-        while b"\n" not in data:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        s.close()
-        return json.loads(data.split(b"\n")[0].decode()) if data \
-            else {"ok": False, "err": "no response"}
-    except Exception as e:
-        return {"ok": False, "err": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────
 # State persistence
 # ─────────────────────────────────────────────────────────────
 
@@ -182,12 +173,11 @@ def state_path(ndt_id: int) -> str:
 
 
 def load_state(ndt_id: int) -> dict:
-    path = state_path(ndt_id)
     try:
-        with open(path) as f:
+        with open(state_path(ndt_id)) as f:
             return json.load(f)
     except Exception:
-        return {"ndt_id": ndt_id, "links": [], "services": []}
+        return {"ndt_id": ndt_id, "services": [], "context": {}}
 
 
 def save_state(ndt_id: int, state: dict) -> None:
@@ -195,67 +185,7 @@ def save_state(ndt_id: int, state: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(state, f, indent=2)
-    log_event("XRM_STATE_SAVED", {"ndt_id": ndt_id, "path": path})
-
-
-# ─────────────────────────────────────────────────────────────
-# Network state restore
-# Reads saved links and re-applies them via on_ndt.py:6001.
-# Called on agent/1:1 startup after Mininet is ready.
-# ─────────────────────────────────────────────────────────────
-
-def restore_network_state(ndt_id: int) -> None:
-    state = load_state(ndt_id)
-    links = state.get("links", [])
-    if not links:
-        print(f"[XRM] ndt-{ndt_id}: no saved network state", flush=True)
-        return
-
-    print(f"[XRM] ndt-{ndt_id}: restoring {len(links)} links...",
-          flush=True)
-    for link in links:
-        resp = control_call({
-            "type": "LINK_SET",
-            "payload": {
-                "a":        link["a"],
-                "b":        link["b"],
-                "delay_ms": link.get("delay_ms", 0.0),
-                "loss_pct": link.get("loss_pct", 0.0),
-                "bw_mbps":  link.get("bw_mbps", 1000.0),
-                "up":       link.get("up", True),
-            },
-        })
-        log_event("XRM_LINK_RESTORED", {
-            "ndt_id": ndt_id,
-            "link":   link,
-            "ok":     resp.get("ok"),
-        })
-        print(f"[XRM]   {link['a']}↔{link['b']} ok={resp.get('ok')}",
-              flush=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# Network state snapshot
-# Queries on_ndt.py for current link state of all known links.
-# Returns list of link dicts.
-# ─────────────────────────────────────────────────────────────
-
-def snapshot_network_state(ndt_id: int) -> List[dict]:
-    """
-    Read current link state from the Mininet topology.
-    Uses SNAPSHOT primitive if available, otherwise reads
-    from saved state (conservative approach).
-    """
-    resp = control_call({"type": "SNAPSHOT"})
-    if resp.get("ok") and resp.get("links"):
-        links = resp["links"]
-        log_event("XRM_SNAPSHOT_OK", {"ndt_id": ndt_id,
-                                       "n_links": len(links)})
-        return links
-
-    # Fallback: return saved links
-    state = load_state(ndt_id)
-    return state.get("links", [])
+    log_event("XRM_STATE_SAVED", {"ndt_id": ndt_id})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -281,17 +211,15 @@ def make_udp_rx(port: int, timeout: float = 1.0) -> socket.socket:
 
 
 # ─────────────────────────────────────────────────────────────
-# DTM relay sender (core side, new)
-# Sends RESTART_NDT event to the DTM relay so the DTM can
-# restart the pod. The XRM has no kubectl dependency — pod
-# lifecycle is entirely the DTM's responsibility.
+# RESTART_NDT sender (XRM core → DTM relay)
 # ─────────────────────────────────────────────────────────────
 
 def send_restart_to_dtm(ndt_id: int, dtm_relay_ip: str,
                          dtm_relay_port: int) -> None:
     """
     Send RESTART_NDT event to DTM relay.
-    DTM will save network state and call restart_ndt.sh.
+    DTM writes restart_requested signal → watch_restarts.sh → pod restart.
+    XRM has no dependency on kubectl.
     """
     event_id = uuid.uuid4().hex[:12]
     ev = json.dumps({
@@ -317,43 +245,28 @@ def send_restart_to_dtm(ndt_id: int, dtm_relay_ip: str,
 
 
 # ─────────────────────────────────────────────────────────────
-# Service management (core side, updated)
-# The XRM updates xrm-state and sends RESTART_NDT to DTM.
-# The DTM restarts the pod — the XRM has no kubectl dependency.
+# Service lifecycle helpers (XRM core)
 # ─────────────────────────────────────────────────────────────
 
 def request_deploy_service(ndt_id: int, service_name: str,
                             dtm_relay_ip: str,
                             dtm_relay_port: int) -> dict:
     """
-    Request deploy of a service on an NDT pod.
-    Steps:
-      1. Validate service name.
-      2. Update xrm-state with new service.
-      3. Send RESTART_NDT to DTM — DTM restarts the pod.
-      4. On restart xrm-agent reads state.json and launches services.
-    Returns {ok, err}.
+    Deploy a service: update xrm-state, send RESTART_NDT to DTM.
     """
     if service_name not in SERVICE_IMAGES:
         return {"ok": False,
                 "err": f"Unknown service: {service_name}. "
                        f"Known: {list(SERVICE_IMAGES.keys())}"}
-
-    # Update xrm state with new service
     state = load_state(ndt_id)
     if service_name in state.get("services", []):
         return {"ok": False,
-                "err": f"Service {service_name} already in state"}
+                "err": f"Service {service_name} already deployed"}
     state.setdefault("services", []).append(service_name)
     save_state(ndt_id, state)
-
-    # Request DTM to restart the pod
     send_restart_to_dtm(ndt_id, dtm_relay_ip, dtm_relay_port)
-
-    log_event("XRM_DEPLOY_REQUESTED", {
-        "ndt_id":  ndt_id,
-        "service": service_name,
-    })
+    log_event("XRM_DEPLOY_REQUESTED",
+              {"ndt_id": ndt_id, "service": service_name})
     return {"ok": True}
 
 
@@ -361,41 +274,26 @@ def request_stop_service(ndt_id: int, service_name: str,
                           dtm_relay_ip: str,
                           dtm_relay_port: int) -> dict:
     """
-    Request stop of a service on an NDT pod.
-    Steps:
-      1. Remove service from xrm-state.
-      2. Send RESTART_NDT to DTM — DTM restarts the pod.
-      3. On restart xrm-agent reads state.json (service not listed).
-    Returns {ok, err}.
+    Stop a service: update xrm-state, send RESTART_NDT to DTM.
     """
     state = load_state(ndt_id)
     if service_name not in state.get("services", []):
         return {"ok": False,
-                "err": f"Service {service_name} not in state"}
-
+                "err": f"Service {service_name} not deployed"}
     state["services"] = [s for s in state.get("services", [])
                          if s != service_name]
     save_state(ndt_id, state)
-
-    # Request DTM to restart the pod
     send_restart_to_dtm(ndt_id, dtm_relay_ip, dtm_relay_port)
-
-    log_event("XRM_STOP_REQUESTED", {
-        "ndt_id":  ndt_id,
-        "service": service_name,
-    })
+    log_event("XRM_STOP_REQUESTED",
+              {"ndt_id": ndt_id, "service": service_name})
     return {"ok": True}
 
 
 # ─────────────────────────────────────────────────────────────
-# Agent registry (core side)
+# Agent registry (XRM core)
 # ─────────────────────────────────────────────────────────────
 
 class AgentRegistry:
-    """
-    Tracks all registered xrm-agents.
-    ndt_name → {ip, port, ndt_id, services, last_seen_ns}
-    """
     def __init__(self) -> None:
         self._lock   = threading.Lock()
         self._agents: Dict[str, dict] = {}
@@ -405,7 +303,6 @@ class AgentRegistry:
         with self._lock:
             self._agents[ndt_name] = {
                 "ip":           ip,
-                "port":         AGENT_RX_PORT,
                 "ndt_id":       ndt_id,
                 "services":     services,
                 "last_seen_ns": time.time_ns(),
@@ -424,12 +321,10 @@ class AgentRegistry:
                 self._agents[ndt_name]["last_seen_ns"] = time.time_ns()
 
     def get_ndt_id(self, ndt_name: str) -> int:
-        """Resolve ndt_name (e.g. 'ndt-1') to 0-based ndt_id."""
         with self._lock:
             agent = self._agents.get(ndt_name)
             if agent:
                 return int(agent["ndt_id"])
-        # Fallback: parse from name (ndt-1 → 0, ndt-2 → 1 ...)
         try:
             return int(ndt_name.split("-")[1]) - 1
         except Exception:
@@ -445,38 +340,12 @@ class AgentRegistry:
 
 
 # ─────────────────────────────────────────────────────────────
-# 1:1 mode
-# Core + agent in one. Runs in pod-dtm-ndt.
-# ─────────────────────────────────────────────────────────────
-
-def run_1to1(args: argparse.Namespace) -> None:
-    global _log_file
-    _log_file = args.log_file
-
-    ndt_id = 0
-
-    print(f"[XRM 1:1] Starting — ndt_id={ndt_id}", flush=True)
-
-    # Wait for on_ndt.py to be ready
-    _wait_for_on_ndt()
-
-    # Restore saved network state
-    restore_network_state(ndt_id)
-
-    # Load current service list
-    state    = load_state(ndt_id)
-    services = state.get("services", [])
-    print(f"[XRM 1:1] Active services: {services}", flush=True)
-
-    if args.script:
-        _run_script_1to1(args.script, ndt_id, args)
-    else:
-        _run_cli_1to1(ndt_id, args)
-
-
-# ─────────────────────────────────────────────────────────────
-# Agent mode
-# Runs in each ndt-i pod. Registers with XRM core.
+# Agent mode (new command data path)
+# Receives XR_SERVICE_CMD from ndt-event-cli via NodePort.
+# Routes to local service process (localhost).
+# Forwards to DTM upstream for ON application.
+# Receives ON_STATE_UPDATE broadcast, stores context,
+# forwards reply to ndt-event-cli.
 # ─────────────────────────────────────────────────────────────
 
 def run_agent(args: argparse.Namespace) -> None:
@@ -484,21 +353,39 @@ def run_agent(args: argparse.Namespace) -> None:
     _log_file = args.log_file
 
     ndt_id   = args.ndt_id
-    pod_name = f"ndt-{ndt_id + 1}"   # ndt_id is 0-based, pod name is 1-based
+    pod_name = f"ndt-{ndt_id + 1}"
+
+    cmd_port = CMD_BASE_PORT + ndt_id   # rx from ndt-event-cli
+    bc_port  = BC_BASE_PORT  + ndt_id   # rx ON_STATE_UPDATE from DTM
 
     print(f"[XRM-AGENT ndt_id={ndt_id}] Starting", flush=True)
+    print(f"[XRM-AGENT] cmd-rx :{cmd_port}  bc-rx :{bc_port}",
+          flush=True)
+    print(f"[XRM-AGENT] → DTM upstream {args.dtm_ip}:{DTM_UPSTREAM_PORT}",
+          flush=True)
 
-    # Wait for on_ndt.py to be ready
-    _wait_for_on_ndt()
+    # Command rx from ndt-event-cli
+    cmd_sock = make_udp_rx(cmd_port, timeout=1.0)
 
-    # Restore saved network state
-    restore_network_state(ndt_id)
+    # Broadcast rx from DTM upstream
+    bc_sock = make_udp_rx(bc_port, timeout=1.0)
 
-    # Register with XRM core
+    # Tx to DTM upstream
+    dtm_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Tx to local service processes (localhost)
+    svc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Tx replies to ndt-event-cli
+    reply_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Pending: event_id → client addr
+    _pending:      Dict[str, tuple] = {}
+    _pending_lock  = threading.Lock()
+
+    # Registration with XRM core
     state    = load_state(ndt_id)
     services = state.get("services", [])
-
-    rx_sock = make_udp_rx(AGENT_RX_PORT)
 
     def _register() -> None:
         while True:
@@ -513,70 +400,216 @@ def run_agent(args: argparse.Namespace) -> None:
     threading.Thread(target=_register, name="xrm-register",
                      daemon=True).start()
 
-    print(f"[XRM-AGENT ndt_id={ndt_id}] Ready — "
-          f"rx UDP :{AGENT_RX_PORT}", flush=True)
+    def _bc_rx_loop() -> None:
+        """
+        Receive ON_STATE_UPDATE broadcast from DTM upstream.
+        Store context locally and forward reply to ndt-event-cli.
+        """
+        while True:
+            try:
+                data, _ = bc_sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
 
-    # Command receive loop
-    # Agent only handles STATE queries — deploy/stop are managed
-    # by the core via DTM restart, not by the agent directly.
+            t_rx_ns = time.time_ns()
+            try:
+                bc = json.loads(data)
+            except Exception as exc:
+                log_event("XRM_AGENT_BC_PARSE_ERR", {"err": str(exc)})
+                continue
+
+            event_id    = str(bc.get("processed_event_id", ""))
+            your_status = bc.get("your_status", "PENDING")
+            state_data  = bc.get("state", {})
+            apply_ms    = bc.get("apply_ms", 0.0)
+            t_create    = int(bc.get("t_create_ns") or 0)
+            t_applied   = int(bc.get("t_applied_ns") or t_rx_ns)
+
+            # Store ON context
+            if state_data:
+                ctx = load_state(ndt_id)
+                ctx["context"] = {
+                    "event_id":     event_id,
+                    "your_status":  your_status,
+                    "t_applied_ns": t_applied,
+                    "t_rx_ns":      t_rx_ns,
+                    **state_data,
+                }
+                save_state(ndt_id, ctx)
+
+            e2e_ms = round((t_rx_ns - t_create) / 1e6, 3) \
+                if t_create and your_status == "ACK" else None
+
+            log_event("XRM_AGENT_BC_RX", {
+                "event_id":    event_id,
+                "your_status": your_status,
+                "apply_ms":    apply_ms,
+                "e2e_ms":      e2e_ms,
+                "ndt_id":      ndt_id,
+                "t_rx_ns":     t_rx_ns,
+            })
+
+            print(f"[XRM-AGENT ndt_id={ndt_id}] BC "
+                  f"status={your_status} e2e_ms={e2e_ms}",
+                  flush=True)
+
+            # Forward reply to ndt-event-cli if this is our command
+            with _pending_lock:
+                client_addr = _pending.pop(event_id, None)
+            if client_addr:
+                reply = json.dumps({
+                    "type":        "XR_SERVICE_REPLY",
+                    "event_id":    event_id,
+                    "ndt_id":      ndt_id,
+                    "your_status": your_status,
+                    "state":       state_data,
+                    "apply_ms":    apply_ms,
+                    "e2e_ms":      e2e_ms,
+                    "t_create_ns": t_create,
+                    "t_applied_ns": t_applied,
+                    "t_rx_ns":     t_rx_ns,
+                }).encode()
+                try:
+                    reply_sock.sendto(reply, client_addr)
+                except Exception as exc:
+                    log_event("XRM_AGENT_REPLY_ERR",
+                              {"event_id": event_id, "err": str(exc)})
+
+    threading.Thread(target=_bc_rx_loop,
+                     name="xrm-agent-bc-rx", daemon=True).start()
+
+    print(f"[XRM-AGENT ndt_id={ndt_id}] Ready", flush=True)
+
+    # ── Main command receive loop ─────────────────────────────
     while True:
         try:
-            data, _ = rx_sock.recvfrom(65535)
+            data, addr = cmd_sock.recvfrom(65535)
         except socket.timeout:
             continue
         except Exception:
             continue
 
+        t_rx_ns = time.time_ns()
         try:
             cmd = json.loads(data)
-        except Exception:
+        except Exception as exc:
+            log_event("XRM_AGENT_CMD_PARSE_ERR", {"err": str(exc)})
             continue
 
-        cmd_type = cmd.get("type", "")
-        req_id   = cmd.get("req_id", "")
+        ev_type  = cmd.get("type", "")
+        event_id = str(cmd.get("event_id", ""))
+        service  = cmd.get("service", "")
 
         log_event("XRM_AGENT_CMD_RX", {
+            "event_id": event_id,
+            "type":     ev_type,
+            "service":  service,
             "ndt_id":   ndt_id,
-            "cmd_type": cmd_type,
-            "req_id":   req_id,
+            "from":     addr[0],
+            "t_rx_ns":  t_rx_ns,
         })
 
-        if cmd_type == "STATE":
-            links  = snapshot_network_state(ndt_id)
-            state  = load_state(ndt_id)
-            result = {"ok": True, "links": links,
-                      "services": state.get("services", [])}
+        if ev_type == "XR_SERVICE_CMD":
+            # Validate service
+            if service not in SERVICE_PORTS:
+                err_reply = json.dumps({
+                    "type":        "XR_SERVICE_REPLY",
+                    "event_id":    event_id,
+                    "ndt_id":      ndt_id,
+                    "your_status": "DISCARDED",
+                    "err": f"Unknown service: {service}. "
+                           f"Known: {list(SERVICE_PORTS.keys())}",
+                }).encode()
+                reply_sock.sendto(err_reply, addr)
+                continue
+
+            # Register pending for broadcast reply.
+            # Use reply_ip + reply_port from cmd payload — the client
+            # includes its own IP explicitly because in K8s UDP NAT
+            # addr[0] seen by the pod is not the real client IP.
+            client_ip   = cmd.get("reply_ip", addr[0])
+            client_port = int(cmd.get("reply_port",
+                                      REPLY_BASE_PORT + ndt_id))
+            client_reply_addr = (client_ip, client_port)
+            with _pending_lock:
+                _pending[event_id] = client_reply_addr
+
+            # Route to local service (localhost)
+            svc_port = SERVICE_PORTS[service]
+            svc_cmd  = json.dumps({
+                **cmd,
+                "ndt_id":       ndt_id,
+                "agent_bc_port": bc_port,
+                "t_create_ns":  cmd.get("t_create_ns", t_rx_ns),
+            }).encode()
+            try:
+                svc_sock.sendto(svc_cmd,
+                                (CONTROL_HOST, svc_port))
+            except Exception as exc:
+                log_event("XRM_AGENT_SVC_ROUTE_ERR",
+                          {"event_id": event_id, "err": str(exc)})
+
+            # Forward XR_SERVICE_CMD to DTM upstream
+            upstream_cmd = json.dumps({
+                "type":         "XR_SERVICE_CMD",
+                "event_id":     event_id,
+                "ndt_id":       ndt_id,
+                "service":      service,
+                "priority":     int(cmd.get("priority", 50)),
+                "t_create_ns":  cmd.get("t_create_ns", t_rx_ns),
+                "agent_bc_port": bc_port,
+                "payload":      cmd.get("payload", {}),
+            }).encode()
+            try:
+                dtm_sock.sendto(upstream_cmd,
+                                (args.dtm_ip, DTM_UPSTREAM_PORT))
+                log_event("XRM_AGENT_CMD_FORWARDED_DTM", {
+                    "event_id": event_id,
+                    "service":  service,
+                    "ndt_id":   ndt_id,
+                    "t_rx_ns":  t_rx_ns,
+                })
+            except Exception as exc:
+                log_event("XRM_AGENT_DTM_FWD_ERR",
+                          {"event_id": event_id, "err": str(exc)})
+                with _pending_lock:
+                    _pending.pop(event_id, None)
+                reply_sock.sendto(json.dumps({
+                    "type":        "XR_SERVICE_REPLY",
+                    "event_id":    event_id,
+                    "ndt_id":      ndt_id,
+                    "your_status": "DISCARDED",
+                    "err":         str(exc),
+                }).encode(), addr)
+
+        elif ev_type == "XR_SERVICE_GET":
+            # Return current ON context
+            ctx = load_state(ndt_id).get("context", {})
+            reply_sock.sendto(json.dumps({
+                "type":     "XR_SERVICE_STATE",
+                "event_id": event_id,
+                "ndt_id":   ndt_id,
+                "context":  ctx,
+            }).encode(), addr)
+
         else:
-            result = {"ok": False, "err": f"Unknown cmd: {cmd_type}"}
-
-        # Send result back to core
-        udp_send(args.core_ip, CORE_RX_PORT, {
-            "type":     "CMD_RESULT",
-            "req_id":   req_id,
-            "ndt_name": pod_name,
-            "ndt_id":   ndt_id,
-            **result,
-        })
-
-        print(f"[XRM-AGENT ndt_id={ndt_id}] "
-              f"{cmd_type} ok={result.get('ok')}",
-              flush=True)
+            log_event("XRM_AGENT_UNKNOWN_CMD",
+                      {"event_id": event_id, "type": ev_type})
 
 
 # ─────────────────────────────────────────────────────────────
-# Core mode
-# Runs in pod-xrm. CLI + script. Manages all agents.
+# Core mode — lifecycle management only
 # ─────────────────────────────────────────────────────────────
 
 def run_core(args: argparse.Namespace) -> None:
     global _log_file
     _log_file = args.log_file
 
-    registry = AgentRegistry()
-    rx_sock  = make_udp_rx(CORE_RX_PORT)
-
-    # Pending command results: req_id → threading.Event + result
-    _pending: Dict[str, dict] = {}
+    registry     = AgentRegistry()
+    rx_sock      = make_udp_rx(CORE_RX_PORT)
+    _pending:    Dict[str, dict] = {}
     _pending_lock = threading.Lock()
 
     def _rx_loop() -> None:
@@ -593,21 +626,17 @@ def run_core(args: argparse.Namespace) -> None:
                 continue
 
             msg_type = msg.get("type", "")
-
             if msg_type == "REGISTER":
                 registry.register(
-                    ndt_name = msg.get("ndt_name", ""),
-                    ip       = addr[0],
-                    ndt_id   = int(msg.get("ndt_id", -1)),
-                    services = msg.get("services", []),
+                    ndt_name=msg.get("ndt_name", ""),
+                    ip=addr[0],
+                    ndt_id=int(msg.get("ndt_id", -1)),
+                    services=msg.get("services", []),
                 )
-
             elif msg_type == "CMD_RESULT":
                 req_id = msg.get("req_id", "")
-                registry.update(
-                    msg.get("ndt_name", ""),
-                    msg.get("services", []),
-                )
+                registry.update(msg.get("ndt_name", ""),
+                                msg.get("services", []))
                 with _pending_lock:
                     if req_id in _pending:
                         _pending[req_id]["result"] = msg
@@ -616,9 +645,7 @@ def run_core(args: argparse.Namespace) -> None:
     threading.Thread(target=_rx_loop, name="xrm-core-rx",
                      daemon=True).start()
 
-    # CLI command listener — receives commands from cli mode instances
-    # running in the same pod via kubectl exec. Uses a separate port
-    # so cli mode does not conflict with the agent registration port.
+    # CLI command listener (from --mode cli process)
     cli_sock = make_udp_rx(CLI_CMD_PORT, timeout=0.5)
 
     def _cli_cmd_loop() -> None:
@@ -634,28 +661,12 @@ def run_core(args: argparse.Namespace) -> None:
             except Exception:
                 continue
 
-            cmd_type  = cmd.get("type", "")
-            reply_ip  = cmd.get("_reply_ip", addr[0])
+            cmd_type   = cmd.get("type", "")
+            reply_ip   = cmd.get("_reply_ip", addr[0])
             reply_port = int(cmd.get("_reply_port", CLI_REPLY_PORT))
 
             if cmd_type == "CLI_LIST":
-                agents = registry.all()
-                result = {"ok": True, "agents": agents}
-
-            elif cmd_type == "CLI_STATE":
-                ndt_name = cmd.get("ndt_name", "")
-                result   = _send_cmd(ndt_name, "STATE", timeout=15.0)
-
-            elif cmd_type == "CLI_RESTART":
-                ndt_name = cmd.get("ndt_name", "")
-                ndt_id   = registry.get_ndt_id(ndt_name)
-                if ndt_id < 0:
-                    result = {"ok": False,
-                              "err": f"could not resolve {ndt_name}"}
-                else:
-                    send_restart_to_dtm(
-                        ndt_id, args.dtm_relay_ip, args.dtm_relay_port)
-                    result = {"ok": True}
+                result = {"ok": True, "agents": registry.all()}
 
             elif cmd_type == "CLI_DEPLOY":
                 ndt_name = cmd.get("ndt_name", "")
@@ -683,15 +694,40 @@ def run_core(args: argparse.Namespace) -> None:
                         args.dtm_relay_ip, args.dtm_relay_port,
                     )
 
+            elif cmd_type == "CLI_RESTART":
+                ndt_name = cmd.get("ndt_name", "")
+                ndt_id   = registry.get_ndt_id(ndt_name)
+                if ndt_id < 0:
+                    result = {"ok": False,
+                              "err": f"could not resolve {ndt_name}"}
+                else:
+                    send_restart_to_dtm(ndt_id, args.dtm_relay_ip,
+                                        args.dtm_relay_port)
+                    result = {"ok": True}
+
+            elif cmd_type == "CLI_STATE":
+                ndt_name = cmd.get("ndt_name", "")
+                agent    = registry.get(ndt_name)
+                if not agent:
+                    result = {"ok": False,
+                              "err": f"{ndt_name} not registered"}
+                else:
+                    ndt_id = agent["ndt_id"]
+                    ctx    = load_state(ndt_id).get("context", {})
+                    result = {"ok": True,
+                              "services": agent["services"],
+                              "context":  ctx}
+
             else:
-                result = {"ok": False, "err": f"unknown cmd: {cmd_type}"}
+                result = {"ok": False,
+                          "err": f"unknown cmd: {cmd_type}"}
 
             try:
-                reply_sock_out = socket.socket(
-                    socket.AF_INET, socket.SOCK_DGRAM)
-                reply_sock_out.sendto(
-                    json.dumps(result).encode(), (reply_ip, reply_port))
-                reply_sock_out.close()
+                out_sock = socket.socket(socket.AF_INET,
+                                         socket.SOCK_DGRAM)
+                out_sock.sendto(json.dumps(result).encode(),
+                                (reply_ip, reply_port))
+                out_sock.close()
             except Exception:
                 pass
 
@@ -699,342 +735,25 @@ def run_core(args: argparse.Namespace) -> None:
                      daemon=True).start()
 
     print(f"[XRM-CORE] Ready — rx UDP :{CORE_RX_PORT}", flush=True)
-
-    def _send_cmd(ndt_name: str, cmd_type: str,
-                  timeout: float = 15.0) -> dict:
-        """Send command to agent and wait for result."""
-        agent = registry.get(ndt_name)
-        if not agent:
-            return {"ok": False,
-                    "err": f"{ndt_name} not registered"}
-
-        req_id = uuid.uuid4().hex[:12]
-        ev     = threading.Event()
-        with _pending_lock:
-            _pending[req_id] = {"event": ev, "result": None}
-
-        udp_send(agent["ip"], AGENT_RX_PORT, {
-            "type":   cmd_type,
-            "req_id": req_id,
-        })
-
-        ev.wait(timeout=timeout)
-        with _pending_lock:
-            entry = _pending.pop(req_id, {})
-
-        result = entry.get("result")
-        if result is None:
-            return {"ok": False, "err": "timeout"}
-        return result
-
-    if args.script:
-        _run_script_core(args.script, registry, _send_cmd, args)
-    else:
-        _run_cli_core(registry, _send_cmd, args)
-
-
-# ─────────────────────────────────────────────────────────────
-# CLI helpers
-# ─────────────────────────────────────────────────────────────
-
-def _wait_for_on_ndt(retries: int = 60, interval: float = 2.0) -> None:
-    """Wait until on_ndt.py is accepting connections on :6001."""
-    for _ in range(retries):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect((CONTROL_HOST, CONTROL_PORT))
-            s.close()
-            print("[XRM] on_ndt.py ready", flush=True)
-            return
-        except Exception:
-            time.sleep(interval)
-    print("[XRM] WARNING: on_ndt.py not ready after timeout",
+    print(f"[XRM-CORE] CLI rx :{CLI_CMD_PORT}", flush=True)
+    print("[XRM-CORE] Lifecycle only — command routing via xrm-agents",
           flush=True)
 
-
-def _print_help_1to1() -> None:
-    print("Commands:")
-    print("  deploy SERVICE     — request deploy of service on this NDT")
-    print("  stop   SERVICE     — request stop of service on this NDT")
-    print("  state              — show network state")
-    print("  services           — list known service images")
-    print("  quit")
-    print(f"Known services: {list(SERVICE_IMAGES.keys())}\n")
-
-
-def _print_help_core() -> None:
-    print("Commands:")
-    print("  list                        — show all NDTs and services")
-    print("  deploy SERVICE NDT [NDT...] — request deploy on NDTs via DTM")
-    print("  stop   SERVICE NDT [NDT...] — request stop on NDTs via DTM")
-    print("  restart NDT                 — request DTM to restart NDT")
-    print("  state  NDT                  — show network state of NDT")
-    print("  services                    — list known service images")
-    print("  quit")
-    print(f"Known services: {list(SERVICE_IMAGES.keys())}\n")
-
-
-def _run_cli_1to1(ndt_id: int, args: argparse.Namespace) -> None:
-    """Interactive CLI for 1:1 mode."""
-    _print_help_1to1()
     while True:
-        try:
-            line = input("[XRM 1:1] > ").strip()
-        except EOFError:
-            break
-        if not line:
-            continue
-        parts = line.split()
-        cmd   = parts[0].lower()
-
-        if cmd == "quit":
-            break
-        elif cmd == "services":
-            for name, image in SERVICE_IMAGES.items():
-                print(f"  {name}: {image}")
-        elif cmd == "state":
-            links = snapshot_network_state(ndt_id)
-            state = load_state(ndt_id)
-            print(f"  Links ({len(links)}):")
-            for lk in links:
-                print(f"    {lk['a']}↔{lk['b']} "
-                      f"up={lk.get('up')} "
-                      f"delay={lk.get('delay_ms')}ms "
-                      f"bw={lk.get('bw_mbps')}Mbps")
-            print(f"  Services: {state.get('services', [])}")
-        elif cmd == "deploy" and len(parts) == 2:
-            service = parts[1]
-            print(f"  Requesting deploy of {service}...")
-            result = request_deploy_service(
-                ndt_id, service,
-                args.dtm_relay_ip, args.dtm_relay_port,
-            )
-            if result["ok"]:
-                print(f"  ✓ {service}: restart requested to DTM.")
-            else:
-                print(f"  ✗ {result.get('err')}")
-        elif cmd == "stop" and len(parts) == 2:
-            service = parts[1]
-            print(f"  Requesting stop of {service}...")
-            result = request_stop_service(
-                ndt_id, service,
-                args.dtm_relay_ip, args.dtm_relay_port,
-            )
-            if result["ok"]:
-                print(f"  ✓ {service}: restart requested to DTM.")
-            else:
-                print(f"  ✗ {result.get('err')}")
-        else:
-            _print_help_1to1()
-
-
-def _run_cli_core(registry: AgentRegistry, send_cmd,
-                  args: argparse.Namespace) -> None:
-    """Interactive CLI for core mode."""
-    _print_help_core()
-    while True:
-        try:
-            line = input("[XRM-CORE] > ").strip()
-        except EOFError:
-            break
-        if not line:
-            continue
-        parts = line.split()
-        cmd   = parts[0].lower()
-
-        if cmd == "quit":
-            break
-
-        elif cmd == "list":
-            agents = registry.all()
-            if not agents:
-                print("  No NDTs registered yet.")
-            for name, info in sorted(agents.items()):
-                print(f"  {name}  ip={info['ip']}  "
-                      f"services={info['services']}")
-
-        elif cmd == "services":
-            for name, image in SERVICE_IMAGES.items():
-                print(f"  {name}: {image}")
-
-        elif cmd == "state" and len(parts) == 2:
-            ndt_name = parts[1]
-            print(f"  Querying {ndt_name}...")
-            result = send_cmd(ndt_name, "STATE", timeout=15.0)
-            if result.get("ok"):
-                links = result.get("links", [])
-                print(f"  Links ({len(links)}):")
-                for lk in links:
-                    print(f"    {lk['a']}↔{lk['b']} "
-                          f"up={lk.get('up')} "
-                          f"delay={lk.get('delay_ms')}ms "
-                          f"bw={lk.get('bw_mbps')}Mbps")
-                print(f"  Services: {result.get('services', [])}")
-            else:
-                print(f"  ✗ {result.get('err')}")
-
-        elif cmd == "restart" and len(parts) == 2:
-            # Send RESTART_NDT directly to DTM
-            ndt_name = parts[1]
-            ndt_id   = registry.get_ndt_id(ndt_name)
-            if ndt_id < 0:
-                print(f"  ✗ Could not resolve ndt_id for {ndt_name}")
-            else:
-                send_restart_to_dtm(
-                    ndt_id, args.dtm_relay_ip, args.dtm_relay_port)
-                print(f"  ✓ RESTART_NDT sent to DTM for {ndt_name}")
-
-        elif cmd == "deploy" and len(parts) >= 3:
-            service   = parts[1]
-            ndt_names = parts[2:]
-            for ndt_name in ndt_names:
-                ndt_id = registry.get_ndt_id(ndt_name)
-                if ndt_id < 0:
-                    print(f"  ✗ {ndt_name}: could not resolve ndt_id")
-                    continue
-                print(f"  Requesting deploy of {service} on {ndt_name}...")
-                result = request_deploy_service(
-                    ndt_id, service,
-                    args.dtm_relay_ip, args.dtm_relay_port,
-                )
-                if result.get("ok"):
-                    print(f"  ✓ {ndt_name}: restart requested to DTM.")
-                else:
-                    print(f"  ✗ {ndt_name}: {result.get('err')}")
-
-        elif cmd == "stop" and len(parts) >= 3:
-            service   = parts[1]
-            ndt_names = parts[2:]
-            for ndt_name in ndt_names:
-                ndt_id = registry.get_ndt_id(ndt_name)
-                if ndt_id < 0:
-                    print(f"  ✗ {ndt_name}: could not resolve ndt_id")
-                    continue
-                print(f"  Requesting stop of {service} on {ndt_name}...")
-                result = request_stop_service(
-                    ndt_id, service,
-                    args.dtm_relay_ip, args.dtm_relay_port,
-                )
-                if result.get("ok"):
-                    print(f"  ✓ {ndt_name}: restart requested to DTM.")
-                else:
-                    print(f"  ✗ {ndt_name}: {result.get('err')}")
-
-        else:
-            _print_help_core()
-
-
-def _run_script_1to1(script_path: str, ndt_id: int,
-                     args: argparse.Namespace) -> None:
-    """Execute commands from script file (1:1 mode)."""
-    with open(script_path) as f:
-        lines = [l.strip() for l in f
-                 if l.strip() and not l.startswith("#")]
-    for line in lines:
-        print(f"[XRM 1:1] > {line}", flush=True)
-        parts = line.split()
-        cmd   = parts[0].lower()
-        if cmd == "deploy" and len(parts) == 2:
-            result = request_deploy_service(
-                ndt_id, parts[1],
-                args.dtm_relay_ip, args.dtm_relay_port,
-            )
-            print(f"  {'✓' if result['ok'] else '✗'} "
-                  f"{result.get('err', 'restart requested')}",
-                  flush=True)
-        elif cmd == "stop" and len(parts) == 2:
-            result = request_stop_service(
-                ndt_id, parts[1],
-                args.dtm_relay_ip, args.dtm_relay_port,
-            )
-            print(f"  {'✓' if result['ok'] else '✗'} "
-                  f"{result.get('err', 'restart requested')}",
-                  flush=True)
-        time.sleep(0.5)
-
-
-def _run_script_core(script_path: str, registry: AgentRegistry,
-                     send_cmd, args: argparse.Namespace) -> None:
-    """Execute commands from script file (core mode)."""
-    with open(script_path) as f:
-        lines = [l.strip() for l in f
-                 if l.strip() and not l.startswith("#")]
-    for line in lines:
-        print(f"[XRM-CORE] > {line}", flush=True)
-        parts = line.split()
-        cmd   = parts[0].lower()
-        if cmd == "deploy" and len(parts) >= 3:
-            service   = parts[1]
-            ndt_names = parts[2:]
-            for ndt_name in ndt_names:
-                ndt_id = registry.get_ndt_id(ndt_name)
-                if ndt_id < 0:
-                    print(f"  ✗ {ndt_name}: could not resolve ndt_id",
-                          flush=True)
-                    continue
-                result = request_deploy_service(
-                    ndt_id, service,
-                    args.dtm_relay_ip, args.dtm_relay_port,
-                )
-                print(f"  {ndt_name}: "
-                      f"{'✓' if result['ok'] else '✗'} "
-                      f"{result.get('err', 'restart requested')}",
-                      flush=True)
-        elif cmd == "stop" and len(parts) >= 3:
-            service   = parts[1]
-            ndt_names = parts[2:]
-            for ndt_name in ndt_names:
-                ndt_id = registry.get_ndt_id(ndt_name)
-                if ndt_id < 0:
-                    print(f"  ✗ {ndt_name}: could not resolve ndt_id",
-                          flush=True)
-                    continue
-                result = request_stop_service(
-                    ndt_id, service,
-                    args.dtm_relay_ip, args.dtm_relay_port,
-                )
-                print(f"  {ndt_name}: "
-                      f"{'✓' if result['ok'] else '✗'} "
-                      f"{result.get('err', 'restart requested')}",
-                      flush=True)
-        elif cmd == "restart" and len(parts) == 2:
-            ndt_name = parts[1]
-            ndt_id   = registry.get_ndt_id(ndt_name)
-            if ndt_id >= 0:
-                send_restart_to_dtm(
-                    ndt_id, args.dtm_relay_ip, args.dtm_relay_port)
-                print(f"  {ndt_name}: ✓ restart requested", flush=True)
-        time.sleep(0.5)
+        time.sleep(60)
 
 
 # ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────
-# CLI mode (new)
-# Lightweight interactive CLI that connects to a running core.
-# Does NOT bind the core port (8101) — uses an ephemeral reply
-# port (8102) to receive responses from the core.
-# Intended use: kubectl exec -it pod-xrm -n ndt -- \
-#               python3 xrm.py --mode cli
+# CLI mode — connects to running core
 # ─────────────────────────────────────────────────────────────
 
 def run_cli(args: argparse.Namespace) -> None:
-    """
-    CLI mode — connects to a running XRM core.
-    Sends commands to the core via UDP and receives replies.
-    No ports bound except the ephemeral reply socket.
-    """
     global _log_file
     _log_file = args.log_file
 
-    # Reply socket — ephemeral port for receiving core responses
     reply_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     reply_sock.bind(("0.0.0.0", CLI_REPLY_PORT))
     reply_sock.settimeout(10.0)
-
     core_ip = args.core_ip
 
     def send_and_wait(cmd: dict) -> dict:
@@ -1090,14 +809,14 @@ def run_cli(args: argparse.Namespace) -> None:
                 "ndt_name": parts[1],
             })
             if result.get("ok"):
-                links = result.get("links", [])
-                print(f"  Links ({len(links)}):")
-                for lk in links:
-                    print(f"    {lk['a']}↔{lk['b']} "
-                          f"up={lk.get('up')} "
-                          f"delay={lk.get('delay_ms')}ms "
-                          f"bw={lk.get('bw_mbps')}Mbps")
                 print(f"  Services: {result.get('services', [])}")
+                ctx = result.get("context", {})
+                if ctx:
+                    print("  ON context:")
+                    for k, v in ctx.items():
+                        print(f"    {k}: {v}")
+                else:
+                    print("  (no ON context yet)")
             else:
                 print(f"  ✗ {result.get('err')}")
 
@@ -1121,7 +840,7 @@ def run_cli(args: argparse.Namespace) -> None:
                     "service":  service,
                 })
                 if result.get("ok"):
-                    print(f"  ✓ {ndt_name}: restart requested to DTM.")
+                    print(f"  ✓ {ndt_name}: {service} deploy requested")
                 else:
                     print(f"  ✗ {ndt_name}: {result.get('err')}")
 
@@ -1135,7 +854,7 @@ def run_cli(args: argparse.Namespace) -> None:
                     "service":  service,
                 })
                 if result.get("ok"):
-                    print(f"  ✓ {ndt_name}: restart requested to DTM.")
+                    print(f"  ✓ {ndt_name}: {service} stop requested")
                 else:
                     print(f"  ✗ {ndt_name}: {result.get('err')}")
 
@@ -1145,6 +864,45 @@ def run_cli(args: argparse.Namespace) -> None:
     reply_sock.close()
 
 
+# ─────────────────────────────────────────────────────────────
+# 1:1 mode — core + agent combined
+# ─────────────────────────────────────────────────────────────
+
+def run_1to1(args: argparse.Namespace) -> None:
+    global _log_file
+    _log_file = args.log_file
+
+    ndt_id = 0
+    print(f"[XRM 1:1] Starting — ndt_id={ndt_id}", flush=True)
+
+    state    = load_state(ndt_id)
+    services = state.get("services", [])
+    print(f"[XRM 1:1] Active services: {services}", flush=True)
+
+    # Run agent loop in this thread
+    run_agent(args)
+
+
+# ─────────────────────────────────────────────────────────────
+# CLI help
+# ─────────────────────────────────────────────────────────────
+
+def _print_help_core() -> None:
+    print("Commands:")
+    print("  list                        — show all NDTs and services")
+    print("  deploy SERVICE NDT [NDT...] — deploy service (lifecycle)")
+    print("  stop   SERVICE NDT [NDT...] — stop service (lifecycle)")
+    print("  restart NDT                 — request pod restart via DTM")
+    print("  state  NDT                  — show ON context of NDT")
+    print("  services                    — list known service images")
+    print("  quit")
+    print(f"Known services: {list(SERVICE_IMAGES.keys())}\n")
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="XRM — Extended Reality Manager"
@@ -1153,17 +911,16 @@ def main() -> None:
                     choices=["1:1", "agent", "core", "cli"],
                     required=True)
     ap.add_argument("--ndt-id",          type=int, default=0,
-                    help="[agent] NDT identifier (0-based)")
+                    help="[agent/1:1] NDT identifier (0-based)")
     ap.add_argument("--core-ip",         default="127.0.0.1",
-                    help="[agent] XRM core IP")
-    ap.add_argument("--script",          default="",
-                    help="[1:1/core] path to command script file")
-    ap.add_argument("--log-file",        default=LOG_FILE_DEFAULT)
-    # DTM relay connection — needed to send RESTART_NDT events
+                    help="[agent/cli] XRM core IP")
+    ap.add_argument("--dtm-ip",          default="127.0.0.1",
+                    help="[agent] DTM upstream IP for XR_SERVICE_CMD")
     ap.add_argument("--dtm-relay-ip",    default="127.0.0.1",
-                    help="[core/1:1] DTM relay IP for RESTART_NDT events")
-    ap.add_argument("--dtm-relay-port",  type=int, default=7001,
-                    help="[core/1:1] DTM relay port")
+                    help="[core/cli] DTM relay IP for RESTART_NDT events")
+    ap.add_argument("--dtm-relay-port",  type=int, default=DTM_RELAY_PORT,
+                    help="[core/cli] DTM relay port")
+    ap.add_argument("--log-file",        default=LOG_FILE_DEFAULT)
     args = ap.parse_args()
 
     if args.mode == "1:1":

@@ -60,6 +60,7 @@ echo "[RESTART] ${POD_NAME} requested by DTM" >&2
 # ── XRM optional blocks ──────────────────────────────────────
 XRM_VOLUME=""
 XRM_CONTAINER=""
+SVC_CONTAINERS=""
 if [ "${XRM}" = "1" ]; then
     mkdir -p "/tmp/xrm-state/ndt-${NDT_ID}"
     XRM_VOLUME="
@@ -78,6 +79,8 @@ if [ "${XRM}" = "1" ]; then
         - \"${NDT_ID}\"
         - \"--core-ip\"
         - \"${XRM_CORE_IP}\"
+        - \"--dtm-ip\"
+        - \"${DTM_IP}\"
         - \"--log-file\"
         - \"/tmp/xrm_agent_${NDT_ID}.log\"
       volumeMounts:
@@ -85,6 +88,37 @@ if [ "${XRM}" = "1" ]; then
           mountPath: /run
         - name: xrm-state
           mountPath: /tmp/xrm-state/ndt-${NDT_ID}"
+
+    # Read deployed services from xrm-state and build service containers
+    XRM_STATE="/tmp/xrm-state/ndt-${NDT_ID}/state.json"
+    if [ -f "${XRM_STATE}" ]; then
+        SERVICES=$(python3 -c "
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+    print('\\n'.join(s.get('services', [])))
+except: pass
+" "${XRM_STATE}" 2>/dev/null || echo "")
+        while IFS= read -r SVC; do
+            [ -z "${SVC}" ] && continue
+            SVC_IMAGE="${SVC}:1.0"
+            SVC_CONTAINERS="${SVC_CONTAINERS}
+    - name: ${SVC}
+      image: ${SVC_IMAGE}
+      imagePullPolicy: Never
+      args:
+        - \"--ndt-id\"
+        - \"${NDT_ID}\"
+        - \"--log-file\"
+        - \"/tmp/${SVC}_${NDT_ID}.log\"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: xrm-state
+          mountPath: /tmp/xrm-state/ndt-${NDT_ID}"
+            echo "[RESTART] Adding service: ${SVC}" >&2
+        done <<< "${SERVICES}"
+    fi
 fi
 
 # ── Delete existing pod ───────────────────────────────────────
@@ -181,7 +215,7 @@ spec:
         - name: dtm-state
           mountPath: /tmp/dtm-state/ndt-${NDT_ID}
         - name: scripts
-          mountPath: /scripts${XRM_CONTAINER}
+          mountPath: /scripts${XRM_CONTAINER}${SVC_CONTAINERS}
 ---
 apiVersion: v1
 kind: Service

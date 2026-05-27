@@ -21,15 +21,17 @@
 # Mode federated:
 #   pod-on      : ON (Mininet)
 #   pod-onm     : ONM
-#   pod-dtm     : DTM core  (hostNetwork, scripts hostPath mounted)
+#   pod-dtm     : DTM core  (hostNetwork, dtm-state hostPath mounted)
 #   ndt-i       : NDT (Mininet) + DTM agent
 #                 + XRM agent (if --xrm)
 #   pod-xrm     : XRM core (if --xrm)
+#   watch_restarts.sh : daemon on host watching for DTM restart signals
 #
 # Changes vs v1.6:
 #   - NODE_IP obtained generically from first cluster node.
-#   - pod-dtm mounts scripts hostPath so DTM can call
-#     restart_ndt.sh via subprocess.
+#   - pod-dtm mounts dtm-state hostPath so DTM can persist NDT state.
+#   - watch_restarts.sh started as background daemon — detects restart
+#     signal files written by DTM and calls restart_ndt.sh.
 #   - --xrm flag enables XRM containers (v2.0).
 #   - All other logic identical to v1.6.
 #
@@ -88,6 +90,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+NDT_SCRIPTS="${REPO_ROOT}/ndt_deployment/mininet_ndts"
 NAMESPACE="ndt"
 
 # Generic node IP — works on any cluster regardless of node name
@@ -222,7 +225,10 @@ else
     kubectl delete service svc-dtm -n "${NAMESPACE}" \
         --ignore-not-found > /dev/null 2>&1 || true
 
-    # pod-dtm mounts scripts hostPath so DTM can call restart_ndt.sh
+    # Ensure dtm-state base directory exists on host
+    mkdir -p /tmp/dtm-state
+
+    # pod-dtm — mounts dtm-state hostPath so DTM can persist NDT state
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -240,22 +246,10 @@ spec:
       hostPath:
         path: /tmp/ndt-run
         type: DirectoryOrCreate
-    - name: scripts
-      hostPath:
-        path: ${REPO_ROOT}/ndt_deployment/mininet_ndts
-        type: Directory
     - name: dtm-state
       hostPath:
         path: /tmp/dtm-state
         type: DirectoryOrCreate
-    - name: kubectl-bin
-      hostPath:
-        path: /usr/bin/kubectl
-        type: File
-    - name: kubeconfig
-      hostPath:
-        path: /root/.kube
-        type: Directory
   containers:
     - name: dtm
       image: dtm:1.0
@@ -279,8 +273,6 @@ spec:
         - "${BASE_PORT}"
         - "--feedback-port"
         - "9000"
-        - "--restart-script"
-        - "/scripts/restart_ndt.sh"
         - "--experiment-duration"
         - "0"
         - "--log-file"
@@ -288,19 +280,14 @@ spec:
       volumeMounts:
         - name: run-data
           mountPath: /run
-        - name: scripts
-          mountPath: /scripts
         - name: dtm-state
           mountPath: /tmp/dtm-state
-        - name: kubectl-bin
-          mountPath: /usr/local/bin/kubectl
-        - name: kubeconfig
-          mountPath: /root/.kube
 EOF
 
     echo "  DTM core launched."
 
     # pod-xrm — only if --xrm
+    # stdin + tty keep the pod alive and allow kubectl exec -it to attach
     if [ "${XRM}" = "1" ]; then
         kubectl apply -f - <<EOF
 apiVersion: v1
@@ -314,6 +301,11 @@ metadata:
 spec:
   restartPolicy: Never
   hostNetwork: true
+  volumes:
+    - name: xrm-state
+      hostPath:
+        path: /tmp/xrm-state
+        type: DirectoryOrCreate
   containers:
     - name: xrm
       image: xrm:1.0
@@ -327,6 +319,9 @@ spec:
         - "/tmp/xrm_core.log"
         - "--dtm-relay-ip"
         - "${NODE_IP}"
+      volumeMounts:
+        - name: xrm-state
+          mountPath: /tmp/xrm-state
 EOF
         echo "  XRM core launched."
     fi
@@ -335,8 +330,22 @@ EOF
     echo "  Launching ${FANOUT} NDT pods..."
     XRM="${XRM}" \
     XRM_CORE_IP="${NODE_IP}" \
-    "${REPO_ROOT}/ndt_deployment/mininet_ndts/launch_ndts.sh" \
+    "${NDT_SCRIPTS}/launch_ndts.sh" \
         "${FANOUT}" "${NODE_IP}" "${BASE_PORT}" "${PROTO}" "${ACK_PORT}"
+
+    # Start watch_restarts.sh daemon on host
+    # Watches for DTM restart signals and calls restart_ndt.sh
+    WATCH_PID_FILE="/tmp/watch_restarts.pid"
+    if [ -f "${WATCH_PID_FILE}" ]; then
+        OLD_PID=$(cat "${WATCH_PID_FILE}")
+        kill "${OLD_PID}" 2>/dev/null || true
+        rm -f "${WATCH_PID_FILE}"
+    fi
+    XRM="${XRM}" XRM_CORE_IP="${NODE_IP}" \
+    bash "${NDT_SCRIPTS}/watch_restarts.sh" \
+        "${NODE_IP}" "${BASE_PORT}" "${PROTO}" "${ACK_PORT}" \
+        > /tmp/watch_restarts.log 2>&1 &
+    echo "  watch_restarts.sh started (PID=$!)"
 fi
 
 # ── Summary ──────────────────────────────────────────────────
@@ -355,28 +364,15 @@ echo "      --relay-port 7001 --relay-kind router \\"
 echo "      --on-ip ${ON_POD_IP} \\"
 echo "      --log-file /tmp/onm.log"
 echo ""
-echo "ONM automated injection:"
-echo "  kubectl exec -i pod-onm -n ${NAMESPACE} -- bash -c \\"
-echo "      'python3 /app/on_events_gen.py --file /app/onm_commands.txt --rate 0.5 --duration 60 | \\"
-echo "       python3 /app/onm.py --proto ${PROTO} --relay-ip 127.0.0.1 \\"
-echo "       --relay-port 7001 --relay-kind router --on-ip ${ON_POD_IP} --log-file /tmp/onm.log'"
-echo ""
 echo "Access ON Mininet:"
 echo "  kubectl exec -it pod-on -n ${NAMESPACE} -- bash"
 echo ""
-if [ "${MODE}" = "1:1" ]; then
-    echo "Access NDT Mininet:"
-    echo "  kubectl exec -it pod-dtm-ndt -n ${NAMESPACE} -c ndt -- bash"
-    echo ""
-fi
 if [ "${XRM}" = "1" ]; then
     echo "XRM CLI:"
-    echo "  kubectl exec -it pod-xrm -n ${NAMESPACE} -c xrm -- \\"
-    echo "      python3 xrm.py --mode core"
-    echo ""
-    echo "  Restart NDT via XRM (sends RESTART_NDT event to DTM):"
-    echo "  Example from xrm CLI: restart ndt-1"
+    echo "  kubectl exec -it pod-xrm -n ${NAMESPACE} -- python3 xrm.py --mode cli"
     echo ""
 fi
+echo "watch_restarts log: tail -f /tmp/watch_restarts.log"
+echo ""
 echo "Stop testbed:"
 echo "  ./stop_testbed.sh"

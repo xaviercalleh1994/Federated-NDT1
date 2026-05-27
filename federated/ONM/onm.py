@@ -17,10 +17,9 @@
 Authors: Xavier Calle-Heredia & Xavier Hesselbach
 Date: 2026-04-08
 
-onm.py — Original Network Manager
-----------------------------------
-Full ONM logic. Connects to on_ndt.py via 127.0.0.1:6001
-to apply physical changes to the ON Mininet network.
+dtm.py — Digital Twin Manager
+-------------------------------
+Combines DTM core and DTM distributed agent logic.
 
 Responsibilities:
   - Interactive CLI for the operator
@@ -49,24 +48,48 @@ CLI commands:
 
   quit
       Exit the ONM.
+
+Upstream server — XR service commands (new)
+---------------------------------------------
+  Activated with --upstream-server flag. Runs as a daemon thread
+  alongside the interactive CLI without blocking it.
+
+  Listens for XR_SERVICE_CMD from DTM upstream on UDP :7006.
+  Applies command on the target node via on_ndt.py:6001:
+    Writes state to /tmp/actuator/{node}/state.json
+    Reads it back for verification.
+  Sends ACK(event_id, ndt_id, ok, state, apply_ms) back to DTM
+  on UDP dtm_ip:7007.
+
+  Upstream port layout (new, separate from Exp1):
+    7006  ONM rx from DTM upstream
+    7007  ONM → DTM upstream ACK
 """
 import json
 import time
 import uuid
 import socket
 import argparse
+import threading
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict, deque
 
 # ── File paths ────────────────────────────────────────────────
-TOPO_FILE        = "/run/topology.json"         # Mininet exported topology
-TOPO_CONFIG_FILE = "/run/topology_config.json"  # topology config (LANs/hosts)
+TOPO_FILE        = "/run/topology.json"
+TOPO_CONFIG_FILE = "/run/topology_config.json"
 LOG_FILE_DEFAULT = "/home/ubuntu/onm_events.log"
 
 # ── on_ndt.py control server ──────────────────────────────────
 CONTROL_HOST = "127.0.0.1"
 CONTROL_PORT = 6001
+
+# ── Upstream ports (new) ──────────────────────────────────────
+ONM_UPSTREAM_RX_PORT  = 7006   # rx from DTM upstream
+ONM_UPSTREAM_ACK_PORT = 7007   # tx ACK to DTM upstream
+
+# ── Actuator state path convention ───────────────────────────
+ACTUATOR_STATE_PATH = "/tmp/actuator/{node}/state.json"
 
 # ── Runtime context for logging ──────────────────────────────
 RUN_CTX: Dict[str, object] = {}
@@ -251,7 +274,7 @@ def apply_logical_link(
     routers = [n for n in g if n.startswith("r") and n != "r_nat"]
     control_call({
         "type":    "EXEC",
-        "payload": {"node": "r_nat", "cmd": "true"}   # no-op ping
+        "payload": {"node": "r_nat", "cmd": "true"}
     })
     for r in routers:
         control_call({
@@ -338,25 +361,21 @@ def apply_topology_update(
         print("[ONM] Invalid topology: missing 'lans' or 'backbone'")
         return False
 
-    # Write new config so on_ndt.py reads it on RELOAD
     with open(TOPO_CONFIG_FILE, "w") as f:
         json.dump(new_topo, f, indent=2)
     print(f"[ONM] New topology saved to {TOPO_CONFIG_FILE}")
 
-    # Trigger Mininet RELOAD on local ON
     if not mock_on:
         resp = control_call({"type": "RELOAD"})
         if not resp.get("ok"):
             print(f"[ONM] RELOAD error: {resp}")
             return False
         print("[ONM] ON Mininet reloading...")
-        # Wait for topology.json to be re-exported
         for _ in range(90):
             time.sleep(1)
             try:
                 with open(TOPO_FILE) as f:
                     topo = json.load(f)
-                # Check new topology matches expected LAN count
                 expected = len(new_topo["lans"])
                 routers  = [n for n in topo["nodes"]
                             if n.startswith("r") and n != "r_nat"]
@@ -369,29 +388,199 @@ def apply_topology_update(
         else:
             print("[ONM] WARNING: ON reload timeout")
 
-    # Send TOPOLOGY_UPDATE to DTM
     event_id    = str(uuid.uuid4())
     t_create_ns = time.time_ns()
     ev = {
-        "type":       "TOPOLOGY_UPDATE",
-        "event_id":   event_id,
+        "type":        "TOPOLOGY_UPDATE",
+        "event_id":    event_id,
         "t_create_ns": t_create_ns,
-        "payload":    {"topology": new_topo},
+        "payload":     {"topology": new_topo},
     }
     payload = json.dumps(ev).encode()
     t_tx_ns = time.time_ns()
     sender.send(payload)
 
     log_event("ON_TOPOLOGY_UPDATE_SENT", {
-        "event_id":   event_id,
+        "event_id":    event_id,
         "t_create_ns": t_create_ns,
-        "t_tx_ns":    t_tx_ns,
-        "lans":       len(new_topo["lans"]),
-        "size_bytes": len(payload),
+        "t_tx_ns":     t_tx_ns,
+        "lans":        len(new_topo["lans"]),
+        "size_bytes":  len(payload),
     })
     print(f"[ONM] TOPOLOGY_UPDATE sent to DTM "
           f"({len(new_topo['lans'])} LANs)")
     return True
+
+
+# ─────────────────────────────────────────────────────────────
+# Upstream server — XR service commands (new)
+# Daemon thread alongside the interactive CLI.
+# Receives XR_SERVICE_CMD from DTM upstream on UDP :7006.
+# Applies on target node via on_ndt.py:6001.
+# Sends ACK back to DTM on UDP :7007.
+# ─────────────────────────────────────────────────────────────
+
+def _apply_xr_service_cmd(ev: dict) -> dict:
+    """
+    Apply XR_SERVICE_CMD on the target node via on_ndt.py:6001.
+    Writes state to /tmp/actuator/{node}/state.json and reads
+    it back for verification.
+    Returns {ok, state, apply_ms}.
+    """
+    t0      = time.time_ns()
+    payload = ev.get("payload", {})
+    node    = payload.get("node", "h1_1")
+    service = ev.get("service", "unknown")
+    state   = {
+        "event_id":     str(ev.get("event_id", "")),
+        "ndt_id":       ev.get("ndt_id"),
+        "service":      service,
+        "t_applied_ns": time.time_ns(),
+        **{k: v for k, v in payload.items() if k != "node"},
+    }
+    state_path = ACTUATOR_STATE_PATH.format(node=node)
+    state_json = json.dumps(state).replace('"', '\\"')
+
+    # Write state into node namespace via on_ndt.py EXEC
+    write_resp = control_call({
+        "type": "EXEC",
+        "payload": {
+            "node": node,
+            "cmd": (
+                f"mkdir -p /tmp/actuator/{node} && "
+                f"echo \"{state_json}\" > {state_path}"
+            ),
+        },
+    })
+
+    if not write_resp.get("ok"):
+        return {
+            "ok":       False,
+            "err":      f"write failed: {write_resp.get('err')}",
+            "apply_ms": round((time.time_ns() - t0) / 1e6, 3),
+            "state":    {},
+        }
+
+    # Read back for verification
+    read_resp = control_call({
+        "type": "EXEC",
+        "payload": {"node": node, "cmd": f"cat {state_path}"},
+    })
+
+    verified_state = state
+    if read_resp.get("ok") and read_resp.get("output"):
+        try:
+            verified_state = json.loads(read_resp["output"])
+        except Exception:
+            pass
+
+    return {
+        "ok":       True,
+        "state":    verified_state,
+        "apply_ms": round((time.time_ns() - t0) / 1e6, 3),
+    }
+
+
+def run_upstream_server(
+    dtm_ip: str,
+    mock_on: bool,
+) -> None:
+    """
+    Upstream server thread — XR service coordination.
+    Receives XR_SERVICE_CMD from DTM upstream on UDP :7006.
+    Applies on ON via on_ndt.py:6001.
+    Sends ACK back to DTM on UDP :7007.
+    """
+    rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                       8 * 1024 * 1024)
+    rx_sock.bind(("0.0.0.0", ONM_UPSTREAM_RX_PORT))
+    rx_sock.settimeout(1.0)
+
+    ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    print(f"[ONM-UPSTREAM] Ready — UDP :{ONM_UPSTREAM_RX_PORT}",
+          flush=True)
+    print(f"[ONM-UPSTREAM] ACK → {dtm_ip}:{ONM_UPSTREAM_ACK_PORT}",
+          flush=True)
+
+    while True:
+        try:
+            data, _ = rx_sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except Exception:
+            continue
+
+        t_rx_ns = time.time_ns()
+        try:
+            ev = json.loads(data)
+        except Exception as exc:
+            log_event("ONM_UPSTREAM_PARSE_ERR", {"err": str(exc)})
+            continue
+
+        event_id = str(ev.get("event_id", ""))
+        ndt_id   = ev.get("ndt_id")
+        service  = ev.get("service", "unknown")
+        ev_type  = ev.get("type", "")
+
+        if ev_type != "XR_SERVICE_CMD":
+            log_event("ONM_UPSTREAM_UNKNOWN",
+                      {"event_id": event_id, "type": ev_type})
+            continue
+
+        log_event("ONM_UPSTREAM_CMD_RX", {
+            "event_id":   event_id,
+            "ndt_id":     ndt_id,
+            "service":    service,
+            "t_rx_ns":    t_rx_ns,
+            "size_bytes": len(data),
+        })
+
+        # Apply on ON
+        if mock_on:
+            result = {
+                "ok":       True,
+                "state":    ev.get("payload", {}),
+                "apply_ms": 0.0,
+            }
+        else:
+            result = _apply_xr_service_cmd(ev)
+
+        t_done_ns = time.time_ns()
+
+        log_event("ONM_UPSTREAM_CMD_APPLIED", {
+            "event_id":  event_id,
+            "ndt_id":    ndt_id,
+            "service":   service,
+            "ok":        result["ok"],
+            "apply_ms":  result["apply_ms"],
+            "t_rx_ns":   t_rx_ns,
+            "t_done_ns": t_done_ns,
+            "queue_ms":  round((t_done_ns - t_rx_ns) / 1e6, 3),
+        })
+
+        print(f"[ONM-UPSTREAM] {event_id} service={service} "
+              f"ndt_id={ndt_id} ok={result['ok']} "
+              f"apply_ms={result['apply_ms']}", flush=True)
+
+        # Send ACK back to DTM upstream
+        ack = json.dumps({
+            "type":      "XR_SERVICE_ACK",
+            "event_id":  event_id,
+            "ndt_id":    ndt_id,
+            "service":   service,
+            "ok":        result["ok"],
+            "state":     result.get("state", {}),
+            "apply_ms":  result["apply_ms"],
+            "t_done_ns": t_done_ns,
+        }).encode()
+
+        try:
+            ack_sock.sendto(ack, (dtm_ip, ONM_UPSTREAM_ACK_PORT))
+        except Exception as exc:
+            log_event("ONM_UPSTREAM_ACK_ERR",
+                      {"event_id": event_id, "err": str(exc)})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -409,7 +598,13 @@ def main():
     ap.add_argument("--mock-on",    action="store_true",
                     help="Skip local ON application (no Mininet available)")
     ap.add_argument("--on-ip",      default="127.0.0.1",
-                    help="IP of the ON Pod control server (default: 127.0.0.1)")
+                    help="IP of the ON Pod control server")
+    # Upstream server — XR service commands (new)
+    ap.add_argument("--upstream-server", action="store_true",
+                    help="[upstream] Enable upstream server thread")
+    ap.add_argument("--dtm-upstream-ip", default="",
+                    help="[upstream] DTM IP to send ACK to")
+
     args = ap.parse_args()
 
     global RUN_CTX, CONTROL_HOST
@@ -433,8 +628,7 @@ def main():
     try:
         nodes, g = load_topo_graph()
     except FileNotFoundError:
-        print(f"[ONM] WARNING: {TOPO_FILE} not found. "
-              f"Using empty graph (--mock-on recommended).")
+        print(f"[ONM] WARNING: {TOPO_FILE} not found.")
         nodes, g = [], defaultdict(list)
 
     # Send topology to DTM (Exp. 1 handshake)
@@ -442,6 +636,19 @@ def main():
         send_topology_to_dtm(sender)
     except Exception as e:
         print(f"[ONM] WARNING: Could not send topology: {e}")
+
+    # Start upstream server thread if requested
+    if args.upstream_server:
+        if not args.dtm_upstream_ip:
+            print("[ONM] ERROR: --dtm-upstream-ip required "
+                  "with --upstream-server")
+            return
+        threading.Thread(
+            target=run_upstream_server,
+            args=(args.dtm_upstream_ip, args.mock_on),
+            name="onm-upstream",
+            daemon=True,
+        ).start()
 
     M = Matrix()
 
@@ -453,7 +660,6 @@ def main():
     print('  exec NODE "cmd"')
     print('    e.g.: exec r1 "ip route"')
     print("  topology <file.json>")
-    print("    e.g.: topology /app/topologies/3lan.json")
     print("  quit\n")
 
     while True:
@@ -491,7 +697,6 @@ def main():
                 "params": asdict(e),
             })
 
-            # Apply locally on ON via on_ndt.py primitives
             if not args.mock_on:
                 ok = apply_logical_link(g, a, b, e)
                 if not ok:
@@ -499,7 +704,6 @@ def main():
                               {"event_id": event_id, "a": a, "b": b})
                     continue
 
-            # Send to DTM
             ev = {
                 "type":        "LOGICAL_LINK_SET",
                 "event_id":    event_id,
@@ -528,10 +732,6 @@ def main():
             shell_cmd = line.split(None, 2)[2].strip().strip('"')
             event_id    = str(uuid.uuid4())
             t_create_ns = time.time_ns()
-            log_event("ON_EXEC_CREATED", {
-                "event_id": event_id,
-                "node": node, "cmd": shell_cmd,
-            })
 
             if not args.mock_on:
                 resp = control_call({
@@ -546,15 +746,7 @@ def main():
                 "t_create_ns": t_create_ns,
                 "payload":     {"node": node, "cmd": shell_cmd},
             }
-            payload = json.dumps(ev).encode()
-            t_tx_ns = time.time_ns()
-            sender.send(payload)
-            log_event("ON_EXEC_SENT", {
-                "event_id":    event_id,
-                "t_create_ns": t_create_ns,
-                "t_tx_ns":     t_tx_ns,
-                "size_bytes":  len(payload),
-            })
+            sender.send(json.dumps(ev).encode())
             continue
 
         # ── topology <file.json> ─────────────────────────────
@@ -562,15 +754,12 @@ def main():
             if len(parts) != 2:
                 print("Usage: topology <file.json>")
                 continue
-            topo_path = parts[1]
-            ok = apply_topology_update(topo_path, sender, args.mock_on)
+            ok = apply_topology_update(parts[1], sender, args.mock_on)
             if ok and not args.mock_on:
-                # Reload topology graph after ON restarts
                 time.sleep(2)
                 try:
                     nodes, g = load_topo_graph()
-                    print(f"[ONM] Graph reloaded: "
-                          f"{len(nodes)} nodes")
+                    print(f"[ONM] Graph reloaded: {len(nodes)} nodes")
                 except Exception as e:
                     print(f"[ONM] WARNING: Could not reload graph: {e}")
             continue

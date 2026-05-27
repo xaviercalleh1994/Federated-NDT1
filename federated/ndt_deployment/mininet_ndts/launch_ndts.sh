@@ -314,6 +314,11 @@ spec:
       port: ${NDT_INTERNAL_PORT}
       targetPort: ${NDT_INTERNAL_PORT}
       nodePort: ${NODE_PORT}
+    - name: xrm-agent-cmd
+      protocol: UDP
+      port: 8110
+      targetPort: 8110
+      nodePort: $(( 31100 + NDT_ID ))
 EOF
 
     kubectl apply -f "${MANIFEST}" > /dev/null
