@@ -1,0 +1,10 @@
+# NDT-3 command script
+# priority is set via --priority arg (base priority of this NDT)
+# format: key=val [key=val ...]
+action=move angle=45 speed=10
+action=grip status=busy
+action=move angle=0 speed=5
+action=release status=idle
+action=move angle=90 speed=8
+action=grip status=standby
+action=move angle=180 speed=3

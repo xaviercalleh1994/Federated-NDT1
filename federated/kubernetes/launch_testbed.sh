@@ -58,8 +58,10 @@ FANOUT=2
 BASE_PORT=30001
 PROTO="udp"
 ACK_PORT=9000
+UPSTREAM=0       # --upstream: start ONM upstream server + DTM upstream
 DTM_LOG="/dev/stderr"
 XRM=0
+UPSTREAM=0       # --upstream: start ONM upstream server + DTM upstream
 
 # ── Parse arguments ──────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -71,6 +73,7 @@ while [[ $# -gt 0 ]]; do
         --ack-port)   ACK_PORT="$2";  shift 2 ;;
         --dtm-log)    DTM_LOG="$2";   shift 2 ;;
         --xrm)        XRM=1;          shift   ;;
+        --upstream)   UPSTREAM=1;     shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -184,8 +187,72 @@ ON_POD_IP=$(kubectl get pod pod-on -n "${NAMESPACE}" \
     -o jsonpath='{.status.podIP}' 2>/dev/null || echo "127.0.0.1")
 echo "  ON Pod IP: ${ON_POD_IP}"
 
-kubectl apply -f "${SCRIPT_DIR}/onm-pod.yaml"
-echo "  ONM ready."
+# pod-onm — if --upstream: starts ONM directly with --upstream-server
+#            otherwise: sleep infinity (operator launches ONM manually)
+if [ "${UPSTREAM}" = "1" ]; then
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-onm
+  namespace: ${NAMESPACE}
+  labels:
+    app: onm
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  volumes:
+    - name: run-data
+      hostPath:
+        path: /tmp/ndt-run
+        type: DirectoryOrCreate
+    - name: logs
+      emptyDir: {}
+  containers:
+    - name: onm
+      image: onm:1.0
+      imagePullPolicy: Never
+      stdin: true
+      command: ["python3", "/app/onm.py"]
+      tty: true
+      args:
+        - "--proto"
+        - "${PROTO}"
+        - "--relay-ip"
+        - "127.0.0.1"
+        - "--relay-port"
+        - "7001"
+        - "--relay-kind"
+        - "router"
+        - "--on-ip"
+        - "${ON_POD_IP}"
+        - "--upstream-server"
+        - "--dtm-upstream-ip"
+        - "127.0.0.1"
+        - "--log-file"
+        - "/tmp/onm.log"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: logs
+          mountPath: /app/logs
+EOF
+
+# Wait for ONM upstream to be ready
+echo "  Waiting for ONM upstream..."
+for i in $(seq 1 30); do
+    if kubectl exec pod-onm -n "${NAMESPACE}" -- \
+        grep -q "ONM-UPSTREAM.*Ready" /tmp/onm.log 2>/dev/null; then
+        echo "  ONM ready (${i}s)"
+        break
+    fi
+    sleep 1
+done
+else
+    # Original behavior — sleep infinity, operator launches ONM manually
+    kubectl apply -f "${SCRIPT_DIR}/onm-pod.yaml"
+    echo "  ONM ready."
+fi
 
 # ── DTM + NDT(s) + XRM ───────────────────────────────────────
 echo "[4/4] Launching DTM$([ "${XRM}" = "1" ] && echo " + XRM" || echo "")..."
@@ -286,6 +353,38 @@ EOF
 
     echo "  DTM core launched."
 
+    # Start DTM upstream — only if --upstream flag is set
+    # Runs as background process via kubectl exec with setsid to survive session
+    # Waits for pod-dtm to be Running first
+    echo "  Waiting for pod-dtm Running..."
+    for i in $(seq 1 30); do
+        phase=$(kubectl get pod pod-dtm -n "${NAMESPACE}" \
+            --no-headers -o custom-columns=":status.phase" 2>/dev/null || echo "")
+        [ "${phase}" = "Running" ] && break
+        sleep 1
+    done
+    if [ "${UPSTREAM}" = "1" ]; then
+        kubectl exec pod-dtm -n "${NAMESPACE}" -- bash -c \
+            "setsid python3 /app/dtm.py \
+                --proto udp \
+                --relay-ip 0.0.0.0 \
+                --mode upstream \
+                --onm-ip 127.0.0.1 \
+                --log-file /tmp/dtm_upstream.log \
+                </dev/null >/tmp/dtm_upstream_stderr.log 2>&1 &
+             echo \$! > /tmp/dtm_upstream.pid" 2>/dev/null || true
+        # Wait for DTM upstream to be ready
+        echo "  Waiting for DTM upstream..."
+        for i in $(seq 1 20); do
+            if kubectl exec pod-dtm -n "${NAMESPACE}" -- \
+                grep -q "DTM-UPSTREAM.*Ready" /tmp/dtm_upstream_stderr.log 2>/dev/null; then
+                echo "  DTM upstream ready (${i}s)"
+                break
+            fi
+            sleep 1
+        done
+    fi
+
     # pod-xrm — only if --xrm
     # stdin + tty keep the pod alive and allow kubectl exec -it to attach
     if [ "${XRM}" = "1" ]; then
@@ -330,6 +429,8 @@ EOF
     echo "  Launching ${FANOUT} NDT pods..."
     XRM="${XRM}" \
     XRM_CORE_IP="${NODE_IP}" \
+    UPSTREAM="${UPSTREAM}" \
+    DTM_IP="${NODE_IP}" \
     "${NDT_SCRIPTS}/launch_ndts.sh" \
         "${FANOUT}" "${NODE_IP}" "${BASE_PORT}" "${PROTO}" "${ACK_PORT}"
 

@@ -211,10 +211,11 @@ class XrmAgentClient:
 
         # Include client IP so xrm-agent can reply directly
         # (in K8s UDP the source addr seen by the pod may be NAT'd)
+        # Use node_ip (not pod_ip) to find the correct outgoing interface
         import socket as _socket
         try:
             _s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-            _s.connect((self._node_ip, 80))
+            _s.connect(("8.8.8.8", 80))
             client_ip = _s.getsockname()[0]
             _s.close()
         except Exception:

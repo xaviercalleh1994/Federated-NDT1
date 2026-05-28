@@ -56,6 +56,8 @@ MAX_WAIT=120
 # XRM parameters — only used when XRM=1
 XRM=${XRM:-0}
 XRM_CORE_IP=${XRM_CORE_IP:-${DTM_IP}}
+# UPSTREAM parameter — deploys actuator-control in each NDT at launch
+UPSTREAM=${UPSTREAM:-0}
 
 # Internal port that every NDT container listens on (fixed)
 NDT_INTERNAL_PORT=8001
@@ -174,6 +176,8 @@ XRMVOL
         - "${NDT_ID}"
         - "--core-ip"
         - "${XRM_CORE_IP}"
+        - "--dtm-ip"
+        - "${DTM_IP}"
         - "--log-file"
         - "/tmp/xrm_agent_${NDT_ID}.log"
       volumeMounts:
@@ -183,6 +187,33 @@ XRMVOL
           mountPath: /tmp/xrm-state/ndt-${NDT_ID}
 XRMBLOCK
 )
+    fi
+
+    # Actuator-control container — only if UPSTREAM=1
+    # Deployed at launch so NDTs start with 4 containers, no restart needed.
+    ACTUATOR_CONTAINER=""
+    if [ "${UPSTREAM}" = "1" ] && [ "${XRM}" = "1" ]; then
+        ACTUATOR_CONTAINER=$(cat <<ACTUATORBLOCK
+
+    # actuator-control XR service — manages h1_1 actuator state
+    - name: actuator-control
+      image: actuator-control:1.0
+      imagePullPolicy: Never
+      args:
+        - "--ndt-id"
+        - "${NDT_ID}"
+        - "--log-file"
+        - "/tmp/actuator_control_${NDT_ID}.log"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: xrm-state
+          mountPath: /tmp/xrm-state/ndt-${NDT_ID}
+ACTUATORBLOCK
+)
+        # Pre-write xrm-state so xrm-agent knows actuator-control is deployed
+        mkdir -p "/tmp/xrm-state/ndt-${NDT_ID}"
+        echo "{"ndt_id":${NDT_ID},"services":["actuator-control"],"context":{}}"             > "/tmp/xrm-state/ndt-${NDT_ID}/state.json"
     fi
 
     # ── Generate Pod + Service manifest ─────────────────────
@@ -293,7 +324,7 @@ spec:
         - name: dtm-state
           mountPath: /tmp/dtm-state/ndt-${NDT_ID}
         - name: scripts
-          mountPath: /scripts${XRM_CONTAINER}
+          mountPath: /scripts${XRM_CONTAINER}${ACTUATOR_CONTAINER}
 ---
 apiVersion: v1
 kind: Service
