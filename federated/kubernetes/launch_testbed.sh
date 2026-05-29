@@ -103,6 +103,12 @@ NODE_IP=$(kubectl get nodes \
 
 echo "=============================================="
 echo " Federated NDT Testbed — Kubernetes"
+
+# ── Ensure state directories exist with correct permissions ──
+# Pods run as root and write to these hostPath volumes.
+# Pre-create them as the current user to avoid permission errors.
+sudo mkdir -p /tmp/dtm-state /tmp/xrm-state /tmp/ndt-run
+sudo chmod -R 777 /tmp/dtm-state /tmp/xrm-state /tmp/ndt-run
 echo "   Mode     : ${MODE}"
 echo "   Node IP  : ${NODE_IP}"
 [ "${MODE}" = "federated" ] && \
