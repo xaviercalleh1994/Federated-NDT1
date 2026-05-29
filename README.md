@@ -10,7 +10,7 @@ Currently, the framework is provided with two operational configurations:
 
     - The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
     - The DTM is the main entity of the system and is in charge of the synchronization of the NDTs. The DTM is decompossed in two agents: the DTM Core is a centralized agent that receives and distribute ON events. While the DTM distributed agents are in charge of implementing each ON event into the NDT.
-    ![Framework_architecture_fed](Images/PoC_fed_arch.png)
+    ![Framework_architecture_fed](Images/PoC_fed_XR.drawio.png)
 - A conventional mode (1:1): this is the currently analyzed configuration in the literature and considers a sinlge NDT instance derived from an ON. This mode will be further analyzed for the inclusion of Extended Reality (XR) services.
 ![Framework_architecture_fed_11](Images/PoC_11_arch.png)
 
