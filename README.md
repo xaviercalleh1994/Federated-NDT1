@@ -17,9 +17,14 @@ Currently, the framework is provided with two operational configurations:
 ## Framework Components
 The framework relies in a Kubernetes architecture to support the deployment of each component. Therefore, main components deployed as K8s pods are:
 - ONM 
-- DTM (core)
 - ON
-- NDTs (includes two containers: the NDT and the DTM distributed agent)
+- DTM-core
+- XRM-core
+- NDT-i:
+  - NDT mininet
+  - DTM-agent
+  - XRM-agent (optional)
+  - Generic XR Services (optional)
 
 The ON as well as the NDTs are created from [topology](federated/topology.json) json file. The current topology is shown next:
 
