@@ -387,7 +387,8 @@ def run_auto(args: argparse.Namespace) -> None:
     _log_file = args.log_file
 
     client   = XrmAgentClient(args.node_ip, args.ndt_id,
-                              args.service, args.agent_port)
+                              args.service, args.agent_port,
+                              pod_ip=args.pod_ip)
     interval = 1.0 / args.rate if args.rate > 0 else 1.0
     start    = time.monotonic()
     sent     = 0

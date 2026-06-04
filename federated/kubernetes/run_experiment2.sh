@@ -54,7 +54,7 @@
 set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────
-FANOUT=5                          # fixed number of NDTs
+FANOUT=4                          # fixed number of NDTs
 SERVICE="actuator-control"
 RUN_COUNT=3                       # runs per condition for 95% CI
 DURATION=60                       # seconds per condition
@@ -65,10 +65,11 @@ PROTO="udp"
 # Variable parameters — space-separated lists
 RATE_LIST=(0.5 1 2 4)            # commands/second per NDT
 QUEUE_LIST=(0 2 4 8)             # DTM upstream queue size (0=unlimited)
+PRIORITY_MODES=(priority fifo)   # priority=AdmissionQueue, fifo=--disable-priorities
 
-# NDT base priorities (ndt-0=highest, ndt-4=lowest)
-# Priority per NDT: 10 30 50 70 90
-NDT_PRIORITIES=(10 30 50 70 90)
+# NDT base priorities (ndt-0=highest, ndt-3=lowest)
+# Priority per NDT: 10 30 50 70
+NDT_PRIORITIES=(10 30 50 70)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -82,8 +83,9 @@ while [[ $# -gt 0 ]]; do
         --runs)       RUN_COUNT="$2";        shift 2 ;;
         --duration)   DURATION="$2";         shift 2 ;;
         --out)        OUT_DIR="$2";          shift 2 ;;
-        --rate-list)  IFS=' ' read -r -a RATE_LIST  <<< "$2"; shift 2 ;;
-        --queue-list) IFS=' ' read -r -a QUEUE_LIST <<< "$2"; shift 2 ;;
+        --rate-list)      IFS=' ' read -r -a RATE_LIST      <<< "$2"; shift 2 ;;
+        --queue-list)     IFS=' ' read -r -a QUEUE_LIST     <<< "$2"; shift 2 ;;
+        --priority-modes) IFS=' ' read -r -a PRIORITY_MODES <<< "$2"; shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -118,13 +120,19 @@ get_pod_ip() {
 
 start_dtm_upstream() {
     # Start DTM upstream mode — nohup + </dev/null ensures process survives kubectl exec session
+    # Args: queue_size prio_mode (priority|fifo)
     local queue_size=$1
+    local prio_mode=${2:-priority}
     local log_file="/tmp/dtm_upstream_exp2.log"
     local max_queue_arg=""
+    local disable_prio_arg=""
     if [ "${queue_size}" -gt 0 ]; then
         max_queue_arg="--max-queue ${queue_size}"
     fi
-    echo "    Starting DTM upstream (queue=${queue_size})..."
+    if [ "${prio_mode}" = "fifo" ]; then
+        disable_prio_arg="--disable-priorities"
+    fi
+    echo "    Starting DTM upstream (queue=${queue_size} mode=${prio_mode})..."
     kubectl exec pod-dtm -n "${NAMESPACE}" -- bash -c \
         "nohup python3 /app/dtm.py \
             --proto udp \
@@ -133,6 +141,7 @@ start_dtm_upstream() {
             --onm-ip 127.0.0.1 \
             --log-file ${log_file} \
             ${max_queue_arg} \
+            ${disable_prio_arg} \
             </dev/null >/tmp/dtm_upstream_stderr.log 2>&1 & echo \$! > /tmp/dtm_upstream.pid"
     # Wait for DTM upstream to be ready
     for i in $(seq 1 20); do
@@ -306,8 +315,9 @@ print_quick_summary() {
     local log_dir=$1
     local rate=$2
     local queue=$3
+    local prio_mode=${4:-priority}
     echo ""
-    echo "    ── Quick summary (rate=${rate} queue=${queue}) ──"
+    echo "    ── Quick summary (rate=${rate} queue=${queue} mode=${prio_mode}) ──"
     python3 - "${log_dir}" << 'PYEOF'
 import sys, json, os, glob
 
@@ -376,7 +386,7 @@ echo "  ndt_event_cli.py: OK"
 echo ""
 
 # ── Experiment loops ─────────────────────────────────────────
-TOTAL=$(( RUN_COUNT * ${#RATE_LIST[@]} * ${#QUEUE_LIST[@]} ))
+TOTAL=$(( RUN_COUNT * ${#RATE_LIST[@]} * ${#QUEUE_LIST[@]} * ${#PRIORITY_MODES[@]} ))
 CURRENT=0
 
 for run in $(seq 1 "${RUN_COUNT}"); do
@@ -384,15 +394,16 @@ for run in $(seq 1 "${RUN_COUNT}"); do
     echo " RUN ${run}/${RUN_COUNT}"
     echo "══════════════════════════════════════════════"
 
-    for queue in "${QUEUE_LIST[@]}"; do
-        for rate in "${RATE_LIST[@]}"; do
-            CURRENT=$(( CURRENT + 1 ))
-            CONDITION="rate${rate}_queue${queue}"
-            LOG_DIR="${OUT_DIR}/run${run}/${CONDITION}"
+    for prio_mode in "${PRIORITY_MODES[@]}"; do
+        for queue in "${QUEUE_LIST[@]}"; do
+            for rate in "${RATE_LIST[@]}"; do
+                CURRENT=$(( CURRENT + 1 ))
+                CONDITION="rate${rate}_queue${queue}_${prio_mode}"
+                LOG_DIR="${OUT_DIR}/run${run}/${CONDITION}"
             mkdir -p "${LOG_DIR}"
 
             echo ""
-            echo "  ── condition ${CURRENT}/${TOTAL}: rate=${rate} queue=${queue} ──"
+            echo "  ── condition ${CURRENT}/${TOTAL}: rate=${rate} queue=${queue} mode=${prio_mode} ──"
 
             # 1. Launch testbed with XRM
             echo "    Launching testbed (fanout=${FANOUT} --xrm)..."
@@ -414,8 +425,10 @@ for run in $(seq 1 "${RUN_COUNT}"); do
             # 4. Service already deployed at launch via --upstream flag
             #    NDTs start with 4 containers (ndt + dtm-agent + xrm-agent + actuator-control)
 
-            # 5+6. ONM upstream and DTM upstream start automatically with testbed
-            #       via launch_testbed.sh — no manual start needed
+            # 5. ONM upstream starts automatically with testbed (launch_testbed.sh)
+
+            # 6. Start DTM upstream with correct priority mode
+            start_dtm_upstream "${queue}" "${prio_mode}"
 
             # 7. Run all NDT clients in parallel
             run_clients "${rate}" "${LOG_DIR}"
@@ -427,7 +440,7 @@ for run in $(seq 1 "${RUN_COUNT}"); do
             collect_logs "${LOG_DIR}"
 
             # 10. Print quick summary
-            print_quick_summary "${LOG_DIR}" "${rate}" "${queue}"
+            print_quick_summary "${LOG_DIR}" "${rate}" "${queue}" "${prio_mode}"
 
             # 11. Upstream processes stop with testbed (stop_testbed.sh)
 
@@ -443,13 +456,13 @@ for run in $(seq 1 "${RUN_COUNT}"); do
             echo "  ── condition done ✓"
         done
     done
+    done
 
     echo ""
     echo " Run ${run}/${RUN_COUNT} complete."
     echo ""
 done
 
-echo "=============================================="
 echo " All runs complete."
 echo " Results in: ${OUT_DIR}"
 echo ""

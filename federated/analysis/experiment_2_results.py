@@ -5,556 +5,549 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 Authors: Xavier Calle-Heredia & Xavier Hesselbach
 Date: 2026-04-08
 
-NDT Federation Loss Analyser — uniform vs Poisson, multiple runs
-================================================================
-Reads multiple experimental runs and produces plots with 95% confidence
-intervals.
+experiment_2_results.py — Experiment 2 Analysis
+-------------------------------------------------
+Analyses ndt_event_cli logs from Experiment 2 (XR service coordination).
 
-Folder layout expected
-----------------------
-losses/
-  run1/
-    uniform/
-      1to1/    dtm.log
-      1to5/    dtm.log
-      1to10/   dtm.log
-      1to11/   dtm.log
-      1to15/   dtm.log
-      1to20/   dtm.log
-    poisson/
-      1to1/    dtm.log
-      ...
-  run2/
-    uniform/
-      ...
-    poisson/
-      ...
-  run3/
-    ...
+Metrics computed per condition (rate × queue_size):
+  - e2e_ms     : end-to-end latency (create → ACK received)
+  - apply_ms   : application time on ON
+  - wait_ms    : time in DTM queue + network
+  - ACK rate   : fraction of commands successfully applied
+  - DISCARD rate: fraction of commands dropped by DTM queue
 
-Usage
------
-python3 analyse_losses.py \\
-    --logs /home/ubuntu/final_test/experiment2/losses/ \\
-    --out  /home/ubuntu/final_test/results/losses/ \\
-    --C    2000
+Plots generated:
+  1. e2e_ms vs rate — per NDT (priority effect)
+  2. e2e_ms vs queue_size — per rate
+  3. ACK / DISCARD rate vs rate × queue_size
+  4. Fairness — e2e CDF per NDT per condition
+  5. Heatmap — e2e_avg vs rate × queue_size
+
+Usage:
+  python3 experiment_2_results.py --logs /tmp/exp2 --out /tmp/exp2/results
+  python3 experiment_2_results.py --logs /tmp/exp2 --out /tmp/exp2/results --show
 """
-
+import os
 import re
+import json
 import argparse
-from pathlib import Path
-from typing import Optional, Dict, List
-
-try:
-    import orjson
-    def _parse(line) -> dict: return orjson.loads(line)
-    _MODE = "rb"
-except ImportError:
-    import json as _json
-    def _parse(line) -> dict: return _json.loads(line)
-    _MODE = "r"
-
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
 from scipy import stats
-from tabulate import tabulate
 
-# ---------------------------------------------------------------------------
-# IEEE style
-# ---------------------------------------------------------------------------
-plt.rcParams.update({
-    "font.family":      "serif",
-    "font.size":        10,
-    "axes.titlesize":   10,
-    "axes.labelsize":   10,
-    "legend.fontsize":  9,
-    "xtick.labelsize":  9,
-    "ytick.labelsize":  9,
-    "figure.figsize":   (5.5, 3.5),
-    "axes.grid":        True,
-    "grid.alpha":       0.4,
-    "grid.linestyle":   "--",
-    "savefig.dpi":      300,
-    "savefig.bbox":     "tight",
-})
-
-MODE_STYLE = {
-    "uniform": {"color": "#185FA5", "marker": "o", "linestyle": "-",  "label": "Uniform"},
-    "poisson": {"color": "#D85A30", "marker": "s", "linestyle": "--", "label": "Poisson"},
-}
-
-CI = 0.95  # confidence level
+# ── NDT priority mapping ──────────────────────────────────────
+NDT_PRIORITIES = {0: 10, 1: 30, 2: 50, 3: 70, 4: 90}
+FANOUT         = 5
+COLORS         = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
 
 
-# ---------------------------------------------------------------------------
-# IO helpers
-# ---------------------------------------------------------------------------
-def load_log(path: Path) -> pd.DataFrame:
+# ─────────────────────────────────────────────────────────────
+# Log loading
+# ─────────────────────────────────────────────────────────────
+
+def parse_condition(cond_name: str) -> Tuple[float, int]:
+    """Parse 'rate1_queue4' → (1.0, 4)."""
+    m = re.match(r"rate([\d.]+)_queue(\d+)", cond_name)
+    if not m:
+        return 0.0, 0
+    return float(m.group(1)), int(m.group(2))
+
+
+def load_logs(logs_dir: str) -> pd.DataFrame:
+    """
+    Load all ndt*.log files from all runs and conditions.
+    Returns a DataFrame with one row per command.
+    """
     rows = []
-    with open(path, _MODE) as f:
-        for raw in f:
-            try:
-                rows.append(_parse(raw))
-            except Exception:
-                pass
+    logs_path = Path(logs_dir)
+
+    for run_dir in sorted(logs_path.glob("run*")):
+        run_num = int(re.search(r"run(\d+)", run_dir.name).group(1))
+
+        for cond_dir in sorted(run_dir.iterdir()):
+            if not cond_dir.is_dir():
+                continue
+            rate, queue = parse_condition(cond_dir.name)
+
+            for ndt_id in range(FANOUT):
+                log_file = cond_dir / f"ndt{ndt_id}.log"
+                if not log_file.exists():
+                    continue
+
+                with open(log_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+
+                        rows.append({
+                            "run":        run_num,
+                            "rate":       rate,
+                            "queue_size": queue,
+                            "condition":  cond_dir.name,
+                            "ndt_id":     ndt_id,
+                            "priority":   NDT_PRIORITIES.get(ndt_id, 50),
+                            "event_id":   rec.get("event_id", ""),
+                            "status":     rec.get("your_status", "UNKNOWN"),
+                            "e2e_ms":     rec.get("e2e_ms"),
+                            "send_ms":    rec.get("send_ms"),
+                            "wait_ms":    rec.get("wait_ms"),
+                            "apply_ms":   rec.get("apply_ms"),
+                            "t_create_ns":rec.get("t_create_ns", 0),
+                        })
+
     if not rows:
-        return pd.DataFrame()
+        raise ValueError(f"No logs found in {logs_dir}")
+
     df = pd.DataFrame(rows)
-    if "ts_ns" in df.columns:
-        df["ts_ns"] = pd.to_numeric(df["ts_ns"], errors="coerce")
-        df = df.dropna(subset=["ts_ns"]).sort_values("ts_ns").reset_index(drop=True)
+    print(f"Loaded {len(df)} records from {logs_dir}")
+    print(f"  Runs: {sorted(df['run'].unique())}")
+    print(f"  Rates: {sorted(df['rate'].unique())}")
+    print(f"  Queue sizes: {sorted(df['queue_size'].unique())}")
+    print(f"  NDTs: {sorted(df['ndt_id'].unique())}")
     return df
 
 
-def find_log(folder: Path) -> Optional[Path]:
-    for name in ("dtm.log", "ndtm_events.log", "dtm_events.log"):
-        p = folder / name
-        if p.exists():
-            return p
-    return None
+# ─────────────────────────────────────────────────────────────
+# Statistics helpers
+# ─────────────────────────────────────────────────────────────
+
+def mean_ci95(values: List[float]) -> Tuple[float, float]:
+    """Return (mean, half-width of 95% CI)."""
+    if len(values) < 2:
+        return (values[0] if values else 0.0), 0.0
+    m  = np.mean(values)
+    se = stats.sem(values)
+    ci = se * stats.t.ppf(0.975, df=len(values) - 1)
+    return float(m), float(ci)
 
 
-def extract_ndts(folder_name: str) -> Optional[int]:
-    m = re.search(r"1to(\d+)$", folder_name)
-    return int(m.group(1)) if m else None
+def aggregate(df: pd.DataFrame, groupby: List[str],
+              metric: str) -> pd.DataFrame:
+    """
+    Aggregate metric over runs: mean ± 95% CI.
+    Only includes ACK rows for latency metrics.
+    """
+    acked = df[df["status"] == "ACK"].copy()
+    acked = acked.dropna(subset=[metric])
+
+    out = []
+    for keys, group in acked.groupby(groupby):
+        vals  = group[metric].tolist()
+        m, ci = mean_ci95(vals)
+        row   = dict(zip(groupby, keys if isinstance(keys, tuple) else [keys]))
+        row[f"{metric}_mean"] = m
+        row[f"{metric}_ci95"] = ci
+        row["n_acked"]        = len(vals)
+        out.append(row)
+
+    return pd.DataFrame(out)
 
 
-# ---------------------------------------------------------------------------
-# Metrics for one log file
-# ---------------------------------------------------------------------------
-def compute_metrics(df: pd.DataFrame, n_ndts: int, C: float) -> Optional[dict]:
-    if "tag" not in df.columns:
-        return None
-
-    rx        = df[df["tag"] == "NDT_EVENT_RX"]
-    done_mask = df["tag"] == "DTM_EVENT_DONE"
-    if "src" in df.columns:
-        done_mask &= (df["src"] == "feedback")
-    done = df[done_mask]
-    drop = df[df["tag"] == "DTM_DROP"]
-
-    total_rx   = len(rx)
-    total_done = len(done)
-    total_drop = len(drop)
-
-    if total_rx == 0:
-        return None
-
-    t_rx = pd.to_numeric(rx["ts_ns"], errors="coerce").dropna()
-    if len(t_rx) < 2:
-        return None
-
-    window_s  = (t_rx.max() - t_rx.min()) / 1e9
-    offered   = total_rx   / window_s if window_s > 0 else 0.0
-    capacity  = total_done / window_s if window_s > 0 else 0.0
-    drop_pct  = total_drop / total_rx * 100.0
-    theo_drop = max(0.0, (offered - C) / offered * 100.0) if offered > 0 else 0.0
-
-    proc_lat_mean = proc_lat_p95 = float("nan")
-    queue_mean    = queue_p95    = float("nan")
-
-    if not done.empty:
-        if {"t_rx_ns", "t_done_ns"}.issubset(done.columns):
-            lats = (
-                pd.to_numeric(done["t_done_ns"], errors="coerce") -
-                pd.to_numeric(done["t_rx_ns"],   errors="coerce")
-            ).dropna() / 1e6
-            if not lats.empty:
-                proc_lat_mean = float(lats.mean())
-                proc_lat_p95  = float(lats.quantile(0.95))
-
-        if "queue_ms" in done.columns:
-            qms = pd.to_numeric(done["queue_ms"], errors="coerce").dropna()
-            if not qms.empty:
-                queue_mean = float(qms.mean())
-                queue_p95  = float(qms.quantile(0.95))
-
-    return {
-        "NDTs":                 n_ndts,
-        "Offered (ev/s)":       round(offered,       1),
-        "Capacity (ev/s)":      round(capacity,      1),
-        "Drop (%)":             round(drop_pct,      2),
-        "Theoretical Drop (%)": round(theo_drop,     2),
-        "Queue Mean (ms)":      round(queue_mean,    3),
-        "Queue P95 (ms)":       round(queue_p95,     3),
-        "Proc Lat Mean (ms)":   round(proc_lat_mean, 3),
-        "Proc Lat P95 (ms)":    round(proc_lat_p95,  3),
-    }
+def ack_rate(df: pd.DataFrame, groupby: List[str]) -> pd.DataFrame:
+    """Compute ACK / DISCARD / TIMEOUT rates per group."""
+    out = []
+    for keys, group in df.groupby(groupby):
+        total     = len(group)
+        acked     = (group["status"] == "ACK").sum()
+        discarded = (group["status"] == "DISCARDED").sum()
+        timeout   = (group["status"] == "TIMEOUT").sum()
+        row = dict(zip(groupby, keys if isinstance(keys, tuple) else [keys]))
+        row["total"]        = total
+        row["ack_rate"]     = acked / total if total > 0 else 0
+        row["discard_rate"] = discarded / total if total > 0 else 0
+        row["timeout_rate"] = timeout / total if total > 0 else 0
+        out.append(row)
+    return pd.DataFrame(out)
 
 
-# ---------------------------------------------------------------------------
-# Load one run / one mode
-# ---------------------------------------------------------------------------
-def load_run_mode(mode_dir: Path, C: float, run_name: str) -> pd.DataFrame:
-    if not mode_dir.exists():
-        return pd.DataFrame()
+# ─────────────────────────────────────────────────────────────
+# Quick summary (text)
+# ─────────────────────────────────────────────────────────────
 
-    folders = sorted(
-        [d for d in mode_dir.iterdir()
-         if d.is_dir() and extract_ndts(d.name) is not None],
-        key=lambda d: extract_ndts(d.name),
-    )
+def print_summary(df: pd.DataFrame) -> None:
+    print("\n" + "="*70)
+    print(" EXPERIMENT 2 SUMMARY")
+    print("="*70)
 
-    results = []
-    for folder in folders:
-        n   = extract_ndts(folder.name)
-        log = find_log(folder)
-        if log is None:
-            continue
-        df = load_log(log)
-        if df.empty:
-            continue
-        m = compute_metrics(df, n, C)
-        if m is None:
-            continue
-        m["run"] = run_name
-        results.append(m)
-
-    if not results:
-        return pd.DataFrame()
-    return pd.DataFrame(results).sort_values("NDTs").reset_index(drop=True)
+    for (rate, queue), grp in df.groupby(["rate", "queue_size"]):
+        print(f"\n  rate={rate} cmd/s  queue={queue}"
+              f"  total={len(grp)}")
+        for ndt_id in sorted(grp["ndt_id"].unique()):
+            ngrp  = grp[grp["ndt_id"] == ndt_id]
+            acked = ngrp[ngrp["status"] == "ACK"]
+            disc  = (ngrp["status"] == "DISCARDED").sum()
+            e2e   = acked["e2e_ms"].dropna().tolist()
+            avg   = round(np.mean(e2e), 1) if e2e else None
+            prio  = NDT_PRIORITIES.get(ndt_id, "?")
+            print(f"    ndt-{ndt_id} (prio={prio:<3}): "
+                  f"sent={len(ngrp):<4} "
+                  f"ack={len(acked):<4} "
+                  f"disc={disc:<3} "
+                  f"e2e_avg={avg}ms")
+    print()
 
 
-# ---------------------------------------------------------------------------
-# Load all runs for one mode — returns DataFrame with all runs stacked
-# ---------------------------------------------------------------------------
-def load_all_runs(logs_path: Path, mode: str, C: float) -> pd.DataFrame:
-    run_dirs = sorted([
-        d for d in logs_path.iterdir()
-        if d.is_dir() and (d / mode).exists()
-    ])
+# ─────────────────────────────────────────────────────────────
+# Plot 1 — e2e_ms vs rate, per NDT (priority effect)
+# ─────────────────────────────────────────────────────────────
 
-    if not run_dirs:
-        # fallback: maybe logs_path itself contains the mode folder directly
-        mode_dir = logs_path / mode
-        if mode_dir.exists():
-            df = load_run_mode(mode_dir, C, "run1")
-            if not df.empty:
-                print(f"  Found single run for {mode}")
-            return df
+def plot_e2e_vs_rate(df: pd.DataFrame, out_dir: Path,
+                     queue_size: int = 0, show: bool = False) -> None:
+    subset = df[df["queue_size"] == queue_size]
+    agg    = aggregate(subset, ["rate", "ndt_id"], "e2e_ms")
 
-    frames = []
-    for run_dir in run_dirs:
-        mode_dir = run_dir / mode
-        df = load_run_mode(mode_dir, C, run_dir.name)
-        if not df.empty:
-            frames.append(df)
-            print(f"  {run_dir.name}/{mode}: {len(df)} experiments")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for ndt_id in sorted(agg["ndt_id"].unique()):
+        ngrp  = agg[agg["ndt_id"] == ndt_id].sort_values("rate")
+        prio  = NDT_PRIORITIES.get(int(ndt_id), "?")
+        ax.errorbar(ngrp["rate"], ngrp["e2e_ms_mean"],
+                    yerr=ngrp["e2e_ms_ci95"],
+                    marker="o", label=f"ndt-{ndt_id} (prio={prio})",
+                    color=COLORS[int(ndt_id) % len(COLORS)],
+                    capsize=4, linewidth=1.5)
 
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-# ---------------------------------------------------------------------------
-# Aggregate: mean + 95% CI per NDT value
-# ---------------------------------------------------------------------------
-def aggregate(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    """Returns DataFrame with columns: NDTs, mean, ci_low, ci_high."""
-    results = []
-    for ndts, group in df.groupby("NDTs"):
-        vals = group[col].dropna().values
-        n    = len(vals)
-        if n == 0:
-            continue
-        mean = float(np.mean(vals))
-        if n == 1:
-            ci_low = ci_high = mean
-        else:
-            se = stats.sem(vals)
-            t  = stats.t.ppf((1 + CI) / 2, df=n - 1)
-            ci_low  = mean - t * se
-            ci_high = mean + t * se
-        results.append({
-            "NDTs":    ndts,
-            "mean":    mean,
-            "ci_low":  ci_low,
-            "ci_high": ci_high,
-            "n_runs":  n,
-        })
-    if not results:
-        return pd.DataFrame()
-    return pd.DataFrame(results).sort_values("NDTs").reset_index(drop=True)
+    ax.set_xlabel("Rate (cmd/s per NDT)", fontsize=12)
+    ax.set_ylabel("e2e latency (ms)", fontsize=12)
+    ax.set_title(f"E2E Latency vs Rate — queue_size={queue_size}\n"
+                 f"(mean ± 95% CI)", fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = out_dir / f"e2e_vs_rate_queue{queue_size}.png"
+    fig.savefig(path, dpi=150)
+    print(f"  Saved: {path}")
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Y-axis in multiples of C
-# ---------------------------------------------------------------------------
-def set_yaxis_C_ticks(ax, C: float, max_val: float) -> None:
-    fracs  = [i / 2 for i in range(0, int(max_val / C * 2) + 3)]
-    ticks  = [f * C for f in fracs if f * C <= max_val * 1.1]
-    labels = []
-    for f in fracs:
-        if f * C > max_val * 1.1:
-            break
-        if f == 0:
-            labels.append("0")
-        elif f == 1:
-            labels.append("$C$")
-        elif f.is_integer():
-            labels.append(f"${int(f)}C$")
-        else:
-            num = int(f * 2)
-            labels.append(f"$\\frac{{{num}}}{{2}}C$")
-    ax.set_yticks(ticks)
-    ax.set_yticklabels(labels)
+# ─────────────────────────────────────────────────────────────
+# Plot 2 — e2e_ms vs queue_size, per rate
+# ─────────────────────────────────────────────────────────────
+
+def plot_e2e_vs_queue(df: pd.DataFrame, out_dir: Path,
+                      show: bool = False) -> None:
+    agg   = aggregate(df, ["rate", "queue_size"], "e2e_ms")
+    rates = sorted(agg["rate"].unique())
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for i, rate in enumerate(rates):
+        rgrp = agg[agg["rate"] == rate].sort_values("queue_size")
+        ax.errorbar(rgrp["queue_size"], rgrp["e2e_ms_mean"],
+                    yerr=rgrp["e2e_ms_ci95"],
+                    marker="s", label=f"rate={rate} cmd/s",
+                    color=COLORS[i % len(COLORS)],
+                    capsize=4, linewidth=1.5)
+
+    ax.set_xlabel("Queue size (0=unlimited)", fontsize=12)
+    ax.set_ylabel("e2e latency (ms)", fontsize=12)
+    ax.set_title("E2E Latency vs Queue Size\n(mean ± 95% CI)", fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = out_dir / "e2e_vs_queue.png"
+    fig.savefig(path, dpi=150)
+    print(f"  Saved: {path}")
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Plot helpers
-# ---------------------------------------------------------------------------
-def _plot_ci(ax, agg: pd.DataFrame, style: dict, label: str) -> None:
-    if agg.empty:
+# ─────────────────────────────────────────────────────────────
+# Plot 3 — ACK / DISCARD rate vs conditions
+# ─────────────────────────────────────────────────────────────
+
+def plot_ack_discard(df: pd.DataFrame, out_dir: Path,
+                     show: bool = False) -> None:
+    rates  = sorted(df["rate"].unique())
+    queues = sorted(df["queue_size"].unique())
+    ar     = ack_rate(df, ["rate", "queue_size"])
+
+    x      = np.arange(len(rates))
+    width  = 0.8 / len(queues)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for j, queue in enumerate(queues):
+        qgrp = ar[ar["queue_size"] == queue].sort_values("rate")
+        offset = (j - len(queues)/2 + 0.5) * width
+        axes[0].bar(x + offset, qgrp["ack_rate"] * 100,
+                    width=width*0.9, label=f"queue={queue}",
+                    color=COLORS[j % len(COLORS)], alpha=0.8)
+        axes[1].bar(x + offset, qgrp["discard_rate"] * 100,
+                    width=width*0.9, label=f"queue={queue}",
+                    color=COLORS[j % len(COLORS)], alpha=0.8)
+
+    for ax, title, ylabel in zip(
+        axes,
+        ["ACK Rate vs Rate × Queue", "DISCARD Rate vs Rate × Queue"],
+        ["ACK rate (%)", "Discard rate (%)"]
+    ):
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{r}" for r in rates])
+        ax.set_xlabel("Rate (cmd/s per NDT)", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(title, fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3, axis="y")
+        ax.set_ylim(0, 105)
+
+    fig.tight_layout()
+    path = out_dir / "ack_discard_rate.png"
+    fig.savefig(path, dpi=150)
+    print(f"  Saved: {path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────
+# Plot 4 — CDF of e2e_ms per NDT (fairness)
+# ─────────────────────────────────────────────────────────────
+
+def plot_cdf_fairness(df: pd.DataFrame, out_dir: Path,
+                      rate: float = 1.0, queue_size: int = 0,
+                      show: bool = False) -> None:
+    subset = df[(df["rate"] == rate) &
+                (df["queue_size"] == queue_size) &
+                (df["status"] == "ACK")].dropna(subset=["e2e_ms"])
+
+    if subset.empty:
+        print(f"  No ACK data for rate={rate} queue={queue_size} — skipping CDF")
         return
-    import numpy as _np
-    yerr = _np.array([
-        agg["mean"].values - agg["ci_low"].values,
-        agg["ci_high"].values - agg["mean"].values,
-    ])
-    ax.errorbar(
-        agg["NDTs"], agg["mean"],
-        yerr=yerr,
-        color=style["color"],
-        marker=style["marker"],
-        linestyle=style["linestyle"],
-        label=label,
-        linewidth=1.5,
-        markersize=5,
-        capsize=4,
-        capthick=1.2,
-        elinewidth=1.2,
-    )
 
-
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
-def plot_drop(data: Dict[str, pd.DataFrame], C: float, outdir: Path) -> None:
-    fig, ax = plt.subplots()
-
-    # theoretical curve from first available mode
-    ref = next((df for df in data.values() if not df.empty), None)
-    if ref is not None:
-        theo = aggregate(ref, "Theoretical Drop (%)")
-        if not theo.empty:
-            ax.plot(theo["NDTs"], theo["mean"],
-                    color="gray", linestyle=":", linewidth=1.2,
-                    label="Theoretical (no buffer)")
-
-    for mode, df in data.items():
-        agg = aggregate(df, "Drop (%)")
-        _plot_ci(ax, agg, MODE_STYLE[mode], MODE_STYLE[mode]["label"])
-
-    ax.set_xlabel("Number of NDTs")
-    ax.set_ylabel("Event drop ratio (%)")
-    ax.set_title(f"Drop % vs federation size (95% CI)")
-    ax.legend()
-    out = outdir / "fig1_drop_vs_ndts.pdf"
-    fig.savefig(out)
-    plt.close(fig)
-    print(f"  -> {out.name}")
-
-
-def plot_throughput(data: Dict[str, pd.DataFrame], C: float, outdir: Path) -> None:
-    fig, ax = plt.subplots()
-
-    all_vals = []
-    for df in data.values():
-        if df.empty:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for ndt_id in sorted(subset["ndt_id"].unique()):
+        vals = sorted(subset[subset["ndt_id"] == ndt_id]["e2e_ms"].tolist())
+        if not vals:
             continue
-        all_vals += df["Offered (ev/s)"].tolist()
-        all_vals += df["Capacity (ev/s)"].tolist()
-    max_val = max(all_vals) if all_vals else C * 2
+        cdf  = np.arange(1, len(vals) + 1) / len(vals)
+        prio = NDT_PRIORITIES.get(int(ndt_id), "?")
+        ax.plot(vals, cdf,
+                label=f"ndt-{ndt_id} (prio={prio})",
+                color=COLORS[int(ndt_id) % len(COLORS)],
+                linewidth=1.5)
 
-    ax.axhline(y=C, color="red", linestyle=":", linewidth=1.2, label="$C$")
-
-    for mode, df in data.items():
-        s = MODE_STYLE[mode]
-        agg_off = aggregate(df, "Offered (ev/s)")
-        agg_cap = aggregate(df, "Capacity (ev/s)")
-        if not agg_off.empty:
-            ax.plot(agg_off["NDTs"], agg_off["mean"],
-                    color=s["color"], marker=s["marker"],
-                    linestyle="-", alpha=0.4, linewidth=1, markersize=4,
-                    label=f"Offered ({s['label']})")
-        if not agg_cap.empty:
-            _plot_ci(ax, agg_cap, s, f"Processed ({s['label']})")
-
-    set_yaxis_C_ticks(ax, C, max_val)
-    ax.set_xlabel("Number of NDTs")
-    ax.set_ylabel("Event rate")
-    ax.set_title("Throughput vs federation size (95% CI)")
-    ax.legend(fontsize=7)
-    out = outdir / "fig2_throughput_vs_ndts.pdf"
-    fig.savefig(out)
+    ax.set_xlabel("e2e latency (ms)", fontsize=12)
+    ax.set_ylabel("CDF", fontsize=12)
+    ax.set_title(f"Fairness — CDF of e2e latency per NDT\n"
+                 f"rate={rate} cmd/s  queue={queue_size}", fontsize=12)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1.05)
+    fig.tight_layout()
+    path = out_dir / f"cdf_fairness_rate{rate}_queue{queue_size}.png"
+    fig.savefig(path, dpi=150)
+    print(f"  Saved: {path}")
+    if show:
+        plt.show()
     plt.close(fig)
-    print(f"  -> {out.name}")
 
 
-def plot_latency(data: Dict[str, pd.DataFrame], outdir: Path) -> None:
-    fig, ax = plt.subplots()
-    for mode, df in data.items():
-        s = MODE_STYLE[mode]
-        agg_mean = aggregate(df, "Proc Lat Mean (ms)")
-        agg_p95  = aggregate(df, "Proc Lat P95 (ms)")
-        _plot_ci(ax, agg_mean, s, f"Mean ({s['label']})")
-        _plot_ci(ax, agg_p95,  {**s, "linestyle": ":"}, f"P95 ({s['label']})")
-    ax.set_xlabel("Number of NDTs")
-    ax.set_ylabel("Processing latency (ms)")
-    ax.set_title("Processing latency vs federation size (95% CI)")
-    ax.legend(fontsize=7)
-    out = outdir / "fig3_latency_vs_ndts.pdf"
-    fig.savefig(out)
+# ─────────────────────────────────────────────────────────────
+# Plot 5 — Heatmap e2e_avg vs rate × queue_size
+# ─────────────────────────────────────────────────────────────
+
+def plot_heatmap(df: pd.DataFrame, out_dir: Path,
+                 show: bool = False) -> None:
+    agg    = aggregate(df, ["rate", "queue_size"], "e2e_ms")
+    rates  = sorted(agg["rate"].unique())
+    queues = sorted(agg["queue_size"].unique())
+
+    matrix = np.full((len(queues), len(rates)), np.nan)
+    for _, row in agg.iterrows():
+        i = queues.index(row["queue_size"])
+        j = rates.index(row["rate"])
+        matrix[i, j] = row["e2e_ms_mean"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+    plt.colorbar(im, ax=ax, label="e2e_ms mean")
+
+    ax.set_xticks(range(len(rates)))
+    ax.set_xticklabels([str(r) for r in rates])
+    ax.set_yticks(range(len(queues)))
+    ax.set_yticklabels([str(q) for q in queues])
+    ax.set_xlabel("Rate (cmd/s per NDT)", fontsize=12)
+    ax.set_ylabel("Queue size (0=unlimited)", fontsize=12)
+    ax.set_title("Heatmap — Mean e2e latency (ms)\n"
+                 "rate × queue_size", fontsize=12)
+
+    for i in range(len(queues)):
+        for j in range(len(rates)):
+            val = matrix[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:.1f}", ha="center", va="center",
+                        fontsize=10, color="black")
+
+    fig.tight_layout()
+    path = out_dir / "heatmap_e2e.png"
+    fig.savefig(path, dpi=150)
+    print(f"  Saved: {path}")
+    if show:
+        plt.show()
     plt.close(fig)
-    print(f"  -> {out.name}")
 
 
-def plot_queue(data: Dict[str, pd.DataFrame], outdir: Path) -> None:
-    fig, ax = plt.subplots()
-    for mode, df in data.items():
-        s = MODE_STYLE[mode]
-        agg_mean = aggregate(df, "Queue Mean (ms)")
-        agg_p95  = aggregate(df, "Queue P95 (ms)")
-        _plot_ci(ax, agg_mean, s, f"Mean ({s['label']})")
-        _plot_ci(ax, agg_p95,  {**s, "linestyle": ":"}, f"P95 ({s['label']})")
-    ax.set_xlabel("Number of NDTs")
-    ax.set_ylabel("Queue delay (ms)")
-    ax.set_title("Queue delay vs federation size (95% CI)")
-    ax.legend(fontsize=7)
-    out = outdir / "fig4_queue_vs_ndts.pdf"
-    fig.savefig(out)
-    plt.close(fig)
-    print(f"  -> {out.name}")
+# ─────────────────────────────────────────────────────────────
+# Plot 6 — Priority effect: e2e by NDT at fixed rate
+# ─────────────────────────────────────────────────────────────
+
+def plot_priority_effect(df: pd.DataFrame, out_dir: Path,
+                         show: bool = False) -> None:
+    rates  = sorted(df["rate"].unique())
+    queues = sorted(df["queue_size"].unique())
+
+    for queue in queues:
+        fig, axes = plt.subplots(1, len(rates),
+                                 figsize=(4 * len(rates), 5),
+                                 sharey=True)
+        if len(rates) == 1:
+            axes = [axes]
+
+        for ax, rate in zip(axes, rates):
+            subset = df[(df["rate"] == rate) &
+                        (df["queue_size"] == queue) &
+                        (df["status"] == "ACK")].dropna(subset=["e2e_ms"])
+
+            ndt_ids   = sorted(subset["ndt_id"].unique())
+            means, cis = [], []
+            for ndt_id in ndt_ids:
+                vals = subset[subset["ndt_id"] == ndt_id]["e2e_ms"].tolist()
+                m, ci = mean_ci95(vals) if vals else (0, 0)
+                means.append(m)
+                cis.append(ci)
+
+            x     = np.arange(len(ndt_ids))
+            prios = [NDT_PRIORITIES.get(int(n), "?") for n in ndt_ids]
+            bars  = ax.bar(x, means, yerr=cis,
+                           color=[COLORS[int(n) % len(COLORS)] for n in ndt_ids],
+                           capsize=5, alpha=0.85)
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"ndt-{n}\n(p={p})" for n, p in
+                                 zip(ndt_ids, prios)], fontsize=9)
+            ax.set_title(f"rate={rate}", fontsize=10)
+            ax.set_xlabel("NDT (priority)", fontsize=10)
+            ax.grid(True, alpha=0.3, axis="y")
+
+        axes[0].set_ylabel("e2e latency (ms)", fontsize=11)
+        fig.suptitle(f"Priority Effect on e2e Latency — queue={queue}",
+                     fontsize=12)
+        fig.tight_layout()
+        path = out_dir / f"priority_effect_queue{queue}.png"
+        fig.savefig(path, dpi=150)
+        print(f"  Saved: {path}")
+        if show:
+            plt.show()
+        plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Console summary table with CI
-# ---------------------------------------------------------------------------
-def print_summary(df: pd.DataFrame, mode: str, C: float) -> None:
-    cols = ["Drop (%)", "Capacity (ev/s)", "Queue Mean (ms)",
-            "Queue P95 (ms)", "Proc Lat Mean (ms)"]
-    rows = []
-    for ndts, group in df.groupby("NDTs"):
-        row = {"NDTs": ndts, "runs": len(group)}
-        for col in cols:
-            vals = group[col].dropna().values
-            if len(vals) == 0:
-                row[f"{col} mean"] = float("nan")
-                row[f"{col} CI±"]  = float("nan")
-            elif len(vals) == 1:
-                row[f"{col} mean"] = round(float(vals[0]), 2)
-                row[f"{col} CI±"]  = 0.0
-            else:
-                mean = float(np.mean(vals))
-                se   = stats.sem(vals)
-                t    = stats.t.ppf((1 + CI) / 2, df=len(vals) - 1)
-                row[f"{col} mean"] = round(mean, 2)
-                row[f"{col} CI±"]  = round(t * se, 2)
-        rows.append(row)
+# ─────────────────────────────────────────────────────────────
+# CSV export
+# ─────────────────────────────────────────────────────────────
 
-    if not rows:
-        return
-    result_df = pd.DataFrame(rows)
-    print(f"\n[{'='*20} {mode.upper()} {'='*20}]")
-    print(tabulate(result_df, headers="keys", tablefmt="psql",
-                   showindex=False, floatfmt=".2f"))
+def export_csv(df: pd.DataFrame, out_dir: Path) -> None:
+    # Full log
+    df.to_csv(out_dir / "all_records.csv", index=False)
+    print(f"  Saved: {out_dir / 'all_records.csv'}")
+
+    # Aggregated summary
+    agg_e2e  = aggregate(df, ["rate", "queue_size", "ndt_id"], "e2e_ms")
+    agg_wait = aggregate(df, ["rate", "queue_size", "ndt_id"], "wait_ms")
+    agg_app  = aggregate(df, ["rate", "queue_size", "ndt_id"], "apply_ms")
+    ar       = ack_rate(df, ["rate", "queue_size", "ndt_id"])
+
+    summary = agg_e2e.merge(
+        agg_wait[["rate","queue_size","ndt_id","wait_ms_mean","wait_ms_ci95"]],
+        on=["rate","queue_size","ndt_id"], how="left"
+    ).merge(
+        agg_app[["rate","queue_size","ndt_id","apply_ms_mean","apply_ms_ci95"]],
+        on=["rate","queue_size","ndt_id"], how="left"
+    ).merge(
+        ar[["rate","queue_size","ndt_id","total","ack_rate","discard_rate"]],
+        on=["rate","queue_size","ndt_id"], how="left"
+    )
+    summary["priority"] = summary["ndt_id"].map(NDT_PRIORITIES)
+    summary = summary.sort_values(["rate","queue_size","ndt_id"])
+    summary.to_csv(out_dir / "summary.csv", index=False)
+    print(f"  Saved: {out_dir / 'summary.csv'}")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
 # Main
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="NDT loss analyser — uniform vs Poisson, multiple runs with 95% CI"
+        description="experiment_2_results — Exp.2 analysis and plots"
     )
     ap.add_argument("--logs", required=True,
-                    help="Root folder containing run1/, run2/... or uniform/poisson/ directly")
+                    help="Root directory of experiment logs (e.g. /tmp/exp2)")
     ap.add_argument("--out",  required=True,
-                    help="Output folder for PDFs and CSV")
-    ap.add_argument("--C",   type=float, default=2000.0,
-                    help="DTM capacity C in ev/s (default: 2000)")
+                    help="Output directory for plots and CSVs")
+    ap.add_argument("--show", action="store_true",
+                    help="Show plots interactively")
+    ap.add_argument("--queue-for-cdf", type=int, default=0,
+                    help="Queue size to use for CDF fairness plot (default: 0)")
+    ap.add_argument("--rate-for-cdf", type=float, default=1.0,
+                    help="Rate to use for CDF fairness plot (default: 1.0)")
     args = ap.parse_args()
 
-    logs_path = Path(args.logs)
-    out_path  = Path(args.out)
-    out_path.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    data: Dict[str, pd.DataFrame] = {}
-    for mode in ("uniform", "poisson"):
-        print(f"\nLoading mode: {mode}")
-        df = load_all_runs(logs_path, mode, args.C)
-        if not df.empty:
-            n_runs = df["run"].nunique()
-            data[mode] = df
-            print(f"  Total: {len(df)} experiments across {n_runs} run(s)")
-        else:
-            print(f"  No data for {mode} — skipping")
+    # Load
+    df = load_logs(args.logs)
 
-    if not data:
-        print("\n[ERROR] No valid data found.")
-        return
+    # Summary
+    print_summary(df)
 
-    # console summary
-    for mode, df in data.items():
-        print_summary(df, mode, args.C)
+    print(f"\nGenerating plots → {out_dir}")
 
-    # CSV — raw per-run data
-    for mode, df in data.items():
-        df.to_csv(out_path / f"metrics_{mode}_runs.csv", index=False)
-        print(f"  -> metrics_{mode}_runs.csv")
+    # Plot 1 — e2e vs rate per NDT (all queue sizes)
+    for queue in sorted(df["queue_size"].unique()):
+        plot_e2e_vs_rate(df, out_dir, queue_size=int(queue), show=args.show)
 
-    # CSV — aggregated mean + CI
-    agg_frames = []
-    for mode, df in data.items():
-        cols = ["Drop (%)", "Capacity (ev/s)", "Offered (ev/s)",
-                "Queue Mean (ms)", "Queue P95 (ms)",
-                "Proc Lat Mean (ms)", "Proc Lat P95 (ms)"]
-        rows = []
-        for ndts, group in df.groupby("NDTs"):
-            row = {"Mode": mode, "NDTs": ndts, "n_runs": len(group)}
-            for col in cols:
-                vals = group[col].dropna().values
-                if len(vals) == 0:
-                    row[f"{col}_mean"] = float("nan")
-                    row[f"{col}_ci"]   = float("nan")
-                    continue
-                mean = float(np.mean(vals))
-                ci   = 0.0
-                if len(vals) > 1:
-                    se = stats.sem(vals)
-                    t  = stats.t.ppf((1 + CI) / 2, df=len(vals) - 1)
-                    ci = float(t * se)
-                row[f"{col}_mean"] = round(mean, 3)
-                row[f"{col}_ci"]   = round(ci, 3)
-            rows.append(row)
-        agg_frames.append(pd.DataFrame(rows))
+    # Plot 2 — e2e vs queue per rate
+    plot_e2e_vs_queue(df, out_dir, show=args.show)
 
-    pd.concat(agg_frames).to_csv(out_path / "metrics_aggregated.csv", index=False)
-    print(f"  -> metrics_aggregated.csv")
+    # Plot 3 — ACK/DISCARD rates
+    plot_ack_discard(df, out_dir, show=args.show)
 
-    # plots
-    print("\nGenerating plots...")
-    plot_drop(data, args.C, out_path)
-    plot_throughput(data, args.C, out_path)
-    plot_latency(data, out_path)
-    plot_queue(data, out_path)
+    # Plot 4 — CDF fairness
+    plot_cdf_fairness(df, out_dir,
+                      rate=args.rate_for_cdf,
+                      queue_size=args.queue_for_cdf,
+                      show=args.show)
 
-    print(f"\nDone. Results in: {out_path.resolve()}")
+    # Plot 5 — Heatmap
+    plot_heatmap(df, out_dir, show=args.show)
+
+    # Plot 6 — Priority effect
+    plot_priority_effect(df, out_dir, show=args.show)
+
+    # CSV export
+    print("\nExporting CSVs...")
+    export_csv(df, out_dir)
+
+    print(f"\nDone. Results in: {out_dir}")
+    print("Files:")
+    for f in sorted(out_dir.iterdir()):
+        print(f"  {f.name}")
 
 
 if __name__ == "__main__":
