@@ -287,7 +287,7 @@ collect_logs() {
 
     # DTM upstream log
     kubectl exec pod-dtm -n "${NAMESPACE}" -- \
-        cat /run/dtm_upstream_exp2.log 2>/dev/null \
+        cat /tmp/dtm_upstream.log 2>/dev/null \
         > "${log_dir}/dtm_upstream.log" || true
 
     # ONM log
@@ -407,12 +407,18 @@ for run in $(seq 1 "${RUN_COUNT}"); do
 
             # 1. Launch testbed with XRM
             echo "    Launching testbed (fanout=${FANOUT} --xrm)..."
+            # Build launch args with queue and priority mode
+            LAUNCH_EXTRA=""
+            [ "${queue}" -gt 0 ] && LAUNCH_EXTRA="${LAUNCH_EXTRA} --max-queue ${queue}"
+            [ "${prio_mode}" = "fifo" ] && LAUNCH_EXTRA="${LAUNCH_EXTRA} --disable-priorities"
+
             "${SCRIPT_DIR}/launch_testbed.sh" \
                 --mode federated \
                 --fanout "${FANOUT}" \
                 --xrm \
                 --upstream \
-                2>&1 | grep -E "ready|ERROR|TIMEOUT|NDTs|DTM|XRM|ONM" || true
+                ${LAUNCH_EXTRA} \
+                2>&1 | grep -E "ready|ERROR|TIMEOUT|NDTs|DTM|XRM|ONM|queue|fifo" || true
 
             # 2. Wait for all pods Running
             wait_pods_ready
@@ -425,10 +431,9 @@ for run in $(seq 1 "${RUN_COUNT}"); do
             # 4. Service already deployed at launch via --upstream flag
             #    NDTs start with 4 containers (ndt + dtm-agent + xrm-agent + actuator-control)
 
-            # 5. ONM upstream starts automatically with testbed (launch_testbed.sh)
-
-            # 6. Start DTM upstream with correct priority mode
-            start_dtm_upstream "${queue}" "${prio_mode}"
+            # 5+6. ONM upstream and DTM upstream start automatically with testbed
+            #       --max-queue and --disable-priorities passed via launch_testbed.sh
+            #       No manual start needed — avoids port conflict with testbed process
 
             # 7. Run all NDT clients in parallel
             run_clients "${rate}" "${LOG_DIR}"

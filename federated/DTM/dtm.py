@@ -590,10 +590,12 @@ def run_upstream(args: argparse.Namespace) -> None:
     """
     global run_ctx
     run_ctx = {
-        "side":        "DTM_UPSTREAM",
-        "onm_ip":      args.onm_ip,
-        "log_file":    args.log_file,
-        "event_limit": args.event_limit,
+        "side":               "DTM_UPSTREAM",
+        "onm_ip":             args.onm_ip,
+        "log_file":           args.log_file,
+        "event_limit":        args.event_limit,
+        "max_queue":          args.max_queue,
+        "disable_priorities": args.disable_priorities,
     }
     threading.Thread(target=_log_writer, name="log-writer",
                      daemon=True).start()

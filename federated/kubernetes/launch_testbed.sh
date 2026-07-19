@@ -58,10 +58,11 @@ FANOUT=2
 BASE_PORT=30001
 PROTO="udp"
 ACK_PORT=9000
-UPSTREAM=0       # --upstream: start ONM upstream server + DTM upstream
 DTM_LOG="/dev/stderr"
 XRM=0
 UPSTREAM=0       # --upstream: start ONM upstream server + DTM upstream
+UPSTREAM_MAX_QUEUE=0    # --max-queue N: DTM upstream AdmissionQueue size (0=unlimited)
+UPSTREAM_FIFO=0         # --disable-priorities: DTM upstream FIFO mode
 
 # ── Parse arguments ──────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -72,8 +73,10 @@ while [[ $# -gt 0 ]]; do
         --proto)      PROTO="$2";     shift 2 ;;
         --ack-port)   ACK_PORT="$2";  shift 2 ;;
         --dtm-log)    DTM_LOG="$2";   shift 2 ;;
-        --xrm)        XRM=1;          shift   ;;
-        --upstream)   UPSTREAM=1;     shift   ;;
+        --xrm)                XRM=1;                  shift   ;;
+        --upstream)           UPSTREAM=1;             shift   ;;
+        --max-queue)          UPSTREAM_MAX_QUEUE="$2"; shift 2 ;;
+        --disable-priorities) UPSTREAM_FIFO=1;         shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -370,6 +373,11 @@ EOF
         sleep 1
     done
     if [ "${UPSTREAM}" = "1" ]; then
+        # Build optional args for DTM upstream
+        DTM_UPSTREAM_EXTRA=""
+        [ "${UPSTREAM_MAX_QUEUE}" -gt 0 ] &&             DTM_UPSTREAM_EXTRA="${DTM_UPSTREAM_EXTRA} --max-queue ${UPSTREAM_MAX_QUEUE}"
+        [ "${UPSTREAM_FIFO}" = "1" ] &&             DTM_UPSTREAM_EXTRA="${DTM_UPSTREAM_EXTRA} --disable-priorities"
+        echo "  DTM upstream args: queue=${UPSTREAM_MAX_QUEUE} fifo=${UPSTREAM_FIFO}"
         kubectl exec pod-dtm -n "${NAMESPACE}" -- bash -c \
             "setsid python3 /app/dtm.py \
                 --proto udp \
@@ -377,6 +385,7 @@ EOF
                 --mode upstream \
                 --onm-ip 127.0.0.1 \
                 --log-file /tmp/dtm_upstream.log \
+                ${DTM_UPSTREAM_EXTRA} \
                 </dev/null >/tmp/dtm_upstream_stderr.log 2>&1 &
              echo \$! > /tmp/dtm_upstream.pid" 2>/dev/null || true
         # Wait for DTM upstream to be ready
