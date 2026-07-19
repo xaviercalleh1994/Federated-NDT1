@@ -88,6 +88,8 @@ import os
 import json as _json
 import time
 import math
+import heapq
+import itertools
 import socket
 import argparse
 import threading
@@ -778,9 +780,8 @@ def run_upstream(args: argparse.Namespace) -> None:
                 registry.clear_inflight(event_id)
 
                 # Get current queued event_ids for status assignment
-                queued_ids = set(
-                    item["event_id"] for item in aq.drain_up_to(0)
-                )
+                # (non-destructive peek — see AdmissionQueue.peek_ids)
+                queued_ids = aq.peek_ids()
 
                 _broadcast_state_update(
                     bc_sock, registry,
@@ -1045,16 +1046,34 @@ class TokenBucket:
 
 
 class AdmissionQueue:
+    # ── FIX (2026-07-19) ────────────────────────────────────────
+    # Previously self._q was a plain deque: push() always appended
+    # and drain()/drain_up_to() always popleft()'d, so dispatch order
+    # was strict FIFO regardless of `priority` — priority only ever
+    # affected admission (drop) decisions, never service order. This
+    # meant "priority" mode and "fifo" mode produced identical e2e
+    # latency, since nothing was ever actually reordered.
+    #
+    # Fix: replace the deque with a binary heap (heapq) keyed on
+    # priority when priority mode is active, or on a monotonic
+    # counter when disable_priorities/fifo mode is active (preserving
+    # strict FIFO for that control condition). A monotonically
+    # increasing tie-breaker (self._counter) is always included as
+    # the second tuple element so heapq never has to compare the
+    # `item` dicts themselves (which are not orderable) when two
+    # entries share the same priority.
+    # ─────────────────────────────────────────────────────────────
     def __init__(self, max_queue: int, drop_prio_if_full: int,
                  disable_priorities: bool, no_queue: bool = False) -> None:
         self._max       = max_queue
         self._drop_prio = drop_prio_if_full
         self._fifo      = disable_priorities
         self._no_queue  = no_queue
-        self._q: deque  = deque()
-        self._lock      = threading.Lock()
-        self._cond      = threading.Condition(self._lock)
-        self._qsize     = 0
+        self._heap: list = []
+        self._counter    = itertools.count()
+        self._lock       = threading.Lock()
+        self._cond       = threading.Condition(self._lock)
+        self._qsize      = 0
         self._dispatch_busy = False
 
     def set_busy(self, busy: bool) -> None:
@@ -1071,7 +1090,13 @@ class AdmissionQueue:
                 if self._fifo or priority >= self._drop_prio:
                     drop_reason = "tail_drop" if self._fifo else "prio_drop"
             if drop_reason is None:
-                self._q.append(item)
+                # order key: priority (lower = served first) in priority
+                # mode, or arrival sequence in fifo mode — either way the
+                # counter guarantees stable ordering and a valid heap
+                # comparison without ever touching `item`.
+                seq = next(self._counter)
+                order_key = seq if self._fifo else priority
+                heapq.heappush(self._heap, (order_key, seq, item))
                 self._qsize += 1
                 self._cond.notify()
         if drop_reason is not None:
@@ -1085,21 +1110,37 @@ class AdmissionQueue:
 
     def drain(self, max_items: int = 2000) -> List[dict]:
         with self._lock:
-            while not self._q:
+            while not self._heap:
                 self._cond.wait(timeout=0.0005)
             batch: List[dict] = []
-            while self._q and len(batch) < max_items:
-                batch.append(self._q.popleft())
+            while self._heap and len(batch) < max_items:
+                _, _, item = heapq.heappop(self._heap)
+                batch.append(item)
                 self._qsize -= 1
         return batch
 
     def drain_up_to(self, max_items: int) -> List[dict]:
         with self._lock:
             batch: List[dict] = []
-            while self._q and len(batch) < max_items:
-                batch.append(self._q.popleft())
+            while self._heap and len(batch) < max_items:
+                _, _, item = heapq.heappop(self._heap)
+                batch.append(item)
                 self._qsize -= 1
         return batch
+
+    # ── FIX (2026-07-19) ────────────────────────────────────────
+    # Non-destructive peek. run_upstream's _dispatch_loop needs to
+    # know which event_ids are currently waiting (to broadcast
+    # "QUEUED" status) without removing them from the heap.
+    # drain_up_to() always pops — calling it with max_items=0 was
+    # being used for this purpose but its loop condition
+    # (len(batch) < max_items) is false immediately when
+    # max_items=0, so it always returned an empty set and no
+    # xrm-agent ever received "QUEUED" status. Use this instead.
+    # ─────────────────────────────────────────────────────────────
+    def peek_ids(self) -> set:
+        with self._lock:
+            return {item[2]["event_id"] for item in self._heap}
 
 
 # ─────────────────────────────────────────────────────────────
