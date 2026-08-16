@@ -1,0 +1,576 @@
+# Copyright (C) 2026 Xavier Calle-Heredia, Xavier Hesselbach
+# Universitat Politècnica de Catalunya (UPC)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+"""
+Authors: Xavier Calle-Heredia & Xavier Hesselbach
+Date: 2026-04-08
+
+Experiment 1 — Synchronization Latency Analyser
+================================================
+Reads DTM logs from multiple runs and produces plots with 95% CI.
+
+Metrics extracted (all from dtm.log)
+-------------------------------------
+  L_dispatch   — DTM fanout time: t_dispatch_end - t_dispatch_start (ms)
+  T_conv       — convergence spread: max(t_rx_ns ACK) - min(t_rx_ns ACK) per event (ms)
+  F_sync       — sync fidelity: ok ACKs / total ACKs × 100 (%)
+  apply_ms     — mean time each NDT takes to apply an event internally (ms)
+                 Proxy for per-NDT computational overhead under load.
+
+Plots generated
+---------------
+  fig1_l_dispatch_vs_ndts.pdf  — dispatch latency vs N
+  fig2_t_conv_vs_ndts.pdf      — convergence spread vs N
+  fig3_f_sync_vs_ndts.pdf      — sync fidelity vs N
+  fig4_apply_ms_vs_ndts.pdf    — per-NDT apply time vs N
+
+Folder layout expected
+----------------------
+exp1/
+  run1/
+    1to1/   dtm.log
+    1to2/   dtm.log
+    ...
+  run2/
+    ...
+
+Usage
+-----
+python3 experiment_1.py \\
+    --logs /tmp/exp1 \\
+    --out  /tmp/exp1/results
+"""
+
+import re
+import argparse
+from pathlib import Path
+from typing import Optional
+
+try:
+    import orjson
+    def _parse(line: bytes) -> dict: return orjson.loads(line)
+    _MODE = "rb"
+except ImportError:
+    import json as _json
+    def _parse(line) -> dict: return _json.loads(line)
+    _MODE = "r"
+
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.ticker
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy import stats
+from tabulate import tabulate
+
+
+# ── IEEE-style plot settings ─────────────────────────────────────
+# Aligned with experiment_2_results.py so Exp1 and Exp2 figures read
+# as one consistent visual language in the paper: same serif font
+# (Liberation Serif, Times-metric-compatible), same Okabe-Ito
+# colorblind-safe palette (applied above to the plotting calls), and
+# the same dual PNG(300dpi)+PDF export layout.
+plt.rcParams.update({
+    "font.family":       "serif",
+    "font.serif":        ["Liberation Serif", "Times New Roman", "DejaVu Serif"],
+    "font.size":         12,
+    "axes.titlesize":    12.5,
+    "axes.labelsize":    12,
+    "legend.fontsize":   10.5,
+    "xtick.labelsize":   11,
+    "ytick.labelsize":   11,
+    "figure.figsize":    (5.5, 3.8),
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.linewidth":    0.9,
+    "axes.edgecolor":    "#333333",
+    "axes.grid":         True,
+    "grid.alpha":        0.25,
+    "grid.linewidth":    0.6,
+    "grid.linestyle":    "--",
+    "legend.frameon":    True,
+    "legend.facecolor":  "white",
+    "legend.edgecolor":  "#cccccc",
+    "legend.framealpha": 0.92,
+    "axes.axisbelow":    True,
+    "savefig.dpi":       300,
+    "savefig.bbox":      "tight",
+})
+
+CI = 0.95
+
+
+def _save(fig, out_dir: Path, stem: str, also_pdf: bool = True) -> None:
+    """Save as high-res PNG (screen/quick review) and, by default,
+    vector PDF (camera-ready) — same convention and folder layout
+    (png/, pdf/) as experiment_2_results.py, so combining figures
+    from both experiments into the paper doesn't mean hunting through
+    a flat folder of mixed formats."""
+    png_dir = out_dir / "png"
+    png_dir.mkdir(parents=True, exist_ok=True)
+    png_path = png_dir / f"{stem}.png"
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    print(f"  -> {png_path}")
+    if also_pdf:
+        pdf_dir = out_dir / "pdf"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = pdf_dir / f"{stem}.pdf"
+        fig.savefig(pdf_path, bbox_inches="tight")
+        print(f"  -> {pdf_path}")
+
+
+# ── IO helpers ────────────────────────────────────────────────────────────────
+
+def load_log(path: Path) -> pd.DataFrame:
+    rows = []
+    with open(path, _MODE) as f:
+        for raw in f:
+            try:
+                rows.append(_parse(raw))
+            except Exception:
+                pass
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if "ts_ns" in df.columns:
+        df["ts_ns"] = pd.to_numeric(df["ts_ns"], errors="coerce")
+        df = df.dropna(subset=["ts_ns"]).sort_values("ts_ns").reset_index(drop=True)
+    return df
+
+
+def extract_ndts(folder_name: str) -> Optional[int]:
+    m = re.search(r"1to(\d+)$", folder_name)
+    return int(m.group(1)) if m else None
+
+
+# ── Resource metrics (from resources.log, optional) ─────────────────────────
+
+def compute_resource_metrics(res_path: Path) -> dict:
+    """
+    Parse resources.log and return peak CPU per component.
+    Uses max (peak during injection) instead of mean to capture
+    the actual resource pressure at the busiest moment.
+    """
+    nan = float("nan")
+    result = {
+        "CPU_dtm_core_peak_m":    nan,
+        "CPU_dtm_agent_peak_m":   nan,
+        "CPU_ndt_mininet_peak_m": nan,
+        "RAM_dtm_core_peak_mi":   nan,
+    }
+
+    if not res_path.exists():
+        return result
+
+    df = load_log(res_path)
+    if df.empty or "pod" not in df.columns:
+        return result
+
+    df["cpu_m"]  = pd.to_numeric(df.get("cpu_m",  0), errors="coerce").fillna(0)
+    df["mem_mi"] = pd.to_numeric(df.get("mem_mi", 0), errors="coerce").fillna(0)
+    has_container = "container" in df.columns
+
+    # DTM core peak
+    if has_container:
+        dtm_rows = df[(df["pod"] == "pod-dtm") & (df["container"] == "dtm")]
+    else:
+        dtm_rows = df[df["pod"] == "pod-dtm"]
+    if not dtm_rows.empty:
+        result["CPU_dtm_core_peak_m"]  = round(float(dtm_rows["cpu_m"].max()),  2)
+        result["RAM_dtm_core_peak_mi"] = round(float(dtm_rows["mem_mi"].max()), 2)
+
+    ndt_mask = df["pod"].str.match(r"ndt-\d+", na=False)
+
+    # DTM agents peak (sum per timestamp, then max over time)
+    if has_container:
+        agent_rows = df[ndt_mask & (df["container"] == "dtm-agent")]
+        ndt_rows   = df[ndt_mask & (df["container"] == "ndt")]
+    else:
+        agent_rows = df[ndt_mask]
+        ndt_rows   = pd.DataFrame()
+
+    if not agent_rows.empty:
+        result["CPU_dtm_agent_peak_m"] = round(
+            float(agent_rows.groupby("ts_ns")["cpu_m"].sum().max()), 2)
+
+    if not ndt_rows.empty:
+        result["CPU_ndt_mininet_peak_m"] = round(
+            float(ndt_rows.groupby("ts_ns")["cpu_m"].sum().max()), 2)
+
+    return result
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+def compute_metrics(dtm_path: Path, n_ndts: int, res_path: Optional[Path] = None) -> Optional[dict]:
+    dtm = load_log(dtm_path)
+    if dtm.empty or "tag" not in dtm.columns:
+        return None
+
+    # ── L_dispatch ────────────────────────────────────────────────────────────
+    disp = dtm[dtm["tag"] == "NDT_EVENT_DISPATCHED"].copy()
+    l_dispatch_mean = l_dispatch_p95 = float("nan")
+    if not disp.empty and {"t_dispatch_start_ns", "t_dispatch_end_ns"}.issubset(disp.columns):
+        d_ns = (
+            pd.to_numeric(disp["t_dispatch_end_ns"],   errors="coerce") -
+            pd.to_numeric(disp["t_dispatch_start_ns"], errors="coerce")
+        ).dropna() / 1e6
+        if not d_ns.empty:
+            l_dispatch_mean = float(d_ns.mean())
+            l_dispatch_p95  = float(d_ns.quantile(0.95))
+
+    # ── T_conv ────────────────────────────────────────────────────────────────
+    acks = dtm[dtm["tag"] == "DTM_ACK_RX"].copy()
+    t_conv_mean = t_conv_p95 = float("nan")
+    if n_ndts == 1:
+        t_conv_mean = 0.0
+        t_conv_p95  = 0.0
+    elif n_ndts >= 2 and not acks.empty and \
+            {"event_id", "t_rx_ns"}.issubset(acks.columns):
+        acks_t = acks[["event_id", "t_rx_ns"]].copy()
+        acks_t["event_id"] = acks_t["event_id"].astype(str)
+        acks_t["t_rx_ns"]  = pd.to_numeric(acks_t["t_rx_ns"], errors="coerce")
+        acks_t = acks_t.dropna(subset=["t_rx_ns"])
+        spread = acks_t.groupby("event_id")["t_rx_ns"].agg(
+            lambda x: (x.max() - x.min()) / 1e6 if len(x) >= 2 else float("nan")
+        ).dropna()
+        if not spread.empty:
+            t_conv_mean = float(spread.mean())
+            t_conv_p95  = float(spread.quantile(0.95))
+
+    # ── F_sync ────────────────────────────────────────────────────────────────
+    f_sync = float("nan")
+    if not acks.empty and "ok" in acks.columns:
+        ok_vals = acks["ok"].astype(bool)
+        f_sync  = float(ok_vals.sum() / len(ok_vals) * 100.0)
+
+    # ── apply_ms — per-NDT event application time ─────────────────────────────
+    # apply_ms in each DTM_ACK_RX is the time the NDT took to apply the event.
+    # Mean across all ACKs gives the average per-NDT overhead under load.
+    apply_ms_mean = apply_ms_p95 = float("nan")
+    if not acks.empty and "apply_ms" in acks.columns:
+        apply_vals = pd.to_numeric(acks["apply_ms"], errors="coerce").dropna()
+        if not apply_vals.empty:
+            apply_ms_mean = float(apply_vals.mean())
+            apply_ms_p95  = float(apply_vals.quantile(0.95))
+
+    res = compute_resource_metrics(res_path) if res_path else {
+        "CPU_dtm_core_peak_m":    float("nan"),
+        "CPU_dtm_agent_peak_m":   float("nan"),
+        "CPU_ndt_mininet_peak_m": float("nan"),
+        "RAM_dtm_core_peak_mi":   float("nan"),
+    }
+
+    return {
+        "NDTs":               n_ndts,
+        "L_dispatch_mean_ms": round(l_dispatch_mean, 3),
+        "L_dispatch_p95_ms":  round(l_dispatch_p95,  3),
+        "T_conv_mean_ms":     round(t_conv_mean,      3),
+        "T_conv_p95_ms":      round(t_conv_p95,       3),
+        "F_sync_pct":         round(f_sync,           2),
+        "apply_ms_mean":      round(apply_ms_mean,    3),
+        "apply_ms_p95":       round(apply_ms_p95,     3),
+        **res,
+    }
+
+
+# ── Load all runs ─────────────────────────────────────────────────────────────
+
+def load_all_runs(logs_path: Path) -> pd.DataFrame:
+    run_dirs = sorted([
+        d for d in logs_path.iterdir()
+        if d.is_dir() and d.name.startswith("run")
+    ])
+    if not run_dirs:
+        run_dirs = [logs_path]
+
+    frames = []
+    for run_dir in run_dirs:
+        exp_dirs = sorted(
+            [d for d in run_dir.iterdir()
+             if d.is_dir() and extract_ndts(d.name) is not None],
+            key=lambda d: extract_ndts(d.name),
+        )
+        for exp_dir in exp_dirs:
+            n        = extract_ndts(exp_dir.name)
+            dtm_path = exp_dir / "dtm.log"
+            if not dtm_path.exists():
+                print(f"  [SKIP] {exp_dir}: no dtm.log")
+                continue
+            res_path = exp_dir / "resources.log"
+            m = compute_metrics(dtm_path, n, res_path if res_path.exists() else None)
+            if m is None:
+                print(f"  [SKIP] {exp_dir}: empty or unparseable dtm.log")
+                continue
+            m["run"] = run_dir.name
+            frames.append(m)
+            print(f"  {run_dir.name}/{exp_dir.name}: N={n} ok")
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.DataFrame(frames).sort_values(["NDTs", "run"]).reset_index(drop=True)
+
+
+# ── Aggregate with 95% CI ─────────────────────────────────────────────────────
+
+def aggregate(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    results = []
+    for ndts, group in df.groupby("NDTs"):
+        vals = group[col].replace(
+            [float("inf"), float("-inf")], float("nan")).dropna().values
+        n = len(vals)
+        if n == 0:
+            continue
+        mean = float(np.mean(vals))
+        if n == 1:
+            ci_low = ci_high = mean
+        else:
+            se      = stats.sem(vals)
+            t       = stats.t.ppf((1 + CI) / 2, df=n - 1)
+            ci_low  = mean - t * se
+            ci_high = mean + t * se
+        results.append({
+            "NDTs":    ndts,
+            "mean":    mean,
+            "ci_low":  ci_low,
+            "ci_high": ci_high,
+            "n_runs":  n,
+        })
+    if not results:
+        return pd.DataFrame()
+    return pd.DataFrame(results).sort_values("NDTs").reset_index(drop=True)
+
+
+# ── Plot helpers ──────────────────────────────────────────────────────────────
+
+def _plot_ci(ax, agg: pd.DataFrame, color: str, marker: str,
+             linestyle: str, label: str) -> None:
+    if agg.empty:
+        return
+    yerr = np.array([
+        agg["mean"].values - agg["ci_low"].values,
+        agg["ci_high"].values - agg["mean"].values,
+    ])
+    ax.errorbar(
+        agg["NDTs"], agg["mean"],
+        yerr=yerr,
+        color=color, marker=marker, linestyle=linestyle,
+        label=label, linewidth=1.5, markersize=5,
+        capsize=4, capthick=1.2, elinewidth=1.2,
+    )
+
+
+def _set_log2_xaxis(ax, ndts_list) -> None:
+    ax.set_xscale("log", base=2)
+    ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+    ax.xaxis.set_major_locator(matplotlib.ticker.FixedLocator(sorted(set(ndts_list))))
+
+
+# ── Plots ─────────────────────────────────────────────────────────────────────
+
+def plot_l_dispatch(df: pd.DataFrame, outdir: Path) -> None:
+    fig, ax = plt.subplots()
+    _plot_ci(ax, aggregate(df, "L_dispatch_mean_ms"), "#D55E00", "o", "-",  "Mean")
+    _plot_ci(ax, aggregate(df, "L_dispatch_p95_ms"),  "#CC79A7", "s", "--", "P95")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Dispatch latency $L_{dispatch}$ (ms)")
+    ax.set_title("DTM dispatch latency vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    _save(fig, outdir, "fig1_l_dispatch_vs_ndts")
+    plt.close(fig)
+
+
+def plot_t_conv(df: pd.DataFrame, outdir: Path) -> None:
+    fig, ax = plt.subplots()
+    _plot_ci(ax, aggregate(df, "T_conv_mean_ms"), "#0072B2", "o", "-",  "Mean")
+    _plot_ci(ax, aggregate(df, "T_conv_p95_ms"),  "#D55E00", "s", "--", "P95")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Convergence spread $T_{conv}$ (ms)")
+    ax.set_title("Convergence spread vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    _save(fig, outdir, "fig2_t_conv_vs_ndts")
+    plt.close(fig)
+
+
+def plot_f_sync(df: pd.DataFrame, outdir: Path) -> None:
+    fig, ax = plt.subplots()
+    _plot_ci(ax, aggregate(df, "F_sync_pct"), "#CC79A7", "o", "-", "$F_{sync}$")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Synchronization fidelity $F_{sync}$ (%)")
+    ax.set_title("Sync fidelity vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.set_ylim(0, 105)
+    ax.legend()
+    _save(fig, outdir, "fig3_f_sync_vs_ndts")
+    plt.close(fig)
+
+
+def plot_cpu_resources(df: pd.DataFrame, outdir: Path) -> None:
+    """Plot peak CPU usage per component vs N (only if resources.log was collected)."""
+    agg_core    = aggregate(df, "CPU_dtm_core_peak_m")
+    agg_agents  = aggregate(df, "CPU_dtm_agent_peak_m")
+    agg_mininet = aggregate(df, "CPU_ndt_mininet_peak_m")
+    if agg_core.empty and agg_agents.empty:
+        return
+    fig, ax = plt.subplots()
+    _plot_ci(ax, agg_core,    "#D55E00", "o", "-",   "DTM core (peak)")
+    _plot_ci(ax, agg_agents,  "#CC79A7", "s", "--",  "DTM agents total (peak)")
+    _plot_ci(ax, agg_mininet, "#0072B2", "^", "-.",  "Mininet total (peak)")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Peak CPU usage (millicores)")
+    ax.set_title("Peak CPU usage vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    _save(fig, outdir, "fig5_cpu_peak_vs_ndts")
+    plt.close(fig)
+
+
+def plot_ram_resources(df: pd.DataFrame, outdir: Path) -> None:
+    """Plot peak RAM usage per component vs N (only if resources.log was collected)."""
+    agg_core = aggregate(df, "RAM_dtm_core_peak_mi")
+    if agg_core.empty or agg_core["mean"].isna().all():
+        return
+    fig, ax = plt.subplots()
+    _plot_ci(ax, agg_core, "#D55E00", "o", "-", "DTM core (peak)")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Peak RAM usage (MiB)")
+    ax.set_title("DTM core peak RAM usage vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    _save(fig, outdir, "fig6_ram_peak_vs_ndts")
+    plt.close(fig)
+
+
+def plot_apply_ms(df: pd.DataFrame, outdir: Path) -> None:
+    fig, ax = plt.subplots()
+    _plot_ci(ax, aggregate(df, "apply_ms_mean"), "#0072B2", "o", "-",  "Mean")
+    _plot_ci(ax, aggregate(df, "apply_ms_p95"),  "#D55E00", "s", "--", "P95")
+    ax.set_xlabel("Number of NDTs (N)")
+    ax.set_ylabel("Per-NDT apply time (ms)")
+    ax.set_title("Per-NDT event application time vs federation size (95% CI)")
+    _set_log2_xaxis(ax, df["NDTs"].unique())
+    ax.legend()
+    _save(fig, outdir, "fig4_apply_ms_vs_ndts")
+    plt.close(fig)
+
+
+# ── Console summary ───────────────────────────────────────────────────────────
+
+def print_summary(df: pd.DataFrame) -> None:
+    cols = [
+        ("L_dispatch_mean_ms",    "L_disp (ms)"),
+        ("T_conv_mean_ms",        "T_conv (ms)"),
+        ("F_sync_pct",            "F_sync (%)"),
+        ("apply_ms_mean",         "apply_ms (ms)"),
+        ("CPU_dtm_core_peak_m",   "CPU_dtm (m)"),
+        ("CPU_dtm_agent_peak_m",  "CPU_agents (m)"),
+        ("CPU_ndt_mininet_peak_m","CPU_mininet (m)"),
+    ]
+    rows = []
+    for ndts, group in df.groupby("NDTs"):
+        row = {"NDTs": ndts, "runs": len(group)}
+        for col, label in cols:
+            vals = group[col].replace(
+                [float("inf"), float("-inf")], float("nan")).dropna().values
+            if len(vals) == 0:
+                row[label] = "—"
+            elif len(vals) == 1:
+                row[label] = f"{vals[0]:.3f}"
+            else:
+                mean = np.mean(vals)
+                se   = stats.sem(vals)
+                t    = stats.t.ppf((1 + CI) / 2, df=len(vals) - 1)
+                row[label] = f"{mean:.3f} ±{t * se:.3f}"
+        rows.append(row)
+
+    if rows:
+        print("\n" + "=" * 75)
+        print(" EXPERIMENT 1 — SYNCHRONIZATION METRICS (mean ± 95% CI)")
+        print("=" * 75)
+        print(tabulate(pd.DataFrame(rows), headers="keys",
+                       tablefmt="psql", showindex=False))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Experiment 1 — sync latency analyser"
+    )
+    ap.add_argument("--logs", required=True,
+                    help="Root folder with run1/, run2/... containing 1toN/ subfolders")
+    ap.add_argument("--out",  required=True,
+                    help="Output folder for PDFs and CSVs")
+    args = ap.parse_args()
+
+    logs_path = Path(args.logs)
+    out_path  = Path(args.out)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nLoading logs from: {logs_path}")
+    df = load_all_runs(logs_path)
+
+    if df.empty:
+        print("\n[ERROR] No valid data found. Check folder structure:")
+        print("  exp1/run1/1to8/dtm.log")
+        return
+
+    print(f"\nLoaded {len(df)} experiments across {df['run'].nunique()} run(s)")
+    print_summary(df)
+
+    # CSV — raw per-run data
+    df.to_csv(out_path / "exp1_metrics_runs.csv", index=False)
+    print(f"\n  -> exp1_metrics_runs.csv")
+
+    # CSV — aggregated mean + CI
+    all_cols = [
+        "L_dispatch_mean_ms", "L_dispatch_p95_ms",
+        "T_conv_mean_ms",     "T_conv_p95_ms",
+        "F_sync_pct",
+        "apply_ms_mean",      "apply_ms_p95",
+        "CPU_dtm_core_peak_m",
+        "CPU_dtm_agent_peak_m",
+        "CPU_ndt_mininet_peak_m",
+        "RAM_dtm_core_peak_mi",
+    ]
+    agg_rows = []
+    for ndts, group in df.groupby("NDTs"):
+        row = {"NDTs": ndts, "n_runs": len(group)}
+        for col in all_cols:
+            vals = group[col].replace(
+                [float("inf"), float("-inf")], float("nan")).dropna().values
+            mean = float(np.mean(vals)) if len(vals) > 0 else float("nan")
+            ci   = 0.0
+            if len(vals) > 1:
+                se = stats.sem(vals)
+                t  = stats.t.ppf((1 + CI) / 2, df=len(vals) - 1)
+                ci = float(t * se)
+            row[f"{col}_mean"] = round(mean, 3)
+            row[f"{col}_ci"]   = round(ci,   3)
+        agg_rows.append(row)
+
+    pd.DataFrame(agg_rows).to_csv(
+        out_path / "exp1_metrics_aggregated.csv", index=False)
+    print(f"  -> exp1_metrics_aggregated.csv")
+
+    # Plots
+    print("\nGenerating plots...")
+    plot_l_dispatch(df, out_path)
+    plot_t_conv(df, out_path)
+    plot_f_sync(df, out_path)
+    plot_apply_ms(df, out_path)
+    plot_cpu_resources(df, out_path)
+    plot_ram_resources(df, out_path)
+
+    print(f"\nDone. Results in: {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
