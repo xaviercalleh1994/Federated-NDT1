@@ -200,10 +200,11 @@ pod-xrm   1/1     Running   0          2m5s
 
 # Check the containers of NDT PODs:
 ```bash
-kubectl get pod ndt-1 -n ndt -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
+kubectl get pod ndt-1 -n ndt -o   \
+jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
 ```
 ```bash
-ndt	      ndt-mininet:1.0
+ndt	        ndt-mininet:1.0
 dtm-agent	dtm:1.0
 xrm-agent	xrm:1.0
 ```
