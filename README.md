@@ -181,6 +181,34 @@ ndt	        ndt-mininet:1.0   -> NDT running with mininet
 dtm-agent	dtm:1.0           -> DTM distributed agent
 ```
 
+# List of PODs:
+```bash
+kubectl get pods -n ndt
+```
+
+```bash
+NAME      READY   STATUS    RESTARTS   AGE
+ndt-1     3/3     Running   0          2m3s
+ndt-2     3/3     Running   0          119s
+ndt-3     3/3     Running   0          115s
+ndt-4     3/3     Running   0          111s
+pod-dtm   1/1     Running   0          2m7s
+pod-on    1/1     Running   0          2m9s
+pod-onm   1/1     Running   0          2m7s
+pod-xrm   1/1     Running   0          2m5s
+```
+
+# Check the containers of NDT PODs:
+```bash
+kubectl get pod ndt-1 -n ndt -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
+```
+```bash
+ndt	      ndt-mininet:1.0
+dtm-agent	dtm:1.0
+xrm-agent	xrm:1.0
+```
+
+
 To start the experiment, you need to run the ONM:
 ```bash
 kubectl exec -it pod-onm -n ndt -- python3 onm.py \
