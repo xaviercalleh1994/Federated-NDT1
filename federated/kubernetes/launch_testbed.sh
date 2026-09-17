@@ -3,6 +3,11 @@
 # Copyright (C) 2026 Xavier Calle-Heredia, Xavier Hesselbach
 # Universitat Politècnica de Catalunya (UPC)
 #
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
 # ============================================================
 # launch_testbed.sh — Federated NDT Testbed (Kubernetes)
 #
@@ -10,20 +15,39 @@
 #
 # Mode 1:1:
 #   pod-on-onm  : ON (Mininet) + ONM
-#   pod-dtm-ndt : NDT (Mininet) + DTM agent
+#   pod-dtm-ndt : NDT (Mininet) + DTM
+#                 + XRM (if --xrm)
 #
 # Mode federated:
 #   pod-on      : ON (Mininet)
 #   pod-onm     : ONM
-#   pod-dtm     : DTM core
-#   exp1-ndt-i  : NDT (Mininet) + DTM agent  (x N)
+#   pod-dtm     : DTM core  (hostNetwork, dtm-state hostPath mounted)
+#   ndt-i       : NDT (Mininet) + DTM agent
+#                 + XRM agent (if --xrm)
+#   pod-xrm     : XRM core (if --xrm)
+#   watch_restarts.sh : daemon on host watching for DTM restart signals
+#
+# Changes vs v1.6:
+#   - NODE_IP obtained generically from first cluster node.
+#   - pod-dtm mounts dtm-state hostPath so DTM can persist NDT state.
+#   - watch_restarts.sh started as background daemon — detects restart
+#     signal files written by DTM and calls restart_ndt.sh.
+#   - --xrm flag enables XRM containers (v2.0).
+#   - All other logic identical to v1.6.
 #
 # Usage:
-#   ./launch_testbed.sh --mode 1:1
-#   ./launch_testbed.sh --mode federated --fanout N
-#   ./launch_testbed.sh --mode federated --fanout N \
-#                       --base-port 30001 --proto udp --ack-port 9000 \
-#                       --dtm-log /run/dtm.log
+#   v1.6 — no XRM:
+#     ./launch_testbed.sh --mode 1:1
+#     ./launch_testbed.sh --mode federated --fanout N
+#
+#   v2.0 — with XRM:
+#     ./launch_testbed.sh --mode federated --fanout N --xrm
+#
+#   Full options:
+#     ./launch_testbed.sh --mode federated --fanout N \
+#                         --base-port 30001 --proto udp \
+#                         --ack-port 9000 --dtm-log /run/dtm.log \
+#                         [--xrm]
 # ============================================================
 
 set -euo pipefail
@@ -35,6 +59,10 @@ BASE_PORT=30001
 PROTO="udp"
 ACK_PORT=9000
 DTM_LOG="/dev/stderr"
+XRM=0
+UPSTREAM=0       # --upstream: start ONM upstream server + DTM upstream
+UPSTREAM_MAX_QUEUE=0    # --max-queue N: DTM upstream AdmissionQueue size (0=unlimited)
+UPSTREAM_FIFO=0         # --disable-priorities: DTM upstream FIFO mode
 
 # ── Parse arguments ──────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -45,6 +73,10 @@ while [[ $# -gt 0 ]]; do
         --proto)      PROTO="$2";     shift 2 ;;
         --ack-port)   ACK_PORT="$2";  shift 2 ;;
         --dtm-log)    DTM_LOG="$2";   shift 2 ;;
+        --xrm)                XRM=1;                  shift   ;;
+        --upstream)           UPSTREAM=1;             shift   ;;
+        --max-queue)          UPSTREAM_MAX_QUEUE="$2"; shift 2 ;;
+        --disable-priorities) UPSTREAM_FIFO=1;         shift   ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -53,6 +85,7 @@ if [ -z "${MODE}" ]; then
     echo "Usage: ./launch_testbed.sh --mode 1:1|federated [--fanout N]"
     echo "                           [--base-port PORT] [--proto udp|tcp]"
     echo "                           [--ack-port PORT] [--dtm-log PATH]"
+    echo "                           [--xrm]"
     exit 1
 fi
 
@@ -63,28 +96,42 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+NDT_SCRIPTS="${REPO_ROOT}/ndt_deployment/mininet_ndts"
 NAMESPACE="ndt"
-NODE_IP=$(kubectl get node xcalle \
-    -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' \
+
+# Generic node IP — works on any cluster regardless of node name
+NODE_IP=$(kubectl get nodes \
+    -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' \
     2>/dev/null || hostname -I | awk '{print $1}')
 
 echo "=============================================="
 echo " Federated NDT Testbed — Kubernetes"
+
+# ── Ensure state directories exist with correct permissions ──
+# Pods run as root and write to these hostPath volumes.
+# Pre-create them as the current user to avoid permission errors.
+sudo mkdir -p /tmp/dtm-state /tmp/xrm-state /tmp/ndt-run
+sudo chmod -R 777 /tmp/dtm-state /tmp/xrm-state /tmp/ndt-run
 echo "   Mode     : ${MODE}"
 echo "   Node IP  : ${NODE_IP}"
 [ "${MODE}" = "federated" ] && \
     echo "   NDTs     : ${FANOUT} (ports ${BASE_PORT}–$(( BASE_PORT + FANOUT - 1 )))"
 echo "   Protocol : ${PROTO}"
 echo "   DTM log  : ${DTM_LOG}"
+echo "   XRM      : $([ "${XRM}" = "1" ] && echo "enabled (v2.0)" || echo "disabled (v1.6)")"
 echo "=============================================="
 echo ""
 
 # ── Check images ─────────────────────────────────────────────
 echo "Checking images..."
-for img in dtm:1.0 onm:1.0 on-mininet:1.0 ndt-mininet:1.0; do
+REQUIRED_IMAGES="dtm:1.0 onm:1.0 on-mininet:1.0 ndt-mininet:1.0"
+[ "${XRM}" = "1" ] && REQUIRED_IMAGES="${REQUIRED_IMAGES} xrm:1.0"
+
+for img in ${REQUIRED_IMAGES}; do
     name="${img%:*}"
     tag="${img#*:}"
-    if ! sudo crictl images 2>/dev/null | grep -E "${name}[[:space:]].*${tag}|${name}:${tag}" | grep -q .; then
+    if ! sudo crictl images 2>/dev/null | \
+       grep -E "${name}[[:space:]].*${tag}|${name}:${tag}" | grep -q .; then
         echo "ERROR: image '${img}' not found in containerd."
         echo "Build and import it first:"
         echo "  docker build -t ${img} <path>"
@@ -107,8 +154,8 @@ kubectl create configmap on-ndt-script \
     --namespace="${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-# Reset topology to default before launch
-sudo mkdir -p /tmp/ndt-run && sudo cp "${REPO_ROOT}/topology.json" /tmp/ndt-run/topology_config.json
+sudo mkdir -p /tmp/ndt-run
+sudo cp "${REPO_ROOT}/topology.json" /tmp/ndt-run/topology_config.json
 
 kubectl create configmap topology-config \
     --from-file=topology.json="${REPO_ROOT}/topology.json" \
@@ -149,18 +196,85 @@ ON_POD_IP=$(kubectl get pod pod-on -n "${NAMESPACE}" \
     -o jsonpath='{.status.podIP}' 2>/dev/null || echo "127.0.0.1")
 echo "  ON Pod IP: ${ON_POD_IP}"
 
-kubectl apply -f "${SCRIPT_DIR}/onm-pod.yaml"
-echo "  ONM ready."
+# pod-onm — if --upstream: starts ONM directly with --upstream-server
+#            otherwise: sleep infinity (operator launches ONM manually)
+if [ "${UPSTREAM}" = "1" ]; then
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-onm
+  namespace: ${NAMESPACE}
+  labels:
+    app: onm
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  volumes:
+    - name: run-data
+      hostPath:
+        path: /tmp/ndt-run
+        type: DirectoryOrCreate
+    - name: logs
+      emptyDir: {}
+  containers:
+    - name: onm
+      image: onm:1.0
+      imagePullPolicy: Never
+      stdin: true
+      command: ["python3", "/app/onm.py"]
+      tty: true
+      args:
+        - "--proto"
+        - "${PROTO}"
+        - "--relay-ip"
+        - "127.0.0.1"
+        - "--relay-port"
+        - "7001"
+        - "--relay-kind"
+        - "router"
+        - "--on-ip"
+        - "${ON_POD_IP}"
+        - "--upstream-server"
+        - "--dtm-upstream-ip"
+        - "127.0.0.1"
+        - "--log-file"
+        - "/tmp/onm.log"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: logs
+          mountPath: /app/logs
+EOF
 
-# ── DTM + NDT(s) ─────────────────────────────────────────────
-echo "[4/4] Launching DTM..."
+# Wait for ONM upstream to be ready
+echo "  Waiting for ONM upstream..."
+for i in $(seq 1 30); do
+    if kubectl exec pod-onm -n "${NAMESPACE}" -- \
+        grep -q "ONM-UPSTREAM.*Ready" /tmp/onm.log 2>/dev/null; then
+        echo "  ONM ready (${i}s)"
+        break
+    fi
+    sleep 1
+done
+else
+    # Original behavior — sleep infinity, operator launches ONM manually
+    kubectl apply -f "${SCRIPT_DIR}/onm-pod.yaml"
+    echo "  ONM ready."
+fi
+
+# ── DTM + NDT(s) + XRM ───────────────────────────────────────
+echo "[4/4] Launching DTM$([ "${XRM}" = "1" ] && echo " + XRM" || echo "")..."
 
 if [ "${MODE}" = "1:1" ]; then
+
+    [ "${XRM}" = "1" ] && mkdir -p /tmp/xrm-state/ndt-0
 
     kubectl delete pod pod-dtm-ndt -n "${NAMESPACE}" \
         --ignore-not-found --grace-period=0 --force > /dev/null 2>&1 || true
     kubectl delete service svc-dtm -n "${NAMESPACE}" \
         --ignore-not-found > /dev/null 2>&1 || true
+
     kubectl apply -f "${SCRIPT_DIR}/dtm-ndt-pod.yaml"
 
     echo "  Waiting for NDT Mininet..."
@@ -174,20 +288,23 @@ if [ "${MODE}" = "1:1" ]; then
             || echo "Unknown")
         if [ "${PHASE}" = "Failed" ]; then
             echo "  ERROR: pod-dtm-ndt failed."
-            echo "  Logs: kubectl logs pod-dtm-ndt -n ${NAMESPACE} -c ndt"
             exit 1
         fi
         [ "${elapsed}" -ge 120 ] && echo "  TIMEOUT" && exit 1
     done
-    echo "  DTM + NDT ready (${elapsed}s)"
+    echo "  DTM + NDT$([ "${XRM}" = "1" ] && echo " + XRM") ready (${elapsed}s)"
 
 else
 
-    kubectl delete pod pod-dtm -n "${NAMESPACE}" \
+    kubectl delete pod pod-dtm pod-xrm -n "${NAMESPACE}" \
         --ignore-not-found --grace-period=0 --force > /dev/null 2>&1 || true
     kubectl delete service svc-dtm -n "${NAMESPACE}" \
         --ignore-not-found > /dev/null 2>&1 || true
 
+    # Ensure dtm-state base directory exists on host
+    mkdir -p /tmp/dtm-state
+
+    # pod-dtm — mounts dtm-state hostPath so DTM can persist NDT state
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Pod
@@ -204,6 +321,10 @@ spec:
     - name: run-data
       hostPath:
         path: /tmp/ndt-run
+        type: DirectoryOrCreate
+    - name: dtm-state
+      hostPath:
+        path: /tmp/dtm-state
         type: DirectoryOrCreate
   containers:
     - name: dtm
@@ -235,19 +356,118 @@ spec:
       volumeMounts:
         - name: run-data
           mountPath: /run
+        - name: dtm-state
+          mountPath: /tmp/dtm-state
 EOF
 
     echo "  DTM core launched."
+
+    # Start DTM upstream — only if --upstream flag is set
+    # Runs as background process via kubectl exec with setsid to survive session
+    # Waits for pod-dtm to be Running first
+    echo "  Waiting for pod-dtm Running..."
+    for i in $(seq 1 30); do
+        phase=$(kubectl get pod pod-dtm -n "${NAMESPACE}" \
+            --no-headers -o custom-columns=":status.phase" 2>/dev/null || echo "")
+        [ "${phase}" = "Running" ] && break
+        sleep 1
+    done
+    if [ "${UPSTREAM}" = "1" ]; then
+        # Build optional args for DTM upstream
+        DTM_UPSTREAM_EXTRA=""
+        [ "${UPSTREAM_MAX_QUEUE}" -gt 0 ] &&             DTM_UPSTREAM_EXTRA="${DTM_UPSTREAM_EXTRA} --max-queue ${UPSTREAM_MAX_QUEUE}"
+        [ "${UPSTREAM_FIFO}" = "1" ] &&             DTM_UPSTREAM_EXTRA="${DTM_UPSTREAM_EXTRA} --disable-priorities"
+        echo "  DTM upstream args: queue=${UPSTREAM_MAX_QUEUE} fifo=${UPSTREAM_FIFO}"
+        kubectl exec pod-dtm -n "${NAMESPACE}" -- bash -c \
+            "setsid python3 /app/dtm.py \
+                --proto udp \
+                --relay-ip 0.0.0.0 \
+                --mode upstream \
+                --onm-ip 127.0.0.1 \
+                --log-file /tmp/dtm_upstream.log \
+                ${DTM_UPSTREAM_EXTRA} \
+                </dev/null >/tmp/dtm_upstream_stderr.log 2>&1 &
+             echo \$! > /tmp/dtm_upstream.pid" 2>/dev/null || true
+        # Wait for DTM upstream to be ready
+        echo "  Waiting for DTM upstream..."
+        for i in $(seq 1 20); do
+            if kubectl exec pod-dtm -n "${NAMESPACE}" -- \
+                grep -q "DTM-UPSTREAM.*Ready" /tmp/dtm_upstream_stderr.log 2>/dev/null; then
+                echo "  DTM upstream ready (${i}s)"
+                break
+            fi
+            sleep 1
+        done
+    fi
+
+    # pod-xrm — only if --xrm
+    # stdin + tty keep the pod alive and allow kubectl exec -it to attach
+    if [ "${XRM}" = "1" ]; then
+        kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-xrm
+  namespace: ${NAMESPACE}
+  labels:
+    app: xrm
+    mode: core
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  volumes:
+    - name: xrm-state
+      hostPath:
+        path: /tmp/xrm-state
+        type: DirectoryOrCreate
+  containers:
+    - name: xrm
+      image: xrm:1.0
+      imagePullPolicy: Never
+      stdin: true
+      tty: true
+      args:
+        - "--mode"
+        - "core"
+        - "--log-file"
+        - "/tmp/xrm_core.log"
+        - "--dtm-relay-ip"
+        - "${NODE_IP}"
+      volumeMounts:
+        - name: xrm-state
+          mountPath: /tmp/xrm-state
+EOF
+        echo "  XRM core launched."
+    fi
+
     echo ""
     echo "  Launching ${FANOUT} NDT pods..."
-    "${REPO_ROOT}/ndt_deployment/mininet_ndts/launch_ndts.sh" \
+    XRM="${XRM}" \
+    XRM_CORE_IP="${NODE_IP}" \
+    UPSTREAM="${UPSTREAM}" \
+    DTM_IP="${NODE_IP}" \
+    "${NDT_SCRIPTS}/launch_ndts.sh" \
         "${FANOUT}" "${NODE_IP}" "${BASE_PORT}" "${PROTO}" "${ACK_PORT}"
+
+    # Start watch_restarts.sh daemon on host
+    # Watches for DTM restart signals and calls restart_ndt.sh
+    WATCH_PID_FILE="/tmp/watch_restarts.pid"
+    if [ -f "${WATCH_PID_FILE}" ]; then
+        OLD_PID=$(cat "${WATCH_PID_FILE}")
+        kill "${OLD_PID}" 2>/dev/null || true
+        rm -f "${WATCH_PID_FILE}"
+    fi
+    XRM="${XRM}" XRM_CORE_IP="${NODE_IP}" \
+    bash "${NDT_SCRIPTS}/watch_restarts.sh" \
+        "${NODE_IP}" "${BASE_PORT}" "${PROTO}" "${ACK_PORT}" \
+        > /tmp/watch_restarts.log 2>&1 &
+    echo "  watch_restarts.sh started (PID=$!)"
 fi
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "=============================================="
-echo " Testbed ready — mode=${MODE}"
+echo " Testbed ready — mode=${MODE}$([ "${XRM}" = "1" ] && echo " + XRM (v2.0)" || echo " (v1.6)")"
 echo "=============================================="
 kubectl get pods -n "${NAMESPACE}" -o wide
 echo ""
@@ -260,19 +480,15 @@ echo "      --relay-port 7001 --relay-kind router \\"
 echo "      --on-ip ${ON_POD_IP} \\"
 echo "      --log-file /tmp/onm.log"
 echo ""
-echo "ONM automated injection:"
-echo "  kubectl exec -i pod-onm -n ${NAMESPACE} -- bash -c \\"
-echo "      'python3 /app/on_events_gen.py --file /app/onm_commands.txt --rate 0.5 --duration 60 | \\"
-echo "       python3 /app/onm.py --proto ${PROTO} --relay-ip 127.0.0.1 \\"
-echo "       --relay-port 7001 --relay-kind router --on-ip ${ON_POD_IP} --log-file /tmp/onm.log'"
-echo ""
 echo "Access ON Mininet:"
 echo "  kubectl exec -it pod-on -n ${NAMESPACE} -- bash"
 echo ""
-if [ "${MODE}" = "1:1" ]; then
-    echo "Access NDT Mininet:"
-    echo "  kubectl exec -it pod-dtm-ndt -n ${NAMESPACE} -c ndt -- bash"
+if [ "${XRM}" = "1" ]; then
+    echo "XRM CLI:"
+    echo "  kubectl exec -it pod-xrm -n ${NAMESPACE} -- python3 xrm.py --mode cli"
     echo ""
 fi
+echo "watch_restarts log: tail -f /tmp/watch_restarts.log"
+echo ""
 echo "Stop testbed:"
 echo "  ./stop_testbed.sh"

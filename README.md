@@ -10,16 +10,21 @@ Currently, the framework is provided with two operational configurations:
 
     - The ONM oversees the ON and receives events intended to modify the topology of the ON. Then, forwards the event towards the DTM.
     - The DTM is the main entity of the system and is in charge of the synchronization of the NDTs. The DTM is decompossed in two agents: the DTM Core is a centralized agent that receives and distribute ON events. While the DTM distributed agents are in charge of implementing each ON event into the NDT.
-    ![Framework_architecture_fed](Images/PoC_fed_arch.png)
+    ![Framework_architecture_fed](Images/PoC_fed_XR.drawio.png)
 - A conventional mode (1:1): this is the currently analyzed configuration in the literature and considers a sinlge NDT instance derived from an ON. This mode will be further analyzed for the inclusion of Extended Reality (XR) services.
 ![Framework_architecture_fed_11](Images/PoC_11_arch.png)
 
 ## Framework Components
 The framework relies in a Kubernetes architecture to support the deployment of each component. Therefore, main components deployed as K8s pods are:
 - ONM 
-- DTM (core)
 - ON
-- NDTs (includes two containers: the NDT and the DTM distributed agent)
+- DTM-core
+- XRM-core
+- NDT-i:
+  - NDT mininet
+  - DTM-agent
+  - XRM-agent (optional)
+  - Generic XR Services (optional)
 
 The ON as well as the NDTs are created from [topology](federated/topology.json) json file. The current topology is shown next:
 
