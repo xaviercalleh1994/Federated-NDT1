@@ -606,10 +606,26 @@ def run_upstream(args: argparse.Namespace) -> None:
     gc.disable()
 
     registry = XrmAgentRegistry()
+
+    # ── NEW (2026-08-26) — bounded-but-admitted third state ──
+    # --tenant-bounds is a JSON dict mapping ndt_id -> max pending
+    # requests for that tenant, e.g. '{"2": 8}'. Tenants not listed
+    # keep today's always-admitted, unbounded-backlog behavior.
+    # ─────────────────────────────────────────────────────────────
+    tenant_bounds: Dict[int, int] = {}
+    if getattr(args, "tenant_bounds", ""):
+        try:
+            tenant_bounds = {int(k): int(v) for k, v in
+                             _json.loads(args.tenant_bounds).items()}
+        except Exception as exc:
+            print(f"[DTM-UPSTREAM] WARNING: bad --tenant-bounds: {exc}",
+                  flush=True)
+
     aq = AdmissionQueue(
         max_queue          = args.max_queue,
         drop_prio_if_full  = args.drop_prio_if_full,
         disable_priorities = args.disable_priorities,
+        tenant_bounds       = tenant_bounds,   # NEW (2026-08-26)
     )
 
     # Receive XR service commands from xrm-agents
@@ -685,6 +701,7 @@ def run_upstream(args: argparse.Namespace) -> None:
                  "event_id": event_id, "ndt_id": ndt_id,
                  "t_create_ns": int(ev.get("t_create_ns", 0))},
                 pr, event_id, ev_type, "upstream",
+                ndt_id=ndt_id,  # NEW (2026-08-26) — enables per-tenant bound
             )
 
             if not admitted:
@@ -726,6 +743,7 @@ def run_upstream(args: argparse.Namespace) -> None:
                     log_event("DTM_UPSTREAM_FWD_ERR",
                               {"event_id": event_id, "err": str(exc)})
                     registry.clear_inflight(event_id)
+                    aq.mark_done(ndt_id)  # NEW (2026-08-26) — free tenant slot
                     _broadcast_state_update(
                         bc_sock, registry,
                         processed_event_id=event_id,
@@ -778,6 +796,7 @@ def run_upstream(args: argparse.Namespace) -> None:
                 })
 
                 registry.clear_inflight(event_id)
+                aq.mark_done(ndt_id)  # NEW (2026-08-26) — free tenant slot
 
                 # Get current queued event_ids for status assignment
                 # (non-destructive peek — see AdmissionQueue.peek_ids)
@@ -1064,7 +1083,8 @@ class AdmissionQueue:
     # entries share the same priority.
     # ─────────────────────────────────────────────────────────────
     def __init__(self, max_queue: int, drop_prio_if_full: int,
-                 disable_priorities: bool, no_queue: bool = False) -> None:
+                 disable_priorities: bool, no_queue: bool = False,
+                 tenant_bounds: Optional[Dict[int, int]] = None) -> None:
         self._max       = max_queue
         self._drop_prio = drop_prio_if_full
         self._fifo      = disable_priorities
@@ -1075,15 +1095,44 @@ class AdmissionQueue:
         self._cond       = threading.Condition(self._lock)
         self._qsize      = 0
         self._dispatch_busy = False
+        # ── NEW (2026-08-26) — bounded-but-admitted third admission state ──
+        # Until now, a tier was either bounded by `max_queue` (droppable)
+        # or fully exempt from any bound (always-admitted). An
+        # always-admitted tenant could therefore accumulate unbounded
+        # backlog under sustained contention: nothing ever told the DTM
+        # "this tenant already has enough pending work". `tenant_bounds`
+        # gives each tenant (by ndt_id) an optional cap on its own
+        # pending-request count, independent of `max_queue`. A tenant
+        # exceeding its own cap is rejected with reason
+        # "tenant_bound_exceeded" (surfaced today via the existing
+        # DISCARDED path) instead of being queued indefinitely. Tenants
+        # not present in `tenant_bounds` keep today's exact behavior.
+        # ─────────────────────────────────────────────────────────────
+        self._tenant_bounds: Dict[int, int] = tenant_bounds or {}
+        self._pending_by_tenant: Dict[int, int] = defaultdict(int)
 
     def set_busy(self, busy: bool) -> None:
         self._dispatch_busy = busy
 
     def push(self, item: dict, priority: int,
-             event_id: str, ev_type: str, src: str) -> bool:
+             event_id: str, ev_type: str, src: str,
+             ndt_id: Optional[int] = None) -> bool:
         drop_reason: Optional[str] = None
         with self._lock:
-            if self._no_queue:
+            # ── NEW (2026-08-26) — bounded-but-admitted third state ──
+            # Checked first and independently of `max_queue`/`no_queue`:
+            # a tenant with a configured bound that already has `bound`
+            # requests pending is rejected here, before it ever reaches
+            # the shared-queue admission logic below. When ndt_id is
+            # None or has no entry in self._tenant_bounds (the default
+            # for every existing caller — Experiment 1's FeedbackController
+            # never passes ndt_id), this check is skipped entirely and
+            # behavior is byte-for-byte identical to before this patch.
+            # ─────────────────────────────────────────────────────────
+            bound = self._tenant_bounds.get(ndt_id) if ndt_id is not None else None
+            if bound is not None and self._pending_by_tenant[ndt_id] >= bound:
+                drop_reason = "tenant_bound_exceeded"
+            elif self._no_queue:
                 if self._dispatch_busy or self._qsize > 0:
                     drop_reason = "no_queue_busy"
             elif self._max > 0 and self._qsize >= self._max:
@@ -1098,6 +1147,8 @@ class AdmissionQueue:
                 order_key = seq if self._fifo else priority
                 heapq.heappush(self._heap, (order_key, seq, item))
                 self._qsize += 1
+                if ndt_id is not None:
+                    self._pending_by_tenant[ndt_id] += 1  # NEW (2026-08-26)
                 self._cond.notify()
         if drop_reason is not None:
             log_event("DTM_DROP", {
@@ -1107,6 +1158,21 @@ class AdmissionQueue:
             })
             return False
         return True
+
+    # ── NEW (2026-08-26) — bounded-but-admitted third admission state ──
+    # Call once a request that was admitted through push() reaches a
+    # terminal outcome (ACK received, ACK timeout, or forward error), so
+    # its slot in the tenant's bound is freed for the next request. Never
+    # called for tenants with no configured bound (ndt_id is None or has
+    # no entry in self._tenant_bounds at push time), matching push()'s
+    # own no-op behavior for those tenants.
+    # ─────────────────────────────────────────────────────────────
+    def mark_done(self, ndt_id: Optional[int]) -> None:
+        if ndt_id is None:
+            return
+        with self._lock:
+            if self._pending_by_tenant.get(ndt_id, 0) > 0:
+                self._pending_by_tenant[ndt_id] -= 1
 
     def drain(self, max_items: int = 2000) -> List[dict]:
         with self._lock:
@@ -1493,6 +1559,12 @@ def main() -> None:
     ap.add_argument("--ack-port",    type=int, default=9000)
     ap.add_argument("--max-queue",   type=int, default=0)
     ap.add_argument("--drop-prio-if-full", type=int, default=60)
+    # ── NEW (2026-08-26) — bounded-but-admitted third admission state ──
+    ap.add_argument("--tenant-bounds", default="",
+                    help='[upstream] JSON dict ndt_id->max pending '
+                         'requests, e.g. \'{"2": 8}\'. Tenants not listed '
+                         'keep the current always-admitted, unbounded-'
+                         'backlog behavior.')
     ap.add_argument("--disable-priorities", action="store_true")
     ap.add_argument("--no-queue",    action="store_true")
     ap.add_argument("--max-rate",    type=float, default=0.0)
