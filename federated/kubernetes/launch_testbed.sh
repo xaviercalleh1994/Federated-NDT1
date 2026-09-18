@@ -268,14 +268,158 @@ echo "[4/4] Launching DTM$([ "${XRM}" = "1" ] && echo " + XRM" || echo "")..."
 
 if [ "${MODE}" = "1:1" ]; then
 
-    [ "${XRM}" = "1" ] && mkdir -p /tmp/xrm-state/ndt-0
-
-    kubectl delete pod pod-dtm-ndt -n "${NAMESPACE}" \
+    kubectl delete pod pod-dtm-ndt pod-xrm -n "${NAMESPACE}" \
         --ignore-not-found --grace-period=0 --force > /dev/null 2>&1 || true
     kubectl delete service svc-dtm -n "${NAMESPACE}" \
         --ignore-not-found > /dev/null 2>&1 || true
 
-    kubectl apply -f "${SCRIPT_DIR}/dtm-ndt-pod.yaml"
+    if [ "${XRM}" = "1" ]; then
+        mkdir -p /tmp/xrm-state/ndt-0
+
+        # XRM core — same pattern as the federated branch below.
+        kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-xrm
+  namespace: ${NAMESPACE}
+  labels:
+    app: xrm
+    mode: core
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  volumes:
+    - name: xrm-state
+      hostPath:
+        path: /tmp/xrm-state
+        type: DirectoryOrCreate
+  containers:
+    - name: xrm
+      image: xrm:1.0
+      imagePullPolicy: Never
+      stdin: true
+      tty: true
+      args:
+        - "--mode"
+        - "core"
+        - "--log-file"
+        - "/tmp/xrm_core.log"
+        - "--dtm-relay-ip"
+        - "${NODE_IP}"
+      volumeMounts:
+        - name: xrm-state
+          mountPath: /tmp/xrm-state
+EOF
+        echo "  XRM core launched."
+
+        # pod-dtm-ndt, with an xrm-agent container appended.
+        # Identical to dtm-ndt-pod.yaml otherwise — keep the two in sync
+        # if you edit one.
+        kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-dtm-ndt
+  namespace: ${NAMESPACE}
+  labels:
+    app: dtm-ndt
+    mode: "1-1"
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: on-ndt-script
+      configMap:
+        name: on-ndt-script
+        defaultMode: 493
+    - name: topology-config
+      configMap:
+        name: topology-config
+    - name: logs
+      emptyDir: {}
+    - name: run-data
+      emptyDir: {}
+    - name: xrm-state
+      hostPath:
+        path: /tmp/xrm-state/ndt-0
+        type: DirectoryOrCreate
+  containers:
+    - name: ndt
+      image: on-mininet:1.0
+      imagePullPolicy: Never
+      securityContext:
+        privileged: true
+      env:
+        - name: CTRL_PORT
+          value: "6653"
+      volumeMounts:
+        - name: on-ndt-script
+          mountPath: /app/on_ndt.py
+          subPath: on_ndt.py
+        - name: topology-config
+          mountPath: /run/topology_config.json
+          subPath: topology.json
+        - name: logs
+          mountPath: /app/logs
+    - name: dtm
+      image: dtm:1.0
+      imagePullPolicy: Never
+      args:
+        - "--proto"
+        - "udp"
+        - "--relay-ip"
+        - "0.0.0.0"
+        - "--relay-port"
+        - "7001"
+        - "--mode"
+        - "agent"
+        - "--dtm-ip"
+        - ""
+        - "--log-file"
+        - "/app/logs/dtm-agent.log"
+      volumeMounts:
+        - name: logs
+          mountPath: /app/logs
+    - name: xrm-agent
+      image: xrm:1.0
+      imagePullPolicy: Never
+      args:
+        - "--mode"
+        - "agent"
+        - "--ndt-id"
+        - "0"
+        - "--core-ip"
+        - "${NODE_IP}"
+        - "--dtm-ip"
+        - "127.0.0.1"
+        - "--log-file"
+        - "/tmp/xrm_agent_0.log"
+      volumeMounts:
+        - name: run-data
+          mountPath: /run
+        - name: xrm-state
+          mountPath: /tmp/xrm-state/ndt-0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-dtm
+  namespace: ${NAMESPACE}
+  labels:
+    app: dtm-ndt
+spec:
+  type: ClusterIP
+  selector:
+    app: dtm-ndt
+  ports:
+    - name: relay-udp
+      protocol: UDP
+      port: 7001
+      targetPort: 7001
+EOF
+    else
+        kubectl apply -f "${SCRIPT_DIR}/dtm-ndt-pod.yaml"
+    fi
 
     echo "  Waiting for NDT Mininet..."
     elapsed=0

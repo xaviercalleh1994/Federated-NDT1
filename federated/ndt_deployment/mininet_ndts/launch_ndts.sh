@@ -213,7 +213,8 @@ ACTUATORBLOCK
 )
         # Pre-write xrm-state so xrm-agent knows actuator-control is deployed
         mkdir -p "/tmp/xrm-state/ndt-${NDT_ID}"
-        echo "{"ndt_id":${NDT_ID},"services":["actuator-control"],"context":{}}"             > "/tmp/xrm-state/ndt-${NDT_ID}/state.json"
+        echo "{\"ndt_id\":${NDT_ID},\"services\":[\"actuator-control\"],\"context\":{}}" \
+            > "/tmp/xrm-state/ndt-${NDT_ID}/state.json"
     fi
 
     # ── Generate Pod + Service manifest ─────────────────────
