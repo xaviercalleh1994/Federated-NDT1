@@ -30,6 +30,7 @@ The ON as well as the NDTs are created from [topology](federated/topology.json) 
 
 <img src="Images/mininet_net.png" alt="net_arch" width="60%">
 
+> **A note on XRM support by mode.** XRM (and the XR services it manages) is currently only functional in **`--mode federated`**. Passing `--xrm` to `launch_testbed.sh --mode 1:1` does not add an XRM container to the 1:1 pod — see [Known limitations](#known-limitations) below.
 
 ## Requirements
 
@@ -58,14 +59,23 @@ This repository includes the necessary files for supporting the experiments incl
 federated-ndt-framework/
 └── federated/
     ├── DTM/
-    │   ├── dtm.py                  DTM core + distributed agent
+    │   ├── dtm.py                  DTM core + distributed agent + upstream (XRM coordination)
     │   └── Dockerfile
     ├── ONM/
-    │   ├── onm.py                  ONM logic + CLI
-    │   ├── on_events_gen.py        Automated event injector
+    │   ├── onm.py                  ONM logic + CLI + upstream server (XRM coordination)
+    │   ├── on_events_gen.py        Automated event injector (Experiment 1)
     │   ├── onm_commands.txt        Default command set
     │   ├── send_events.sh
     │   └── Dockerfile
+    ├── XRM/
+    │   ├── xrm.py                  XRM core / agent / cli / 1:1 modes
+    │   ├── Dockerfile
+    │   └── services/
+    │       ├── actuator-control/
+    │       │   ├── actuator_control.py
+    │       │   └── Dockerfile
+    │       └── node-scanner/
+    │           └── node_scanner.py  (no Dockerfile yet — see Known limitations)
     ├── on_ndt_creation/
     │   ├── on_ndt.py               Mininet keeper (ON + NDT roles)
     │   ├── Dockerfile
@@ -75,9 +85,11 @@ federated-ndt-framework/
     │   │   ├── Dockerfile
     │   │   ├── entrypoint.sh
     │   │   ├── launch_ndts.sh
+    │   │   ├── restart_ndt.sh      Pod restart + XR service container injection
+    │   │   ├── watch_restarts.sh   Host daemon: detects restart signals, calls restart_ndt.sh
     │   │   └── stop_ndts.sh
     │   └── simulated_ndts/
-    │       ├── ndt_gen.py          NDT simulator (Exp. 2)
+    │       ├── ndt_gen.py          NDT simulator (Exp. 2, standalone)
     │       └── Dockerfile
     ├── topology.json               Default 2-LAN topology
     ├── kubernetes/
@@ -85,12 +97,18 @@ federated-ndt-framework/
     │   ├── on-pod.yaml             Pod ON + Service svc-on
     │   ├── onm-pod.yaml            Pod ONM (hostNetwork)
     │   ├── dtm-pod.yaml            Pod DTM core (hostNetwork, federated)
-    │   ├── dtm-ndt-pod.yaml        Pod DTM+NDT (1:1 mode)
-    │   ├── launch_testbed.sh       Full testbed launcher
-    │   └── stop_testbed.sh         Full testbed stopper
+    │   ├── dtm-ndt-pod.yaml        Pod DTM+NDT (1:1 mode — no XRM)
+    │   ├── launch_testbed.sh       Full testbed launcher (--xrm, --upstream flags)
+    │   ├── stop_testbed.sh         Full testbed stopper
+    │   ├── run_experiment1.sh      Automated Experiment 1
+    │   ├── run_experiment2.sh      Automated Experiment 2 (XRM coordination)
+    │   ├── run_experiment2_bounded.sh  Bounded-admission validation run
+    │   └── commands_ndt{0-4}.txt   Per-tenant command scripts for Experiment 2
     └── analysis/
-        ├── experiment_1.py
-        └── experiment_2.py
+        ├── experiment_1.py / experiment_1_results.py
+        ├── experiment_2_results.py
+        ├── analyze_queue_operations.py
+        └── ndt_event_cli.py        Generic XR service test client
 ```
 
 ---
@@ -130,6 +148,12 @@ docker build -t dtm:1.0         DTM/
 docker build -t onm:1.0         ONM/
 docker build -t on-mininet:1.0  on_ndt_creation/
 docker build -t ndt-mininet:1.0 ndt_deployment/mininet_ndts/
+
+# Only needed if you plan to use --xrm
+docker build -t xrm:1.0 -f XRM/Dockerfile XRM/
+docker build -t actuator-control:1.0 \
+    -f XRM/services/actuator-control/Dockerfile \
+    XRM/services/actuator-control/
 ```
  
 Then import each image into containerd so Kubernetes can use them:
@@ -139,12 +163,16 @@ docker save dtm:1.0         | sudo ctr -n k8s.io images import -
 docker save onm:1.0         | sudo ctr -n k8s.io images import -
 docker save on-mininet:1.0  | sudo ctr -n k8s.io images import -
 docker save ndt-mininet:1.0 | sudo ctr -n k8s.io images import -
+
+# Only if using --xrm
+docker save xrm:1.0              | sudo ctr -n k8s.io images import -
+docker save actuator-control:1.0 | sudo ctr -n k8s.io images import -
 ```
 
 ### 2. Verify images
 
 ```bash
-sudo crictl images | grep -E "dtm|onm|mininet"
+sudo crictl images | grep -E "dtm|onm|mininet|xrm|actuator"
 ```
 
 ## Running the Testbed
@@ -387,4 +415,158 @@ python3 federated/analysis/experiment_1.py \
     --logs /tmp/exp1 \
     --out  /tmp/exp1/results
 ```
- 
+
+---
+
+## Experiment 2 — XR Service Coordination (XRM)
+
+Experiment 2 exercises the **NDTs-to-ON** direction: every NDT's tenant issues XR service commands concurrently (e.g. move an actuator on the shared Original Network), and the DTM upstream core has to admit, prioritize, and serialize those commands onto the real ON. This is what the XRM (Extended Reality Manager) subsystem exists for.
+
+### XRM architecture
+
+Three agentic layers work together for this flow:
+
+- **XRM Core** (`pod-xrm`, one per federation): lifecycle only — tracks which XR services are deployed on which NDT, and issues `RESTART_NDT` requests when you `deploy`/`stop` a service. It never touches the actual command traffic.
+- **XRM distributed agent** (one per NDT pod, container `xrm-agent`): the real entry point for XR commands. Registers with the core every 10s, receives `XR_SERVICE_CMD` from the client, forwards it to the local service process *and* to the DTM upstream core in parallel, and relays the eventual reply back to the client once the DTM broadcasts the outcome.
+- **XR service daemons** (one per NDT pod, e.g. container `actuator-control`): stateless workers that only talk to `xrm-agent` (localhost) and `on_ndt.py` (localhost `:6001`). Two exist today:
+  - `actuator-control` — applies `move`/`grip`/`release` commands to a stateful node (`h1_1`) in both the local NDT replica and, via the DTM/ONM path, the real ON.
+  - `node-scanner` — read-only: `scan_type=all|node|links|actuator` against the local Mininet instance. **Not yet buildable as a container image** (no Dockerfile) — see [Known limitations](#known-limitations).
+
+Command path (client → applied on ON → broadcast back):
+```
+ndt_event_cli.py (host)
+    │  UDP NodePort :31100+ndt_id
+    ▼
+xrm-agent (pod ndt-i, :8110+ndt_id)
+    ├──▶ local service, localhost UDP :9200/:9201 (applies to this NDT's own replica)
+    └──▶ DTM upstream core, UDP :7005
+              │  AdmissionQueue: priority heap admission + dispatch
+              ▼
+         ONM upstream, UDP :7006 → applies on the real ON via on_ndt.py:6001
+              │  ACK, UDP :7007
+              ▼
+         DTM broadcasts ON_STATE_UPDATE, UDP :8115+ndt_id, to ALL xrm-agents
+    ◀── xrm-agent relays XR_SERVICE_REPLY to the client, UDP :9210+ndt_id
+```
+
+### Port reference
+
+| Port | Direction | Purpose |
+|---|---|---|
+| 8100 | xrm-core → xrm-agent | lifecycle: deploy/stop signal |
+| 8101 | xrm-agent → xrm-core | lifecycle: registration + results |
+| 8102 / 8103 | xrm-cli ↔ xrm-core | CLI replies / commands |
+| 8110+i | client → xrm-agent | `XR_SERVICE_CMD` (pod-internal) |
+| 31100+i | NodePort → :8110+i | external access to the above |
+| 8115+i | DTM upstream → xrm-agent | `ON_STATE_UPDATE` broadcast |
+| 9200 | xrm-agent → actuator-control | localhost only |
+| 9201 | xrm-agent → node-scanner | localhost only |
+| 7001 | xrm-core → DTM relay | `RESTART_NDT` events |
+| 7005 | xrm-agent → DTM upstream | `XR_SERVICE_CMD` forward |
+| 7006 / 7007 | DTM ↔ ONM upstream | apply on ON / ACK |
+| 9210+i | xrm-agent → client | reply |
+
+*(`i` = 0-based `ndt_id`.)*
+
+### Launching a testbed with XRM
+
+`--xrm` currently only works with `--mode federated`. Add `--upstream` so the ONM and DTM upstream servers start automatically (otherwise you'd have to start them by hand with `kubectl exec`, as shown in [Manual testing](#manual-testing-of-an-xr-service) below):
+
+```bash
+cd federated/kubernetes
+./launch_testbed.sh --mode federated --fanout 4 --xrm --upstream
+kubectl get pods -n ndt
+```
+
+Expected NDT pods now have **3 containers** (`ndt`, `dtm-agent`, `xrm-agent`) — the XR service itself is *not* deployed automatically; deploy it explicitly (next section) unless you pass `--upstream` **together with `--xrm` at `launch_ndts.sh` level**, which `run_experiment2.sh` does for you (4 containers from the start: `ndt`, `dtm-agent`, `xrm-agent`, `actuator-control`).
+
+### Manual testing of an XR service
+
+1. **Deploy `actuator-control` on an NDT** via the XRM CLI:
+   ```bash
+   kubectl exec -it pod-xrm -n ndt -- python3 xrm.py --mode cli
+   [XRM-CLI] > list
+   [XRM-CLI] > deploy actuator-control ndt-1
+   ```
+   This updates `/tmp/xrm-state/ndt-0/state.json` and sends `RESTART_NDT` to the DTM relay — the pod is recreated with the new service container attached (takes ~5–15s). Watch it happen:
+   ```bash
+   tail -f /tmp/watch_restarts.log
+   kubectl get pod ndt-1 -n ndt -w
+   ```
+
+2. **Send a command from the host**, using the generic client (no `kubectl` needed):
+   ```bash
+   NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+   python3 federated/analysis/ndt_event_cli.py \
+       --mode cli --service actuator-control --ndt-id 0 --node-ip "${NODE_IP}"
+   [ndt-0|actuator-control] > set action=move angle=45 speed=10
+     Sending... ACK  e2e=12.4ms  apply=3.1ms
+       node: h1_1
+   [ndt-0|actuator-control] > get
+     ON context (ndt-0):
+       your_status: ACK
+       ...
+   [ndt-0|actuator-control] > quit
+   ```
+   If you're connecting from inside the cluster (or NodePort UDP is being NAT'd unreliably by Calico), pass `--pod-ip $(kubectl get pod ndt-1 -n ndt -o jsonpath='{.status.podIP}')` to talk to the pod directly instead of through the NodePort.
+
+3. **Check the XRM CLI's view of state** at any point:
+   ```bash
+   [XRM-CLI] > state ndt-1
+     Services: ['actuator-control']
+     ON context:
+       your_status: ACK
+       ...
+   ```
+
+### Automated testing — `run_experiment2.sh`
+
+Fully automates a rate × queue-depth × priority-mode sweep, with one client process per NDT running in parallel:
+
+```bash
+cd federated/kubernetes
+python3 -m venv venv && source venv/bin/activate
+pip install numpy pandas matplotlib scipy tabulate
+
+./run_experiment2.sh
+# or, narrower/faster for a first check:
+./run_experiment2.sh --runs 1 --rate-list "1" --queue-list "4" --out /tmp/exp2_smoke
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--runs` | 3 | Repeats per condition (for 95% CI) |
+| `--duration` | 60 | Seconds per condition |
+| `--out` | `/tmp/exp2` | Output directory |
+| `--rate-list` | `"0.5 1 2 4"` | Commands/s per NDT, space-separated |
+| `--queue-list` | `"0 2 4 8"` | `AdmissionQueue` max size (`0` = unlimited) |
+| `--priority-modes` | `"priority fifo"` | `priority` = heap dispatch, `fifo` = `--disable-priorities` |
+
+Fixed per run: 4 NDTs, service `actuator-control`, per-tenant priorities `10 30 50 70` (ndt-0 highest urgency, ndt-3 lowest). Per condition, the script: launches the testbed with `--xrm --upstream` (+ the queue/priority flags), waits for all 4 containers per pod to be `Ready`, fires all 4 `ndt_event_cli.py --mode auto` clients in parallel for `--duration` seconds, collects every log, prints a quick per-NDT summary, then tears the testbed down and frees UDP ports 7001/7005/7006/7007 before the next condition.
+
+Results land under `<OUT>/run<N>/rate<R>_queue<Q>_<mode>/{ndt0..3.log, dtm_upstream.log, onm.log, dtm_agent_ndt<1..4>.log}`. Analyse with:
+```bash
+python3 federated/analysis/experiment_2_results.py --logs /tmp/exp2 --out /tmp/exp2/results
+```
+
+### Bounded-admission validation — `run_experiment2_bounded.sh`
+
+The DTM's `AdmissionQueue` exposes an optional **per-tenant backlog bound** (`--tenant-bounds '{"<ndt_id>": <max_pending>}'`), independent of the shared queue depth `K` — intended to cap how long an *always-admitted* (non-droppable) tenant can be made to wait under sustained contention from higher-priority traffic. This script isolates exactly that condition (defaults: `rate=150 queue=4 target-ndt=2 bound=8`):
+
+```bash
+./run_experiment2_bounded.sh
+./run_experiment2_bounded.sh --runs 5 --bound 8 --target-ndt 2 --out /tmp/exp2_bounded_std8
+```
+
+It launches the baseline testbed, then swaps the auto-started DTM for one restarted with `--tenant-bounds` attached, runs the clients, and reports how many `tenant_bound_exceeded` events actually fired.
+
+> **Known limitation — this mechanism does not currently engage.** `ndt_event_cli.py` is a *synchronous* client: it blocks on each command's reply before sending the next one, so a tenant's in-flight request count never exceeds 1. No `--bound` value can trigger `tenant_bound_exceeded` under this client. Validating the bound requires an **open-loop load generator** (a client that keeps sending at the target rate regardless of pending replies) — not implemented yet.
+
+---
+
+## Known limitations
+
+- **`--mode 1:1 --xrm` does not deploy XRM.** The 1:1 pod manifest (`dtm-ndt-pod.yaml`) has no XRM container defined; `--xrm` is silently ignored in this mode. XRM only works with `--mode federated`.
+- **`node-scanner` has no Dockerfile yet.** The service is fully implemented (`XRM/services/node-scanner/node_scanner.py`) and listed as a known service in `xrm.py`, but `deploy node-scanner <ndt>` will fail at pod-restart time because no `node-scanner:1.0` image exists. To use it, add a Dockerfile mirroring `XRM/services/actuator-control/Dockerfile` (swap the script name) and build/import the image first.
+- **`--tenant-bounds` cannot be validated with the current test client** (see above) — it is implemented and wired correctly in `dtm.py`, but exercising it meaningfully needs an open-loop load generator.
+- If you launch `--xrm` **without** `--upstream` at the `launch_testbed.sh` level (i.e. you start ONM/DTM upstream by hand), pre-writing a service into `/tmp/xrm-state/ndt-<id>/state.json` directly via a shell one-liner risks producing invalid JSON if you're not careful with quoting inside `echo` — prefer the XRM CLI's `deploy` command, or Python's `json.dump()`, over hand-rolled `echo "{...}"` writes.
