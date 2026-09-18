@@ -3,6 +3,11 @@
 All notable changes to this project are documented here.
 Versioning follows [Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH).
 
+## v2.1 - 2026-09
+- Fixed `--mode 1:1 --xrm` (was a silent no-op — no XRM container was ever added)
+- Fixed invalid-JSON bug in launch_ndts.sh's xrm-state pre-write
+- Added missing Dockerfile for node-scanner (was coded, not buildable)
+
 ## v2.0 - 2026-09
 - Migrated the federated testbed from VirtualBox/Docker to a Kubernetes-native deployment (ONM, DTM, and N tenant-specific NDT instances as pods, with declarative orchestration and self-healing)
 - Added XRM (Extended Reality Manager): a third agentic manager providing per-tenant XR service provisioning, deployed as XRM Core + per-NDT XRM distributed agents
